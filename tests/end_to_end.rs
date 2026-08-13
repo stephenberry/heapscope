@@ -663,6 +663,21 @@ fn trimming_drops_the_runtime_and_keeps_the_call_site(snapshot: &heapscope::Snap
     let (mut sites, mut sites_kept) = (0usize, 0usize);
     let (mut anchored, mut anchorless) = (0usize, 0usize);
     let mut named = 0usize;
+    // Frames the platform named as this binary's own code, which is the only
+    // honest predicate for "could trimming have had anything to act on".
+    //
+    // Not `runtime_before`, which this used to be and which is measuring
+    // something else entirely: `is_runtime` contains `__libc_start_main`, a
+    // glibc `.dynsym` **export** and therefore one of the few names `dladdr`
+    // can resolve on ELF. So on aarch64 Linux CI it counted 4 while the run
+    // named 1 frame in 173, and the guards below fired on a symbol table that
+    // says nothing about whether this crate's own frames are nameable.
+    //
+    // `__rust_begin_short_backtrace` and every `end_to_end::` function are
+    // both non-exported symbols of this test binary, so a symbol table that
+    // names one names the other. That is the whole argument, and it is one a
+    // reader can check.
+    let mut ours = 0usize;
 
     for point in &snapshot.points {
         let stack: Vec<String> = point
@@ -688,6 +703,10 @@ fn trimming_drops_the_runtime_and_keeps_the_call_site(snapshot: &heapscope::Snap
         named += stack
             .iter()
             .filter(|frame| !frame.contains(": ???"))
+            .count();
+        ours += stack
+            .iter()
+            .filter(|frame| frame.contains("end_to_end::"))
             .count();
         if is_anchored(&stack) {
             anchored += 1;
@@ -715,21 +734,20 @@ fn trimming_drops_the_runtime_and_keeps_the_call_site(snapshot: &heapscope::Snap
     // The qualification above must not be what makes the claim pass: if every
     // stack were excluded, the assertion would hold having looked at nothing.
     //
-    // Conditional on `runtime_before` for the same reason the branch at the end
-    // of this function is, and it is the same condition. Reaching the marker
-    // means recognising it by name, so on a platform whose symbol table names
-    // nothing — `dladdr` on Linux names 0 of 145 frames here — no stack can be
-    // anchored and demanding one is demanding a symbol table. Asserting it
-    // unconditionally is exactly the regression this branch exists to prevent,
-    // and it was written that way first: green on macOS, red on Linux, for a
-    // property of the platform rather than of the crate.
-    if runtime_before > 0 {
+    // Conditional on `ours` for the same reason the branch at the end of this
+    // function is, and it is the same condition. Reaching the marker means
+    // recognising it by name, so on a platform whose symbol table does not name
+    // this binary's own functions — `dladdr` on Linux names 0 of 145 frames
+    // here — no stack can be anchored and demanding one is demanding a symbol
+    // table. Asserting it unconditionally is exactly the regression this branch
+    // exists to prevent, and it was written that way first: green on macOS, red
+    // on Linux, for a property of the platform rather than of the crate.
+    if ours > 0 {
         assert!(
             anchored > 0,
-            "the platform named {runtime_before} runtime frames, so trimming had \
-             something to act on, yet no stack reached \
-             `__rust_begin_short_backtrace` and all {anchorless} were excluded — \
-             this test examined nothing"
+            "the platform named {ours} of this binary's own frames, so the marker \
+             was nameable too, yet no stack reached `__rust_begin_short_backtrace` \
+             and all {anchorless} were excluded — this test examined nothing"
         );
         eprintln!(
             "{anchored} program points had a marker to trim at and kept no \
@@ -737,9 +755,13 @@ fn trimming_drops_the_runtime_and_keeps_the_call_site(snapshot: &heapscope::Snap
         );
     } else {
         eprintln!(
-            "the platform named no runtime frame, so no stack here could reach \
-             the marker; all {anchorless} program points are excluded and the \
-             branch at the end of this function is what pins the claim"
+            "the platform named none of this binary's own frames ({named} of \
+             {captured} frames carry any name at all), so no stack here could \
+             reach the marker; all {anchorless} program points are excluded, the \
+             branch at the end of this function is what pins the claim here, and \
+             `tests/symbolize.rs` is what pins trimming on this platform — it \
+             resolves the profile offline first, which is what gives the rules \
+             names to read"
         );
     }
     assert_eq!(
@@ -752,12 +774,19 @@ fn trimming_drops_the_runtime_and_keeps_the_call_site(snapshot: &heapscope::Snap
 
     // Whether anything *can* be trimmed is a property of the platform's symbol
     // table, not of this crate — see the note above the naming count. So the
-    // claim is conditional on the one thing that settles it, and the condition
-    // is a frame the trimming rules never name.
-    if runtime_before > 0 {
+    // claim is conditional on the one thing that settles it: whether this
+    // binary's own frames are nameable, which is what both trimming rules read.
+    //
+    // This condition has to match the one above, and for the same reason. It
+    // was `runtime_before` too, and on a run where the only name is libc's
+    // `__libc_start_main` — neither the marker nor an allocation-path prefix,
+    // and the allocation-path cut is a leading run from the innermost end —
+    // nothing is trimmed and `shown == captured`. Fixing only the first guard
+    // moves the failure here.
+    if ours > 0 {
         assert!(
             shown < captured,
-            "{runtime_before} runtime frames were rendered and none was trimmed"
+            "{ours} of this binary's own frames were rendered and none was trimmed"
         );
     } else if named == 0 {
         // Not a skip. Where the platform names nothing, the rules must find
@@ -774,7 +803,7 @@ fn trimming_drops_the_runtime_and_keeps_the_call_site(snapshot: &heapscope::Snap
              something is being removed for a reason it cannot have read"
         );
     } else {
-        // Some names, none of them the runtime's. The branch above used to
+        // Some names, none of them this binary's own. The branch above used to
         // cover this case too, keyed on `runtime_before` while its message
         // spoke of nothing being named — two different conditions that agree
         // only when symbolization is all or nothing. ELF exports fewer symbols
@@ -785,14 +814,20 @@ fn trimming_drops_the_runtime_and_keeps_the_call_site(snapshot: &heapscope::Snap
         // and the old assertion called that a defect **\[measured, ASan on
         // x86_64 Linux, and reproduced at `d99525b`\]**.
         //
+        // The aarch64 Linux CI runner is the other shape of this: 1 frame named
+        // in 173, and that one *is* the runtime's, because `__libc_start_main`
+        // is a `.dynsym` export while nothing of ours is. So this branch may
+        // not say "none names the runtime" — on that runner the runtime is the
+        // only thing named. It reports both counts instead.
+        //
         // Nothing further is pinned here, and nothing needs to be: the two
         // assertions above this branch — no runtime frame survives a stack that
         // had a marker, and the frame naming the call site is never the one
-        // removed — do not depend on the platform naming any runtime frame.
+        // removed — do not depend on the platform naming a frame of ours.
         eprintln!(
-            "{named} of {captured} frames carry a name and none names the \
-             runtime, so what trimming removed here is allocation-path frames; \
-             {shown} shown"
+            "{named} of {captured} frames carry a name, {runtime_before} of them \
+             the runtime's and none this binary's own, so neither trimming rule \
+             has a frame of ours to read; {shown} shown"
         );
     }
     eprintln!("{captured} frames captured, {shown} shown after trimming");

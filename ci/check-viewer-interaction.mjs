@@ -327,15 +327,31 @@ window.__probe = (function () {
     options: function () {
       return Array.from(document.getElementById("metric").options).map(function (o) { return o.value; });
     },
-    /** Names that occur at more than one place in the tree, whatever their path. */
-    duplicateNames: function (metric) {
-      const seen = new Map();
-      model(metric, false).forEach(function (row) {
-        seen.set(row.name, (seen.get(row.name) || 0) + 1);
+    /**
+     * The first branch row whose name is also a branch somewhere else, or -1.
+     *
+     * This is the row the twisty check must click. Closing a node whose name
+     * occurs once behaves identically whether the open set is keyed by path or
+     * by name, so clicking such a row proves nothing -- and the row the check
+     * used to take, the first branch, is the outermost frame every stack
+     * shares and therefore occurs exactly once by construction. Measured on a
+     * real macOS profile: 23 rows, 14 branches, the clicked row unique, and
+     * the only two rows that could have caught the defect at indices 17 and 21.
+     * The check passed anyway, on the platform where it was believed to work.
+     *
+     * Both occurrences have to be branches. A leaf twin has no twisty and no
+     * descendants to hide, so a name-keyed open set changes nothing on screen
+     * and the check is vacuous again one step further in.
+     */
+    duplicateBranch: function (metric) {
+      const flat = model(metric, false);
+      const branches = new Map();
+      flat.forEach(function (row) {
+        if (!row.leaf) branches.set(row.name, (branches.get(row.name) || 0) + 1);
       });
-      let duplicated = 0;
-      seen.forEach(function (count) { if (count > 1) duplicated += 1; });
-      return duplicated;
+      return flat.findIndex(function (row) {
+        return !row.leaf && branches.get(row.name) > 1;
+      });
     },
   };
 })();
@@ -460,10 +476,17 @@ async function checkPage(browser, path) {
     // the node's name instead of its path opens or closes two unrelated nodes
     // at once, so the invariant is not "the subtree disappeared" but "exactly
     // one row's state changed".
-    const duplicates = await page.evaluate(`window.__probe.duplicateNames(${JSON.stringify(metric)})`);
-    const branch = afterExpand.findIndex((row) => row.glyph === "\u25be");
-    check(branch !== -1, "the tree has a branch to close");
+    const branch = await page.evaluate(`window.__probe.duplicateBranch(${JSON.stringify(metric)})`);
+    check(
+      branch !== -1,
+      "the tree has a branch whose name is a branch elsewhere, so a per-name " +
+        "open set is distinguishable by closing it"
+    );
     if (branch !== -1) {
+      check(
+        afterExpand[branch] && afterExpand[branch].glyph === "\u25be",
+        `the row the model chose (${branch}) is drawn as an open branch`
+      );
       const closed = await page.click(
         `document.querySelectorAll("#tree .node")[${branch}].querySelector(".twisty")`
       );
@@ -564,7 +587,7 @@ async function checkPage(browser, path) {
       "unticking it puts the trimmed tree back"
     );
 
-    return { mode, duplicates, rows: whole.length };
+    return { mode, rows: whole.length };
   } finally {
     await page.close();
   }
@@ -640,15 +663,13 @@ try {
   rmSync(directory, { recursive: true, force: true });
 }
 
-// A tree whose every node has a unique name cannot tell a per-path open set
-// from a per-name one, so the twisty check would be vacuous. Say so rather than
-// pass quietly: this is a fact about the workload, and if it ever stops holding
-// the check needs a different workload, not a lower bar.
-const duplicated = summaries.reduce((most, summary) => Math.max(most, summary.duplicates || 0), 0);
-check(duplicated > 0, `some node name occurs at more than one place in the tree (${duplicated})`);
+// The guard this replaces asked whether a duplicate name existed *anywhere*,
+// which is not the precondition the twisty check needs -- it needs the row it
+// clicks to be one. `duplicateBranch` is that guard now, per page and per
+// metric, and it fails naming what is missing rather than counting.
 
 if (failures > 0) {
   console.error(`${failures} of ${checks} check(s) failed`);
   process.exit(1);
 }
-console.log(`ok: ${checks} checks over ${pages.length} page(s), ${duplicated} repeated names`);
+console.log(`ok: ${checks} checks over ${pages.length} page(s)`);
