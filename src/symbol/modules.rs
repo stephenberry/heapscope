@@ -72,16 +72,21 @@ pub struct Module {
     /// Subtract from a runtime address to get the address as it appears in the
     /// file, which is what `llvm-symbolizer` and `addr2line` resolve.
     ///
-    /// The same quantity on all three platforms, which it was not until the
-    /// Windows backend started reading the image's own PE header for its
-    /// link-time base. Before that this field was the load address there, so
-    /// the difference was a relative virtual address instead — a different
-    /// number, and one `llvm-symbolizer` answers `??:0:0` for unless it is
-    /// told `--relative-address`.
+    /// On Windows this is the image base, so the difference is a relative
+    /// virtual address and `llvm-symbolizer` needs `--relative-address`.
+    /// `addr2line` has no equivalent option and cannot be used there.
     ///
-    /// Subtract with wrapping arithmetic, as [`file_address`](Self::file_address)
-    /// does: an image mapped below its link-time base has a slide that runs the
-    /// other way, and that is ordinary rather than exceptional.
+    /// **The link-time base is not obtainable from memory on Windows**, so this
+    /// cannot simply be fixed the way it reads as though it could. The loader
+    /// rewrites `ImageBase` in the mapped optional header when it relocates an
+    /// image, so reading the header at the module's base — which is what the
+    /// Mach-O and ELF backends do, and what makes their `bias` the link-time
+    /// slide — yields the load address and a `bias` of zero. **Measured**: ASLR
+    /// placed one binary at two different bases across two CI runs, and the
+    /// field read from the mapped header equalled the load address both times.
+    /// Closing this needs the base out of the file on disk, which is the same
+    /// tier-3 requirement the dyld shared cache below has, reached by an
+    /// unrelated route.
     ///
     /// **Not resolvable for an image in the dyld shared cache**, which on macOS
     /// is almost everything under `/usr/lib`. A cache image's segments are laid
@@ -842,60 +847,6 @@ mod imp {
         entry_point: *mut c_void,
     }
 
-    /// The address the image was *linked* at, read from its own PE header.
-    ///
-    /// This is what makes `bias` mean the same thing here as it does on ELF and
-    /// Mach-O: the number to subtract from a runtime address to get the address
-    /// the file records. Windows was the last backend asking only the loader,
-    /// and so the only one whose `bias` was the load address — which makes the
-    /// difference a relative virtual address, a different quantity, and one
-    /// `llvm-symbolizer` resolves to nothing unless told `--relative-address`.
-    /// Caught the first time `windows-latest` ran `tests/end_to_end.rs`, by the
-    /// M2 exit criterion, which asks all three platforms the same question.
-    ///
-    /// Every step is validated, and any surprise gives up rather than reading
-    /// on: this walks a structure in a mapped image, and the alternative to a
-    /// bounded walk is trusting a header this crate did not write.
-    fn link_time_base(base: usize) -> Option<usize> {
-        if base == 0 {
-            return None;
-        }
-        // SAFETY: `base` is the load address of an image the loader has mapped,
-        // so its first page is readable. Each read below is inside that page:
-        // the DOS header is 64 bytes, `e_lfanew` is bounded to the page before
-        // it is followed, and the optional header is read at a fixed offset
-        // from there. Every field is read unaligned, because nothing promises
-        // the alignment of a header in a mapped image.
-        unsafe {
-            let image = base as *const u8;
-            // "MZ", without which this is not an image and nothing below means
-            // anything.
-            if image.cast::<u16>().read_unaligned() != 0x5A4D {
-                return None;
-            }
-            let lfanew = image.add(0x3C).cast::<i32>().read_unaligned();
-            // The DOS stub is small. A bound here is what keeps a damaged
-            // header from sending the reads below into unmapped memory.
-            if !(0..0x1000).contains(&lfanew) {
-                return None;
-            }
-            let nt = image.add(lfanew as usize);
-            // "PE\0\0".
-            if nt.cast::<u32>().read_unaligned() != 0x0000_4550 {
-                return None;
-            }
-            // The optional header follows the 4-byte signature and the 20-byte
-            // file header. `ImageBase` sits at a different offset in the two
-            // shapes, because PE32 carries a `BaseOfData` that PE32+ does not.
-            let optional = nt.add(24);
-            match optional.cast::<u16>().read_unaligned() {
-                0x20B => Some(optional.add(24).cast::<u64>().read_unaligned() as usize),
-                0x10B => Some(optional.add(28).cast::<u32>().read_unaligned() as usize),
-                _ => None,
-            }
-        }
-    }
-
     pub(super) fn capture() -> Vec<Module> {
         // SAFETY: returns a pseudo-handle; no failure mode.
         let process = unsafe { GetCurrentProcess() };
@@ -960,14 +911,9 @@ mod imp {
                 // Windows images do not overlap, so this costs nothing in
                 // attribution accuracy.
                 size: information.size as usize,
-                // The slide, so that subtracting it from a runtime address
-                // gives the address the file records — the same quantity the
-                // other two backends produce. Falls back to the load address,
-                // and therefore to a relative virtual address, only where the
-                // header could not be read; `file_address` subtracts with
-                // wrapping arithmetic, so an image mapped below its link-time
-                // base is handled rather than being a special case.
-                bias: link_time_base(base).map_or(base, |link| base.wrapping_sub(link)),
+                // Subtracting the base gives a relative virtual address, which
+                // `llvm-symbolizer` takes with `--relative-address`.
+                bias: base,
                 image_base: base,
                 // The PDB signature lives in the PE debug directory, which means
                 // reading an object file rather than asking the OS. Deferred
@@ -976,72 +922,6 @@ mod imp {
             });
         }
         modules
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::link_time_base;
-
-        /// A PE header with nothing after it, laid out the way the real one is.
-        ///
-        /// Synthetic for the same reason `find_build_id`'s inputs are: the two
-        /// header shapes and every way a damaged one can end the walk are not
-        /// things a live process supplies on demand, and the walk is exactly
-        /// where reading a header this crate did not write goes wrong.
-        fn image(magic: u16, link: u64, lfanew: usize) -> Vec<u8> {
-            let mut bytes = vec![0u8; lfanew + 64];
-            bytes[0..2].copy_from_slice(&0x5A4Du16.to_le_bytes());
-            bytes[0x3C..0x40].copy_from_slice(&(lfanew as i32).to_le_bytes());
-            bytes[lfanew..lfanew + 4].copy_from_slice(&0x0000_4550u32.to_le_bytes());
-            let optional = lfanew + 24;
-            bytes[optional..optional + 2].copy_from_slice(&magic.to_le_bytes());
-            match magic {
-                // PE32+ has no `BaseOfData`, so `ImageBase` is eight bytes here.
-                0x20B => bytes[optional + 24..optional + 32].copy_from_slice(&link.to_le_bytes()),
-                0x10B => bytes[optional + 28..optional + 32]
-                    .copy_from_slice(&(link as u32).to_le_bytes()),
-                _ => {}
-            }
-            bytes
-        }
-
-        #[test]
-        fn both_header_shapes_report_their_link_time_base() {
-            let wide = image(0x20B, 0x1_4000_0000, 0x100);
-            assert_eq!(link_time_base(wide.as_ptr() as usize), Some(0x1_4000_0000));
-            let narrow = image(0x10B, 0x0040_0000, 0x80);
-            assert_eq!(link_time_base(narrow.as_ptr() as usize), Some(0x0040_0000));
-        }
-
-        #[test]
-        fn a_header_that_does_not_check_out_gives_up_rather_than_reading_on() {
-            let mut no_mz = image(0x20B, 0x1_4000_0000, 0x100);
-            no_mz[0] = b'Z';
-            assert_eq!(link_time_base(no_mz.as_ptr() as usize), None);
-
-            let mut no_pe = image(0x20B, 0x1_4000_0000, 0x100);
-            no_pe[0x100] = b'X';
-            assert_eq!(link_time_base(no_pe.as_ptr() as usize), None);
-
-            let unknown = image(0x999, 0x1_4000_0000, 0x100);
-            assert_eq!(link_time_base(unknown.as_ptr() as usize), None);
-
-            assert_eq!(link_time_base(0), None);
-        }
-
-        /// The bound is what keeps a damaged `e_lfanew` from sending the reads
-        /// below it outside the page the loader mapped, so it is checked in
-        /// both directions rather than assumed.
-        #[test]
-        fn an_lfanew_outside_the_first_page_is_refused() {
-            let mut far = image(0x20B, 0x1_4000_0000, 0x100);
-            far[0x3C..0x40].copy_from_slice(&0x4000i32.to_le_bytes());
-            assert_eq!(link_time_base(far.as_ptr() as usize), None);
-
-            let mut negative = image(0x20B, 0x1_4000_0000, 0x100);
-            negative[0x3C..0x40].copy_from_slice(&(-4i32).to_le_bytes());
-            assert_eq!(link_time_base(negative.as_ptr() as usize), None);
-        }
     }
 }
 

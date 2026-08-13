@@ -877,11 +877,7 @@ fn symbolization_resolves_a_recorded_frame(profile: &json::Value) {
     for (address, file_address) in &mine {
         assert_eq!(
             *file_address,
-            // Wrapping, because `Module::file_address` is what produced the
-            // left-hand side and that is how it subtracts. An image mapped
-            // below its link-time base has a slide that runs the other way,
-            // and a plain `-` would panic here on a correct profile.
-            address.wrapping_sub(image.bias),
+            address - image.bias,
             "a frame rendered a file address that the module map contradicts"
         );
     }
@@ -895,7 +891,7 @@ fn symbolization_resolves_a_recorded_frame(profile: &json::Value) {
         image.start,
         image.size
     );
-    let known_in_file = known.wrapping_sub(image.bias);
+    let known_in_file = known - image.bias;
 
     // `nm` reports the address a symbol has *in the file*, which is an
     // independent source of truth for the bias — independent because it comes
@@ -938,8 +934,22 @@ fn symbolization_resolves_a_recorded_frame(profile: &json::Value) {
         _ => eprintln!("skipping the nm cross-check: no usable nm on PATH"),
     }
 
-    let mut tools = 0;
-    for (tool, arguments) in [
+    // On Windows `bias` is the image base rather than the link-time base, so
+    // `known_in_file` is a relative virtual address rather than the address the
+    // file records — see `Module::bias`, which states the divergence. That is a
+    // fact about the platform and not about this profile: the loader **rewrites**
+    // `ImageBase` in the mapped optional header when it relocates an image, so
+    // the link-time base is not obtainable from memory at all. Measured: ASLR
+    // placed this binary at two different bases across two CI runs and the field
+    // read from the mapped header equalled the load address both times.
+    //
+    // `llvm-symbolizer` takes such an address with `--relative-address`.
+    // `addr2line` has no equivalent — it resolves against section VMAs, which
+    // include the image base — so it is not asked here rather than being asked
+    // a question it cannot answer. Closing this needs the link-time base out of
+    // the file on disk, which is the same tier-3 requirement the macOS shared
+    // cache has.
+    let mut candidates = vec![
         // `atos` takes the runtime address and the image's load address.
         (
             "atos",
@@ -951,12 +961,17 @@ fn symbolization_resolves_a_recorded_frame(profile: &json::Value) {
                 format!("{known:#x}"),
             ],
         ),
-        // The ELF tools take the address as it appears in the file.
-        (
-            "llvm-symbolizer",
-            vec![format!("--obj={executable}"), format!("{known_in_file:#x}")],
-        ),
-        (
+        ("llvm-symbolizer", {
+            let mut arguments = vec![format!("--obj={executable}")];
+            if cfg!(windows) {
+                arguments.push(String::from("--relative-address"));
+            }
+            arguments.push(format!("{known_in_file:#x}"));
+            arguments
+        }),
+    ];
+    if !cfg!(windows) {
+        candidates.push((
             "addr2line",
             vec![
                 String::from("-f"),
@@ -965,8 +980,11 @@ fn symbolization_resolves_a_recorded_frame(profile: &json::Value) {
                 executable.clone(),
                 format!("{known_in_file:#x}"),
             ],
-        ),
-    ] {
+        ));
+    }
+
+    let mut tools = 0;
+    for (tool, arguments) in candidates {
         let Ok(output) = std::process::Command::new(tool).args(&arguments).output() else {
             continue;
         };

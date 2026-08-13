@@ -715,9 +715,16 @@ fn the_public_surface_is_what_was_agreed() {
 
 /// Rewrites the committed surface. Ignored by default: it is a tool, not a
 /// check, and a check that repairs itself checks nothing.
+///
+/// One `#[ignore]`, not two. This also carried a `cfg_attr(miri, ignore)` for a
+/// second and true reason — it writes to the repository, and Miri has no
+/// filesystem — but an unconditional `#[ignore]` already covers every
+/// configuration, so the second one is an attribute that can never do anything.
+/// Nightly's `unused_attributes` says so, and the workflow's `-D warnings`
+/// makes saying so fatal: the Miri job failed on it, in the one file whose
+/// subject is noticing what a build quietly changed.
 #[test]
 #[ignore = "rewrites tests/data/public_surface.txt; run it deliberately"]
-#[cfg_attr(miri, ignore = "writes to the repository; Miri has no filesystem")]
 fn rewrite_the_snapshot() {
     let root = repo_root();
     let surface = scan_crate(&root);
