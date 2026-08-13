@@ -104,9 +104,17 @@ impl Tool {
     /// because it reports inlined frames, which `addr2line` can only do by
     /// emitting a variable number of lines per address and thereby losing the
     /// one thing its output format offers: a fixed size.
+    /// On Windows `addr2line` is not among them. `Module::bias` there is the
+    /// image base, so a recorded file address is a relative virtual address;
+    /// `llvm-symbolizer` takes one with `--relative-address`, and `addr2line`
+    /// resolves against section VMAs, which include the image base, and has no
+    /// equivalent option. Asking it anyway returns `??` for every address —
+    /// confidently, and in a file that looks finished.
     pub fn preference() -> &'static [Tool] {
         if cfg!(target_vendor = "apple") {
             &[Tool::Atos, Tool::LlvmSymbolizer, Tool::Addr2Line]
+        } else if cfg!(windows) {
+            &[Tool::LlvmSymbolizer]
         } else {
             &[Tool::LlvmSymbolizer, Tool::Addr2Line, Tool::Atos]
         }
@@ -136,15 +144,26 @@ impl Tool {
                 String::from("-l"),
                 format!("{load:#x}"),
             ],
-            Tool::LlvmSymbolizer => vec![
-                format!("--obj={image}"),
-                String::from("--no-demangle"),
-                // One answer per address, with inlined callers included. Without
-                // this an address inside an inlined function is reported as the
-                // function it was inlined into, which is the frame the reader
-                // already had.
-                String::from("--inlines"),
-            ],
+            Tool::LlvmSymbolizer => {
+                let mut arguments = vec![
+                    format!("--obj={image}"),
+                    String::from("--no-demangle"),
+                    // One answer per address, with inlined callers included.
+                    // Without this an address inside an inlined function is
+                    // reported as the function it was inlined into, which is the
+                    // frame the reader already had.
+                    String::from("--inlines"),
+                ];
+                // What `Module::bias` records on Windows is the image base, so
+                // the file address in a profile is relative to it. Without this
+                // every address resolves to `??:0:0` — measured on a real
+                // Windows run, where the tool reported 21 of 23 addresses
+                // resolved and had named none of them.
+                if cfg!(windows) {
+                    arguments.push(String::from("--relative-address"));
+                }
+                arguments
+            }
             Tool::Addr2Line => vec![String::from("-f"), String::from("-e"), String::from(image)],
         }
     }
