@@ -1,0 +1,27 @@
+# The positive control for ci/sanitizers.sh, as a crate of its own.
+#
+# Separate rather than an entry in the parent's `examples/`, for two reasons.
+# It is a program whose whole purpose is to be wrong on request, and the
+# published crate should not carry one. And an earlier version wrote it into
+# `examples/` at run time and deleted it afterwards, which made any concurrent
+# `cargo` invocation in the same checkout fail on a file that had just been
+# removed -- a real failure, observed, not a hypothetical.
+#
+# `[workspace]` is empty and deliberate: it detaches this package so the parent
+# never treats it as a member and `cargo test --all-targets` at the root never
+# builds it.
+[workspace]
+
+[package]
+name = "sanitizer-probe"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+heapscope = { path = "../.." }
+
+# Debug assertions and overflow checks stay on; the defects here are memory
+# defects and it is the sanitizer's job to find them, not the profile's.
+[profile.dev]
+panic = "unwind"

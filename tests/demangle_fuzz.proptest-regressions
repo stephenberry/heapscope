@@ -1,0 +1,17 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 502916ec16e91e9f629a179e2b58c10014723b5fcbf92a0c1b2b5aa07c7a3ff5 # shrinks to index = Index(16684316295966600825), edits = [(Index(5244662530760558793), 'R')]
+cc 8af6286a48d9dc378b80f0c7eaac2f656c748d9ce10eed13f2972638406e2b70 # shrinks to index = Index(1439316018490076480), edits = [(Index(5370571059434426420), '\0')]
+cc 96c7d008f2e1eb9239e2dcd332db4ec32ae51eb0d36125a28e40633c254fb65c # shrinks to index = Index(17183670832993770216), edits = [(Index(8475531060893577770), 'B')]
+cc 8ce426d3820a49dc017b927c3d55d572aaca4e3c72f8f58e3ce878c0d33257f7 # shrinks to index = Index(12190125462722076307), edits = [(Index(16602069666338596455), 'N')]
+cc ffc5245a80443399ec61256857c4c90fd10610ed54baf8e0a443484734061b86 # shrinks to index = Index(5316657129524568221), edits = [(Index(14397458789236723213), 'C')]
+cc 6691ff3facceb79c22ad6bddc5c0ca88d556c6b7e6cb62eaad57ffadf37750c2 # shrinks to index = Index(558102129618601084), edits = [(Index(8409545092426413237), 'C')]
+cc 02c7e38b6cc865a50828dfd43b130fa971d2cebd5efed55755da346f248d2a8a # shrinks to index = Index(58747592591431694), edits = [(Index(15372286728091293014), 'a')]
+cc 97029526e6e4049393b0a42a02fc4f3e163dcec128e0436864e78d4b3c0585df # shrinks to index = Index(1821175370334382485), edits = [(Index(12092865559431817171), 'R'), (Index(12297829382473034411), 'n')]
+cc 985c7ccf2e20ed628788339fb8bd00031d9523f3fdf6312695b5e7ced2bb8ad1 # shrinks to index = Index(1850549166630098331), edits = [(Index(12436007240703068506), 'e'), (Index(12228740453358017364), 'R')]
+cc 2df2fbc9e55019848a78717f699102ea00fc59702b1582873189e148e86aba2e # shrinks to index = Index(12395742036792087233), edits = [(Index(10101788421317135409), '5'), (Index(17568327689247192016), 'h')]
+cc 72b1328b989931b6b11bd04bcd38f463ae17dc149732442641507c6d12d75111 # shrinks to index = Index(146868981478579233), edits = [(Index(14648884999710526284), 'R')]

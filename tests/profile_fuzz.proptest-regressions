@@ -1,0 +1,19 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+#
+# Curated rather than appended to. Proptest saves a seed for every failure,
+# including ones that were defects in this file rather than in the crate, and a
+# seed kept for a failure that no longer exists is a case nobody can interpret.
+# The seed below is the one that found a real defect: `Module::build_id` reached
+# both JSON emitters unscreened. It reproduces on its own, without a single
+# novel case -- `PROPTEST_CASES=1` with the screen removed still fails.
+#
+# The shrunk values in the comment are the shrinker's final state and are not a
+# minimal cause: `Borrowed` is built by `prop_map` over a tuple, so proptest
+# cannot attribute the failure to one component. The seed replays the original
+# input, which is what does the work.
+cc fdd52d2af8073466b6da95341e6cfc15702039d4d628ab80ecedc7f0f6c81e34 # shrinks to borrowed = Borrowed { command: "", module_path: "", build_id: "", thread_name: "\u{2028}", region_name: "", symbol: "" }

@@ -1,0 +1,19 @@
+/target
+/tmp
+*.profraw
+dhat-heap.json
+
+# Scratch git worktrees created by local tooling; never content.
+/.claude/worktrees
+
+# `cargo fuzz` build artefacts and its accumulated inputs. The target and the
+# contract it checks are source; a corpus grown on one machine is not.
+/fuzz/target
+
+# The sanitizer control crate builds separately, so it has a target directory of
+# its own. The rules above are anchored at the repository root and do not reach
+# it -- which is how a first commit of it carried thirty build artefacts.
+/ci/sanitizer-probe/target
+/fuzz/corpus
+/fuzz/artifacts
+/fuzz/Cargo.lock

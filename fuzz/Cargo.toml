@@ -1,0 +1,45 @@
+# A separate workspace on purpose. `cargo-fuzz` needs nightly and links
+# libFuzzer, and neither belongs in the dependency graph of a crate whose
+# headline promise is that it has no dependencies. Nothing in the main build
+# reaches this directory.
+[package]
+name = "heapscope-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+heapscope = { path = ".." }
+# The oracle for `demangle`. The same one `tests/demangle.rs` uses, for the same
+# reason: a reimplementation is only as trustworthy as the evidence that it
+# agrees with the implementation everyone else uses.
+rustc-demangle = "0.1"
+# The oracle for `profile`, and the same rule again. This crate writes JSON with
+# a writer of its own, and the question that decides whether a profile opens is
+# whether the parser a reader actually has accepts it — so the check is that
+# parser, not a second reading of the writer.
+serde_json = "1"
+# Structured inputs for `profile`. A profile's text arrives in named fields from
+# named sources, and a target driven by a byte slice would spend the campaign
+# rediscovering that shape instead of exploring it.
+arbitrary = { version = "1", features = ["derive"] }
+
+[[bin]]
+name = "demangle"
+path = "fuzz_targets/demangle.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "profile"
+path = "fuzz_targets/profile.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

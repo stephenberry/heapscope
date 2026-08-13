@@ -1,0 +1,316 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  # The MSRV promise applies to the shipped library only. This job checks the
+  # crate with every dev-only section stripped from the manifest, so a
+  # dev-dependency that raises its own MSRV provably cannot break it. See
+  # ci/msrv-check.sh for why `cargo check --lib` on the real manifest is not
+  # sufficient.
+  msrv:
+    name: MSRV (library only)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read MSRV from Cargo.toml
+        id: msrv
+        run: echo "version=$(sed -n 's/^rust-version *= *"\([^"]*\)".*/\1/p' Cargo.toml | head -n1)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - run: ci/msrv-check.sh "${{ steps.msrv.outputs.version }}"
+
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # PLAN.md section 1.1: musl is a permanent non-goal and is deliberately
+        # absent from this matrix.
+        # PLAN.md section 8.8's matrix includes aarch64 Linux, which has a
+        # different frame-pointer default and a different pthread_mutex_t size
+        # from x86_64.
+        os: [macos-latest, ubuntu-latest, ubuntu-24.04-arm, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Frame pointers are required on x86_64 (PLAN.md section 5.3) and are on
+      # by default on aarch64. Setting the flag unconditionally keeps the CI
+      # configuration identical to the one documented for users.
+      - name: Configure frame pointers
+        shell: bash
+        run: echo "RUSTFLAGS=-D warnings -C force-frame-pointers=yes" >> "$GITHUB_ENV"
+      # `--all-targets` does not build the examples in the form anything can run
+      # them, and the name is what makes that surprising: it *selects* examples
+      # explicitly, and an explicit selection compiles each one as a test target
+      # instead -- a `lifecycle_probe-<hash>` that is never uplifted to the plain
+      # name, and a `cdylib_probe` executable rather than a shared library.
+      # `tests/lifecycle.rs` (25 tests) and `tests/cdylib_tls.rs` drive those two
+      # as programs, so on a cold cache every one of them failed here, with a
+      # message about a missing fixture that reads like a defect in the crate and
+      # was a defect in this file. `ci/sanitizers.sh` has always built examples
+      # for exactly this reason; this job did not. `tests/ci_workflow.rs` keeps
+      # the two in step.
+      - name: Build the example fixtures the suite runs as programs
+        run: cargo build --locked --examples
+      # `--locked` on every job that resolves dependencies. PLAN.md section 1.2
+      # promises "dev-dependencies are version-pinned with a committed
+      # Cargo.lock for CI reproducibility"; without this flag Cargo silently
+      # re-resolves and the lock file's only effect is to get quietly updated.
+      - run: cargo test --locked --all-targets
+      - name: Doc tests
+        run: cargo test --locked --doc
+      # PLAN.md section 4.6's panic row makes two claims about a `panic = "abort"`
+      # build, and no test binary can check either: they are all built the other
+      # way. This builds the lifecycle probe with the setting and runs it.
+      #
+      # Every platform, deliberately, and not one representative Linux runner.
+      # The claim that can actually vary is the first one — that a normal ending
+      # is still profiled — and what would make it vary is the unwinder, which
+      # is the frame-pointer walk here and on macOS, and the platform's own on
+      # Windows. Running this only where the answer is already known would leave
+      # the interesting case unchecked.
+      - name: A panic=abort build profiles what it can, and says so where it cannot
+        shell: bash
+        run: ci/check-panic-abort.sh
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      # The lint job runs on Linux, so without this the Windows and
+      # aarch64-linux backends are never linted anywhere. Checking is cheap and
+      # catches a platform-specific mistake at review time rather than after a
+      # release.
+      - name: Install cross-compilation targets
+        run: rustup target add x86_64-pc-windows-msvc aarch64-unknown-linux-gnu
+      - name: Lint other supported targets
+        run: |
+          cargo clippy --locked --lib --target x86_64-pc-windows-msvc -- -D warnings
+          cargo clippy --locked --lib --target aarch64-unknown-linux-gnu -- -D warnings
+      - name: Documentation builds without warnings
+        run: cargo doc --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+      # `internals` and `unwind` are `doc(hidden)`, so they allow links to their
+      # own private items -- those pages are never rendered publicly, and the
+      # links resolve in the build below, which is how a maintainer reads them.
+      # That justification is only worth writing down if something checks it, so
+      # the internal build is a step rather than a habit.
+      - name: Internal documentation builds without warnings
+        run: cargo doc --no-deps --document-private-items
+        env:
+          RUSTDOCFLAGS: -D warnings
+      # Running a campaign needs nightly and cargo-fuzz, so no job here runs
+      # one. Compiling the targets needs neither, and it is what actually rots:
+      # `fuzz_targets/profile.rs` builds a `Snapshot` field by field, so one
+      # renamed field would leave a fuzz target that nobody discovers is broken
+      # until the day they reach for it. This crate has been here before -- see
+      # `ci/dhat-viewer-check.mjs` in PLAN.md section 9.1, written and never
+      # run. What a green tick here means is "still compiles", and no more.
+      - name: Fuzz targets still compile
+        run: cargo check --manifest-path fuzz/Cargo.toml --all-targets
+
+  # Miri is the strongest correctness tool available for a crate whose whole
+  # difficulty is concurrent shared state reached from inside the allocator.
+  # The data-race detector stays ON: `RawLock` has a cfg(miri) pure-Rust backend
+  # precisely so that Miri's imprecise `os_unfair_lock` shim does not force us
+  # to disable it. See src/core/lock.rs.
+  #
+  # What Miri does *not* check, stated so nobody reads more into a green tick
+  # than it carries: `#[cfg(miri)]` replaces all three platform lock backends,
+  # so none of their FFI or pointer casts is exercised here, and
+  # `-Zmiri-strict-provenance` proves nothing about them. Miri validates the
+  # code that *uses* the locks -- the arena, tables, guard, and gate -- which is
+  # what PLAN.md section 8.7 actually claims. The native `test` job is what
+  # covers the backends.
+  miri:
+    name: Miri
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - uses: Swatinem/rust-cache@v2
+      # `cargo miri test` runs every test target. Tests that read the repository
+      # from disk are ignored under Miri (its filesystem isolation makes `open`
+      # a hard abort, not an `io::Error`); disabling isolation would weaken the
+      # job for a reason unrelated to what Miri is here to check.
+      #
+      # `--lib --tests` rather than everything, which is how doctests are
+      # excluded -- and the exclusion belongs here rather than in the examples.
+      # Starting a profiler needs the inline assembly of the frame-pointer walk,
+      # which Miri cannot execute: it reports `NoBacktraces(UnsupportedArchitecture)`.
+      # Every doc example that starts one therefore used to carry `no_run`, so
+      # they were compiled and never executed *anywhere* -- 15 of 17 doctests,
+      # including every assertion the testing API documents, none of which had
+      # ever been run. One of them asserted something false and nothing could
+      # see it. Scoping the exclusion to the job that cannot run them is what
+      # lets the `test` job execute them for real. Nothing is lost here: the
+      # doctests Miri used to run were the two that do not start a profiler.
+      #
+      # `--test-threads=1` because Miri's deadlock detector is process-wide: it
+      # fires when *no* thread in the interpreted program can make progress, and
+      # under the parallel harness that includes threads belonging to other
+      # tests. A test that legitimately blocks one thread while another waits on
+      # a timeout is then reported as a deadlock, attributed to whichever test
+      # happened to be running. Observed here on `core::gate`, which passes alone
+      # and passes serially. Costs almost nothing — Miri interprets serially
+      # anyway, and the whole job moved from 213s to 242s — and buys a job whose
+      # failures mean what they say.
+      - run: cargo miri test --locked --lib --tests -- --test-threads=1
+        env:
+          MIRIFLAGS: -Zmiri-strict-provenance
+
+  # PLAN.md section 8.7's other half. Miri checks every interleaving of the code
+  # we own, with the platform lock replaced by a `cfg(miri)` backend; these check
+  # the real thing, on the real platform primitive, with the real allocator
+  # underneath.
+  #
+  # `ci/sanitizers.sh` runs a positive control before each suite -- a deliberate
+  # use-after-free for ASan, a deliberate data race for TSan, both in memory that
+  # went through this crate's `#[global_allocator]`. The controls are not
+  # ceremony. A sanitizer that cannot see past the shim reports nothing, the
+  # suite passes, and this job would go green for having watched nothing at all.
+  # A control that does not fire fails the job.
+  #
+  # Linux x86_64 rather than the macOS runner: it is where both sanitizers are
+  # best supported, and the frame-pointer walk needs `-C force-frame-pointers`
+  # there, which the script sets.
+  sanitizers:
+    name: Sanitizers
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - uses: Swatinem/rust-cache@v2
+      - run: ci/sanitizers.sh all
+        env:
+          SANITIZER_TARGET: x86_64-unknown-linux-gnu
+
+  # The one promise no unit test can make: a profile this crate writes opens in
+  # Valgrind's real `dh_view.html`. Everything else about the output format is
+  # checked against our reading of the viewer's source; this checks against the
+  # viewer itself, by running it.
+  #
+  # `dh_view.js` is GPL-licensed and is fetched rather than vendored. A failure
+  # to fetch it is a warning, not a failure -- otherwise an unreachable
+  # sourceware.org would report as a defect in this crate. A viewer that
+  # *rejects* the profile fails the job.
+  viewer:
+    name: Profiles repeat, and load in both viewers
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Configure frame pointers
+        run: echo "RUSTFLAGS=-D warnings -C force-frame-pointers=yes" >> "$GITHUB_ENV"
+      # PLAN.md section 12 promises that a deterministic run records the same
+      # profile every time. It lives here because it needs the same release
+      # build of the same workload the viewer checks record, and because the
+      # defect it catches only appears across processes: address space layout
+      # randomization is what moves the shard a program point hashes into, so a
+      # single process can only ever agree with itself.
+      - name: One workload, one profile, however many runs
+        run: |
+          set +e
+          ci/check-reproducible.sh
+          status=$?
+          set -e
+          if [ "$status" -eq 2 ]; then
+            echo "::warning::no python3, so the profiles were not compared"
+            exit 0
+          fi
+          exit "$status"
+
+      - name: Record a profile and load it in the viewer
+        run: |
+          set +e
+          ci/check-dhat-viewer.sh
+          status=$?
+          set -e
+          if [ "$status" -eq 2 ]; then
+            echo "::warning::the DHAT viewer check could not run, so the profile was not verified against dh_view.js"
+            exit 0
+          fi
+          exit "$status"
+
+      # The bundled viewer of PLAN.md section 6.12. Nothing is fetched here:
+      # the page is one self-contained file, and this runs the page's own code
+      # against the profile it carries. `tests/html_output.rs` checks the file
+      # is self-contained and that a hostile path cannot end a script element;
+      # this checks the arithmetic the page does with what is inside it.
+      - name: The bundled viewer reads the profile it carries
+        run: |
+          set +e
+          ci/check-bundled-viewer.sh
+          status=$?
+          set -e
+          if [ "$status" -eq 2 ]; then
+            echo "::warning::no node, so the bundled viewer's own logic was not exercised"
+            exit 0
+          fi
+          exit "$status"
+
+      # The other half of that page: everything that answers a click. The step
+      # above runs the viewer's script with no `document`, so the rendering half
+      # is skipped there by construction — M7 chunk L broke seven of its controls
+      # and the whole repository passed. This drives Chrome, which every
+      # `ubuntu-latest` runner has, over a pipe rather than a port.
+      - name: The bundled viewer's controls do what they say
+        run: |
+          set +e
+          ci/check-viewer-interaction.sh
+          status=$?
+          set -e
+          if [ "$status" -eq 2 ]; then
+            echo "::warning::no node or no browser, so nothing clicked the viewer"
+            exit 0
+          fi
+          exit "$status"
+
+  # Structural promises that a README cannot keep on its own: an empty
+  # `[dependencies]`, a closed dev-dependency allowlist, and a viewer with no
+  # build step. These run in the `test` job too; this job exists so that a
+  # failure names the promise that was broken.
+  invariants:
+    name: Project invariants
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked --test no_dependencies -- --nocapture
+      # `--target all` matters: without it `cargo tree` resolves for the host
+      # only, so a `[target.'cfg(windows)'.dependencies]` entry would pass this
+      # check on Linux while genuinely shipping a dependency to Windows users.
+      - name: Dependency tree is empty for consumers
+        run: |
+          tree="$(cargo tree --locked --target all --edges normal --prefix none --no-dedupe)"
+          echo "$tree"
+          count="$(echo "$tree" | grep -c . || true)"
+          if [ "$count" -ne 1 ]; then
+            echo "::error::the shipped crate must have no normal dependencies; cargo tree shows $count entries"
+            exit 1
+          fi

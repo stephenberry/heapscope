@@ -1,0 +1,94 @@
+[package]
+name = "heapscope"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.96"
+description = "Dynamic heap analysis for Rust: a heap profiler with no dependencies outside the standard library."
+repository = "https://github.com/stephenberry/heapscope"
+license = "MIT OR Apache-2.0"
+keywords = ["heap", "profiler", "memory", "allocator", "dhat"]
+categories = ["development-tools::profiling", "memory-management"]
+readme = "README.md"
+exclude = ["/dev", "/.github"]
+
+# The shipped library has no dependencies outside the standard library.
+# This table is empty and stays empty. Enforced by `tests/no_dependencies.rs`.
+[dependencies]
+
+[dev-dependencies]
+proptest = "1"
+tempfile = "3"
+# The oracle for `tests/demangle.rs`. This crate reimplements both Rust
+# manglings rather than depending on one, so the reimplementation owes the
+# reader evidence that it agrees with the reference on real symbols. Running the
+# reference is that evidence; asserting agreement would not be.
+rustc-demangle = "0.1"
+# `default-features = false` drops plotters and rayon, which are a report
+# renderer and a thread pool we have no use for. `cargo_bench_support` is what
+# makes `cargo bench` work at all.
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+# The comparison for `benches/overhead.rs`. This crate emits `dhat-rs`'s format
+# and exists because of what it does differently, so an overhead claim that does
+# not run the tool it is claiming to improve on is not a claim about anything.
+# Same rule as `rustc-demangle` above: running the reference is the evidence.
+dhat = "0.3"
+
+[[bench]]
+name = "primitives"
+harness = false
+
+[[bench]]
+name = "unwind"
+harness = false
+
+# The two benchmarks below are `harness = false` and hand-written, so each one
+# answers the `--test` flag itself — see the note in either file. `test = false`
+# here would not do it: `cargo test --all-targets` selects bench targets
+# explicitly, and an explicit selection overrides the default this key sets.
+
+# Not a criterion benchmark. Criterion measures single-threaded iteration
+# latency; this measures aggregate throughput under contention, and criterion's
+# own allocations would flow through the engine being measured.
+[[bench]]
+name = "contention"
+harness = false
+
+# Also not a criterion benchmark, and not really a benchmark: a driver. The
+# three configurations it compares each need their own `#[global_allocator]`, so
+# they are three processes — `examples/overhead_{none,heapscope,dhat}.rs` — and
+# this runs them and tabulates what they report.
+[[bench]]
+name = "overhead"
+harness = false
+
+# The offline symbolizer of PLAN.md section 6.1, which makes tier 2 usable
+# rather than merely possible. Declared here rather than left to `src/bin/`
+# auto-discovery, so that shipping a second executable to every consumer is a
+# line in this file that a reviewer sees.
+#
+# It is part of the shipped package and therefore part of the MSRV promise;
+# `ci/msrv-check.sh` checks `--bins` alongside `--lib` for that reason. It has
+# no dependencies either -- `tests/no_dependencies.rs` covers the whole package.
+[[bin]]
+name = "heapscope-symbolize"
+path = "src/bin/heapscope-symbolize/main.rs"
+
+# PLAN.md section 4.7's cdylib TLS path, which is the reason the reentrancy
+# guard uses no thread-local storage at all. `tests/cdylib_tls.rs` loads this
+# with `dlopen` and makes it allocate on a thread it created itself, which is
+# the only arrangement where dyld's `tlv_get_addr` runs for the first time
+# inside the allocator.
+[[example]]
+name = "cdylib_probe"
+crate-type = ["cdylib"]
+
+[lib]
+# The reference tracker and property tests need to observe the engine, so the
+# library is compiled as an rlib only.
+bench = false
+
+[profile.bench]
+debug = true
+
+[profile.release]
+debug = true

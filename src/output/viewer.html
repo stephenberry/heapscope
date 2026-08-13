@@ -1,0 +1,1018 @@
+<!doctype html>
+<!--
+  The bundled heapscope viewer.
+
+  Hand-written HTML, CSS and JavaScript in one file, with no build step, ever.
+  PLAN.md section 6.12 makes that a hard constraint rather than a preference:
+  the empty `[dependencies]` discipline the library keeps is worth nothing if
+  the viewer quietly acquires npm, and `tests/no_dependencies.rs` fails the
+  build if this repository ever grows a `package.json` or a `node_modules`.
+
+  This is a complement to DHAT v2 output, not a replacement. Valgrind's
+  `dh_view.html` remains the interchange viewer and is better at the tree than
+  this is. What it structurally cannot show is why this file exists: thread
+  attribution, regions, size and alignment distributions, sampling metadata,
+  and what the profiler itself cost. Those are the tabs below.
+
+  The profile is written into this page by `src/output/html.rs`, which replaces
+  the marker further down with two `application/json` blocks. Everything after
+  that point reads them; nothing here fetches anything, and a strict reading of
+  "self-contained" is what `tests/html_output.rs` enforces.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>heapscope profile</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #ffffff;
+    --fg: #1b1b1f;
+    --dim: #5f6368;
+    --rule: #d8dade;
+    --panel: #f6f7f9;
+    --accent: #2b5eb8;
+    --bar: #cfe0ff;
+    --warn-bg: #fff4e2;
+    --warn-fg: #6b4a10;
+    --warn-rule: #e3b768;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #16181c;
+      --fg: #e6e7ea;
+      --dim: #9aa0a8;
+      --rule: #2e3238;
+      --panel: #1d2025;
+      --accent: #7aa7ff;
+      --bar: #24374f;
+      --warn-bg: #2e2415;
+      --warn-fg: #f0cd94;
+      --warn-rule: #6b5426;
+    }
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    padding: 0 0 4rem;
+    background: var(--bg);
+    color: var(--fg);
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  }
+
+  header {
+    padding: 1.25rem 1.5rem 1rem;
+    border-bottom: 1px solid var(--rule);
+  }
+  h1 {
+    margin: 0 0 .35rem;
+    font-size: 1.05rem;
+    font-weight: 600;
+    letter-spacing: .01em;
+  }
+  h1 .producer { color: var(--dim); font-weight: 400; }
+
+  .command {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: .82rem;
+    color: var(--dim);
+    word-break: break-all;
+  }
+
+  .facts {
+    margin: .75rem 0 0;
+    display: flex;
+    flex-wrap: wrap;
+    gap: .35rem 1.5rem;
+    font-size: .82rem;
+    color: var(--dim);
+  }
+  .facts b { color: var(--fg); font-weight: 600; }
+
+  .banner {
+    margin: .75rem 1.5rem 0;
+    padding: .6rem .8rem;
+    border: 1px solid var(--warn-rule);
+    border-left-width: 3px;
+    background: var(--warn-bg);
+    color: var(--warn-fg);
+    font-size: .85rem;
+    border-radius: 3px;
+  }
+  .banner + .banner { margin-top: .4rem; }
+  .banner b { font-weight: 600; }
+
+  nav {
+    display: flex;
+    gap: .25rem;
+    padding: 0 1.5rem;
+    margin-top: 1rem;
+    border-bottom: 1px solid var(--rule);
+    flex-wrap: wrap;
+  }
+  nav button {
+    appearance: none;
+    border: 0;
+    border-bottom: 2px solid transparent;
+    background: none;
+    color: var(--dim);
+    font: inherit;
+    font-size: .88rem;
+    padding: .5rem .7rem;
+    cursor: pointer;
+  }
+  nav button:hover { color: var(--fg); }
+  nav button[aria-selected="true"] {
+    color: var(--accent);
+    border-bottom-color: var(--accent);
+    font-weight: 600;
+  }
+
+  main { padding: 1.25rem 1.5rem 0; }
+  section[hidden] { display: none; }
+
+  .controls {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+    flex-wrap: wrap;
+    margin-bottom: .9rem;
+    font-size: .85rem;
+  }
+  .controls label { color: var(--dim); }
+  select, .controls button {
+    font: inherit;
+    font-size: .85rem;
+    padding: .25rem .45rem;
+    color: var(--fg);
+    background: var(--panel);
+    border: 1px solid var(--rule);
+    border-radius: 3px;
+    cursor: pointer;
+  }
+
+  table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
+  th, td { text-align: right; padding: .3rem .55rem; border-bottom: 1px solid var(--rule); }
+  th { color: var(--dim); font-weight: 600; font-size: .78rem; white-space: nowrap; }
+  th:first-child, td:first-child { text-align: left; }
+  tbody tr:hover { background: var(--panel); }
+  caption { caption-side: top; text-align: left; color: var(--dim); font-size: .82rem; padding-bottom: .5rem; }
+
+  .empty { color: var(--dim); font-style: italic; padding: 1rem 0; }
+
+  /* The program-point tree. One row per node, indented by depth, with a bar
+     behind the name showing the node's share of the selected metric. */
+  #tree { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .82rem; }
+  .node {
+    display: flex;
+    align-items: baseline;
+    gap: .6rem;
+    padding: .1rem .4rem;
+    border-radius: 2px;
+    white-space: nowrap;
+  }
+  .node:hover { background: var(--panel); }
+  .node .label {
+    flex: 1 1 auto;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    position: relative;
+    padding: .05rem .25rem;
+  }
+  .node .bar {
+    position: absolute;
+    left: 0; top: 0; bottom: 0;
+    background: var(--bar);
+    border-radius: 2px;
+    z-index: 0;
+  }
+  .node .text { position: relative; z-index: 1; }
+  .node .metric { flex: 0 0 auto; color: var(--dim); }
+  .node .metric b { color: var(--fg); font-weight: 600; }
+  .twisty {
+    flex: 0 0 1rem;
+    color: var(--dim);
+    cursor: pointer;
+    user-select: none;
+    text-align: center;
+  }
+  .twisty.leaf { cursor: default; opacity: .35; }
+  .synthetic { color: var(--dim); font-style: italic; }
+
+  .hist { display: grid; grid-template-columns: max-content 1fr max-content; gap: .15rem .6rem; align-items: center; font-size: .82rem; }
+  .hist .range { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; color: var(--dim); white-space: nowrap; }
+  .hist .track { background: var(--panel); border-radius: 2px; height: .85rem; }
+  .hist .fill { background: var(--bar); height: 100%; border-radius: 2px; }
+  .hist .count { font-variant-numeric: tabular-nums; white-space: nowrap; }
+
+  h2 { font-size: .95rem; margin: 1.5rem 0 .6rem; }
+  h2:first-child { margin-top: 0; }
+  p.note { color: var(--dim); font-size: .82rem; max-width: 60rem; }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1><span id="title">heapscope profile</span> <span class="producer" id="producer"></span></h1>
+  <div class="command" id="command"></div>
+  <div class="facts" id="facts"></div>
+</header>
+
+<div id="banners"></div>
+
+<nav id="tabs" role="tablist"></nav>
+
+<main>
+  <section id="panel-points" role="tabpanel">
+    <div class="controls">
+      <label for="metric">Sort by</label>
+      <select id="metric"></select>
+      <label><input type="checkbox" id="untrimmed"> Show trimmed frames</label>
+      <button type="button" id="expand">Expand all</button>
+      <button type="button" id="collapse">Collapse all</button>
+    </div>
+    <div id="tree"></div>
+  </section>
+
+  <section id="panel-threads" role="tabpanel" hidden></section>
+  <section id="panel-regions" role="tabpanel" hidden></section>
+  <section id="panel-shapes" role="tabpanel" hidden></section>
+  <section id="panel-cost" role="tabpanel" hidden></section>
+  <section id="panel-modules" role="tabpanel" hidden></section>
+</main>
+
+<!--HEAPSCOPE-PROFILE-->
+
+<script>
+"use strict";
+
+// Everything below is pure until `render`. The split is deliberate: the data
+// half is exercised headlessly by `ci/check-bundled-viewer.mjs`, which loads
+// this script out of a generated profile and runs it against the real thing,
+// so the tree arithmetic is covered without a browser or a DOM.
+
+const HEAPSCOPE = (function () {
+
+  // ---- formatting -------------------------------------------------------
+
+  const KIB = 1024;
+  const UNITS = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
+
+  /// Renders a byte count the way a reader wants to skim it, keeping the exact
+  /// figure in the title attribute rather than throwing it away.
+  function formatBytes(value) {
+    if (!Number.isFinite(value)) return "—";
+    if (value < KIB) return value + " B";
+    let scaled = value;
+    let unit = 0;
+    while (scaled >= KIB && unit < UNITS.length - 1) {
+      scaled /= KIB;
+      unit += 1;
+    }
+    return (scaled < 10 ? scaled.toFixed(2) : scaled < 100 ? scaled.toFixed(1) : Math.round(scaled)) + " " + UNITS[unit];
+  }
+
+  function formatCount(value) {
+    if (!Number.isFinite(value)) return "—";
+    return value.toLocaleString("en-US");
+  }
+
+  /// Ad hoc weights are dimensionless. Calling them bytes would be a claim the
+  /// run does not support, which is the same reason the DHAT emitter writes
+  /// `bu`/`bsu`/`bksu` for this mode instead of letting the viewer assume.
+  function makeAmountFormatter(mode) {
+    return mode === "ad-hoc" ? formatCount : formatBytes;
+  }
+
+  // ---- the model --------------------------------------------------------
+
+  /// The metrics a point can be ranked by. `lifetime` is the two lifetime
+  /// totals added, which is DHAT's single `tl` and is the only form in which
+  /// they are comparable across points.
+  const METRICS = [
+    { key: "totalBytes", label: "Total amount", amount: true },
+    { key: "totalBlocks", label: "Total blocks", amount: false },
+    { key: "maxBytes", label: "Peak amount (mb)", amount: true },
+    { key: "atGmaxBytes", label: "Amount at global peak (gb)", amount: true },
+    { key: "atEndBytes", label: "Amount at end (eb)", amount: true },
+    { key: "lifetime", label: "Block lifetime", amount: false },
+  ];
+
+  /// The additive quantities. Summing these over a subtree is arithmetic, not
+  /// estimation: every allocation counted below a node was counted once.
+  const ADDITIVE = [
+    "totalBytes",
+    "totalBlocks",
+    "atGmaxBytes",
+    "atGmaxBlocks",
+    "atEndBytes",
+    "atEndBlocks",
+    "lifetime",
+  ];
+
+  function emptyTotals() {
+    const totals = {};
+    for (const key of ADDITIVE) totals[key] = 0;
+    totals.maxBytes = 0;
+    totals.maxBlocks = 0;
+    return totals;
+  }
+
+  /// The metrics of one program point, flattened into the shape a tree node
+  /// accumulates.
+  function pointTotals(point) {
+    const retired = point.retiredLifetime || 0;
+    const unretired = point.unretiredLifetime || 0;
+    return {
+      totalBytes: point.totalBytes || 0,
+      totalBlocks: point.totalBlocks || 0,
+      atGmaxBytes: point.atGmaxBytes || 0,
+      atGmaxBlocks: point.atGmaxBlocks || 0,
+      atEndBytes: point.atEndBytes || 0,
+      atEndBlocks: point.atEndBlocks || 0,
+      lifetime: retired + unretired,
+      maxBytes: point.maxBytes || 0,
+      maxBlocks: point.maxBlocks || 0,
+    };
+  }
+
+  /// Folds `child` into `into`.
+  ///
+  /// Maxima do not add, and this is the one place the viewer could quietly
+  /// invent a number. Two points that each peaked at 4 MB, at different
+  /// moments, did not jointly peak at 8 MB. What is provable is that at t-gmax
+  /// both had their `gb` live at the same instant, and the same at t-end, so
+  /// the largest of those three lower bounds is the most a subtree can honestly
+  /// claim. This is the identical argument `Point::merge` makes in
+  /// `src/output/dhat_v2.rs` when two points fold together, and the two are
+  /// deliberately the same rule.
+  function accumulate(into, child) {
+    for (const key of ADDITIVE) into[key] += child[key];
+    into.maxBytes = Math.max(into.maxBytes, child.maxBytes, into.atGmaxBytes, into.atEndBytes);
+    into.maxBlocks = Math.max(into.maxBlocks, child.maxBlocks, into.atGmaxBlocks, into.atEndBlocks);
+  }
+
+  /// Each frame's label with its module's full path replaced by the file's own
+  /// name.
+  ///
+  /// The rendered name carries `(/long/absolute/path+0xfileaddr)` because a
+  /// profile that travels has to stay resolvable by `atos` or `llvm-symbolizer`
+  /// on another machine. A page that carries the module table does not need it
+  /// spelled out on every row: the same path is on the Modules tab, and the
+  /// full label is still one hover away.
+  ///
+  /// Exact rather than heuristic. The path being removed is the one the profile
+  /// says this frame's module was loaded from, so it is a substring the label
+  /// demonstrably contains or does not; a renderer that never mentioned the
+  /// path is left alone rather than guessed at.
+  function shortenNames(profile, names) {
+    const modules = profile.modules || [];
+    const frames = profile.frames || [];
+    return names.map(function (name, at) {
+      const frame = frames[at];
+      if (!frame || frame.module === undefined) return name;
+      const module = modules[frame.module];
+      if (!module || !module.path) return name;
+      const cut = Math.max(module.path.lastIndexOf("/"), module.path.lastIndexOf("\\"));
+      const base = cut >= 0 ? module.path.slice(cut + 1) : module.path;
+      return base.length > 0 ? name.split(module.path).join(base) : name;
+    });
+  }
+
+  /// Builds the call tree, outermost frame first.
+  ///
+  /// Captured stacks are innermost first, so the path is reversed: a tree
+  /// rooted at the program's entry is what makes two call sites that share a
+  /// caller sit under it.
+  function buildTree(profile, display, options) {
+    const untrimmed = Boolean(options && options.untrimmed);
+    const full = display.names || [];
+    const names = options && options.fullPaths ? full : shortenNames(profile, full);
+    const keep = display.keep || [];
+    const labels = display.labels || {};
+
+    const root = { name: "", children: new Map(), totals: emptyTotals(), depth: -1 };
+
+    profile.points.forEach(function (point, index) {
+      const frames = point.frames || [];
+      const range = untrimmed ? [0, frames.length] : (keep[index] || [0, frames.length]);
+      const shown = frames.slice(range[0], range[1]);
+
+      // A point with nothing to show is not a bug in the emitter, and the two
+      // ways it happens have opposite remedies: an overflow point never had
+      // frames, and a recorded point with none had a stack that could not be
+      // walked. The labels come from Rust so the two renderings cannot drift.
+      const path = shown.length > 0
+        ? shown.map(function (frame) { return names[frame] || "0x?"; }).reverse()
+        : [point.kind === "overflow" ? labels.overflow : labels.unwalkable];
+      const titles = shown.length > 0
+        ? shown.map(function (frame) { return full[frame] || ""; }).reverse()
+        : path;
+      const synthetic = shown.length === 0;
+
+      const totals = pointTotals(point);
+      let node = root;
+      accumulate(root.totals, totals);
+      path.forEach(function (name, depth) {
+        let child = node.children.get(name);
+        if (!child) {
+          child = {
+            name: name,
+            title: titles[depth] || name,
+            children: new Map(),
+            totals: emptyTotals(),
+            depth: depth,
+            synthetic: synthetic,
+          };
+          node.children.set(name, child);
+        }
+        accumulate(child.totals, totals);
+        node = child;
+      });
+    });
+
+    return root;
+  }
+
+  /// Orders every level by `metric`, heaviest first, with the name as the
+  /// tie-break so that two runs of the same program produce the same page.
+  function sortTree(node, metric) {
+    const children = Array.from(node.children.values());
+    children.sort(function (a, b) {
+      const difference = b.totals[metric] - a.totals[metric];
+      return difference !== 0 ? difference : a.name.localeCompare(b.name);
+    });
+    children.forEach(function (child) { sortTree(child, metric); });
+    node.sorted = children;
+    return node;
+  }
+
+  /// How accurate a sampled run says it is, from the two counts it carries: an
+  /// exact count of requests beside the estimate of the same quantity.
+  function samplingAccuracy(profile) {
+    const observed = profile.shapes && profile.shapes.observedBlocks;
+    const estimated = profile.totals && profile.totals.totalBlocks;
+    if (!observed || !Number.isFinite(estimated)) return null;
+    return { observed: observed, estimated: estimated, error: (estimated - observed) / observed };
+  }
+
+  /// Everything the run wants a reader warned about, in the order a reader
+  /// should care. Each is a fact the profile states about itself; none is
+  /// inferred.
+  function warnings(profile) {
+    const out = [];
+    const run = profile.run || {};
+    const missed = profile.notRecorded || {};
+    const captures = (profile.selfMetrics && profile.selfMetrics.captures) || {};
+    const interval = profile.settings && profile.settings.samplingInterval;
+
+    if (run.poisoned) {
+      out.push({
+        title: "This profile is not trustworthy.",
+        body: "The engine recorded an internal inconsistency during the run, so the numbers below may not agree with each other.",
+      });
+    }
+    if (run.exact === false) {
+      out.push({
+        title: "Peak figures are approximate.",
+        body: "The run did not hold the peak gate exactly, so the global peak and every at-peak figure are lower bounds rather than measurements.",
+      });
+    }
+    if (interval) {
+      const accuracy = samplingAccuracy(profile);
+      const detail = accuracy
+        ? " The profile counted " + formatCount(accuracy.observed) + " allocations exactly and estimates "
+          + formatCount(accuracy.estimated) + ", an error of " + (accuracy.error * 100).toFixed(1) + "% on the block count."
+        : "";
+      out.push({
+        title: "Sampled run: amounts and block counts are estimates.",
+        body: "One sample point every " + formatBytes(interval) + " of allocated bytes on average, scaled back up per sample."
+          + " Size and alignment distributions are exact — they cost no stack walk, so every request was counted." + detail,
+      });
+    }
+    if (missed.blocks) {
+      out.push({
+        title: formatCount(missed.blocks) + " live blocks were not recorded.",
+        body: "The live-block table was full, so those blocks' frees could not be attributed. Raise max_live_blocks.",
+      });
+    }
+    if (missed.programPoints) {
+      out.push({
+        title: formatCount(missed.programPoints) + " program points did not fit.",
+        body: "Their allocations are gathered into the single [overflow] point in the tree.",
+      });
+    }
+    if (missed.attributionRows || missed.unattributedBlocks) {
+      out.push({
+        title: "Some allocations have no thread or region.",
+        body: formatCount(missed.attributionRows || 0) + " attribution rows did not fit and "
+          + formatCount(missed.unattributedBlocks || 0) + " blocks are unattributed, so the thread and region tables do not sum to the totals.",
+      });
+    }
+    if (missed.refusedEvents) {
+      out.push({
+        title: formatCount(missed.refusedEvents) + " events were refused.",
+        body: "The arena hit its limit, so these allocations are absent from the profile entirely.",
+      });
+    }
+    if (captures.truncated || captures.suspect || captures.noFrames) {
+      out.push({
+        title: "Some stacks are incomplete.",
+        body: formatCount(captures.truncated || 0) + " traces hit the depth limit, "
+          + formatCount(captures.suspect || 0) + " looked wrong, and " + formatCount(captures.noFrames || 0)
+          + " could not be walked at all. Frame pointers are usually the reason: build with -C force-frame-pointers=yes.",
+      });
+    }
+    return out;
+  }
+
+  return {
+    METRICS: METRICS,
+    accumulate: accumulate,
+    buildTree: buildTree,
+    emptyTotals: emptyTotals,
+    formatBytes: formatBytes,
+    formatCount: formatCount,
+    makeAmountFormatter: makeAmountFormatter,
+    pointTotals: pointTotals,
+    samplingAccuracy: samplingAccuracy,
+    shortenNames: shortenNames,
+    sortTree: sortTree,
+    warnings: warnings,
+  };
+})();
+
+// The headless check imports this file as a module; a browser has no `module`
+// and skips the assignment. Nothing else in the page depends on either case.
+if (typeof module === "object" && module.exports) {
+  module.exports = HEAPSCOPE;
+}
+
+// ---- rendering ----------------------------------------------------------
+
+if (typeof document !== "undefined") {
+  (function () {
+    const profileElement = document.getElementById("heapscope-profile");
+    const displayElement = document.getElementById("heapscope-display");
+    if (!profileElement || !displayElement) return;
+
+    const profile = JSON.parse(profileElement.textContent);
+    const display = JSON.parse(displayElement.textContent);
+    const amount = HEAPSCOPE.makeAmountFormatter(profile.run && profile.run.mode);
+
+    // A reader must refuse a formatVersion it does not know: that rule is
+    // written into every profile this crate produces, and the bundled viewer
+    // is the one reader guaranteed to be looking at it.
+    if (profile.formatVersion !== 1) {
+      document.getElementById("banners").innerHTML = "";
+      addBanner("This profile is in a format this viewer does not know.",
+        "It says formatVersion " + String(profile.formatVersion) + ", and this page understands version 1."
+        + " It was written by " + String(profile.producer || "an unknown producer")
+        + ". Nothing below is displayed, because a reader that guesses at an unknown format reports numbers that are not there.");
+      document.getElementById("tabs").hidden = true;
+      document.querySelector("main").hidden = true;
+      return;
+    }
+
+    function text(value) {
+      return document.createTextNode(String(value));
+    }
+
+    function element(tag, className, content) {
+      const node = document.createElement(tag);
+      if (className) node.className = className;
+      if (content !== undefined && content !== null) node.appendChild(text(content));
+      return node;
+    }
+
+    function addBanner(title, body) {
+      const banner = element("div", "banner");
+      const strong = element("b", null, title);
+      banner.appendChild(strong);
+      banner.appendChild(text(" " + body));
+      document.getElementById("banners").appendChild(banner);
+    }
+
+    // ---- header ----
+
+    const run = profile.run || {};
+    document.getElementById("producer").appendChild(text(profile.producer || ""));
+    document.getElementById("command").appendChild(text(run.command || ""));
+    document.title = "heapscope: " + (run.command || "profile").split(" ")[0];
+
+    const facts = document.getElementById("facts");
+    function addFact(label, value) {
+      if (value === undefined || value === null || value === "") return;
+      const item = element("span");
+      item.appendChild(text(label + " "));
+      item.appendChild(element("b", null, value));
+      facts.appendChild(item);
+    }
+    addFact("mode", run.mode);
+    addFact("pid", run.pid);
+    addFact("unwinder", run.unwinder);
+    addFact("time", run.timeAtEnd !== undefined ? HEAPSCOPE.formatCount(run.timeAtEnd) + " " + (run.timeUnit || "") : null);
+    addFact("shutdown", run.shutdown);
+    addFact("depth limit", profile.settings && profile.settings.maxDepth);
+
+    HEAPSCOPE.warnings(profile).forEach(function (warning) {
+      addBanner(warning.title, warning.body);
+    });
+
+    // ---- totals ----
+
+    const totals = profile.totals || {};
+
+    /// Whether this run has live blocks to report at all.
+    ///
+    /// The writer omits every live-block figure in a mode that has none — an
+    /// `event` was never live, so there is no instant at which it was — and it
+    /// omits them rather than writing zeroes precisely so that a reader cannot
+    /// mistake an absence for a measurement. That makes the absence the signal,
+    /// and reading it here is better than testing `mode === "heap"`, which would
+    /// restate a decision `Mode::block_lifetimes` already owns.
+    ///
+    /// This viewer used to answer `totals.maxBytes || 0` and print `peak 0 B`,
+    /// undoing the care the writer had taken one file away. The text summary
+    /// omits the same two lines for the same reason, so of the three renderings
+    /// of one snapshot, two agreed and this one did not.
+    const lifetimes = totals.maxBytes !== undefined;
+
+    addFact("total", amount(totals.totalBytes || 0));
+    addFact("blocks", HEAPSCOPE.formatCount(totals.totalBlocks || 0));
+    if (lifetimes) {
+      addFact("peak", amount(totals.maxBytes));
+      addFact("at end", amount(totals.currBytes));
+    }
+
+    // ---- tabs ----
+
+    const TABS = [
+      { id: "points", label: "Program points" },
+      { id: "threads", label: "Threads" },
+      { id: "regions", label: "Regions" },
+      { id: "shapes", label: "What was asked for" },
+      { id: "cost", label: "Profiler cost" },
+      { id: "modules", label: "Modules" },
+    ];
+    const tabs = document.getElementById("tabs");
+    TABS.forEach(function (tab, index) {
+      const button = element("button", null, tab.label);
+      button.type = "button";
+      button.setAttribute("role", "tab");
+      button.setAttribute("aria-selected", index === 0 ? "true" : "false");
+      button.addEventListener("click", function () {
+        TABS.forEach(function (other, otherIndex) {
+          document.getElementById("panel-" + other.id).hidden = other.id !== tab.id;
+          tabs.children[otherIndex].setAttribute("aria-selected", other.id === tab.id ? "true" : "false");
+        });
+      });
+      tabs.appendChild(button);
+    });
+
+    // ---- program points ----
+
+    const metricSelect = document.getElementById("metric");
+    // Four of the six rank points by something only a live block has. Offering
+    // them for a run with none would be offering a sort whose every key is a
+    // zero this viewer invented — `pointTotals` fills the missing fields in
+    // because a tree has to add *something* up, and that is the one place the
+    // fabrication is legitimate. It stops being legitimate at the point a
+    // reader can see it.
+    HEAPSCOPE.METRICS.filter(function (metric) {
+      return lifetimes || metric.key === "totalBytes" || metric.key === "totalBlocks";
+    }).forEach(function (metric) {
+      const option = document.createElement("option");
+      option.value = metric.key;
+      option.appendChild(text(metric.label));
+      metricSelect.appendChild(option);
+    });
+
+    const expanded = new Set();
+    const untrimmedBox = document.getElementById("untrimmed");
+
+    function metricText(node, metric) {
+      const chosen = HEAPSCOPE.METRICS.find(function (entry) { return entry.key === metric; });
+      const value = node.totals[metric];
+      return chosen && chosen.amount ? amount(value) : HEAPSCOPE.formatCount(value);
+    }
+
+    function renderTree() {
+      const metric = metricSelect.value;
+      const root = HEAPSCOPE.sortTree(
+        HEAPSCOPE.buildTree(profile, display, { untrimmed: untrimmedBox.checked }),
+        metric
+      );
+      const container = document.getElementById("tree");
+      container.textContent = "";
+      if (root.sorted.length === 0) {
+        container.appendChild(element("div", "empty", "This run recorded no allocations."));
+        return;
+      }
+      const scale = root.totals[metric] || 1;
+
+      function renderNode(node, path, indent) {
+        const key = path + "\n" + node.name;
+        const open = expanded.has(key);
+        const row = element("div", "node");
+        row.style.paddingLeft = indent * 1.1 + 0.4 + "rem";
+
+        const twisty = element("span", "twisty" + (node.sorted.length ? "" : " leaf"), node.sorted.length ? (open ? "▾" : "▸") : "·");
+        if (node.sorted.length) {
+          twisty.addEventListener("click", function () {
+            if (open) expanded.delete(key); else expanded.add(key);
+            renderTree();
+          });
+        }
+        row.appendChild(twisty);
+
+        const label = element("div", "label");
+        const share = Math.max(0, Math.min(1, node.totals[metric] / scale));
+        const bar = element("span", "bar");
+        bar.style.width = (share * 100).toFixed(2) + "%";
+        label.appendChild(bar);
+        label.appendChild(element("span", "text" + (node.synthetic ? " synthetic" : ""), node.name));
+        // The unshortened rendering, which is the one that stays resolvable by
+        // a tool on another machine.
+        label.title = node.title || node.name;
+        row.appendChild(label);
+
+        const value = element("div", "metric");
+        value.appendChild(element("b", null, metricText(node, metric)));
+        value.appendChild(text(" · " + (share * 100).toFixed(1) + "%"));
+        row.appendChild(value);
+
+        container.appendChild(row);
+
+        if (open) {
+          node.sorted.forEach(function (child) { renderNode(child, key, indent + 1); });
+        }
+      }
+
+      root.sorted.forEach(function (child) { renderNode(child, "", 0); });
+    }
+
+    function everyKey(node, path, into) {
+      node.sorted.forEach(function (child) {
+        const key = path + "\n" + child.name;
+        if (child.sorted.length) into.add(key);
+        everyKey(child, key, into);
+      });
+      return into;
+    }
+
+    metricSelect.addEventListener("change", renderTree);
+    untrimmedBox.addEventListener("change", renderTree);
+    document.getElementById("expand").addEventListener("click", function () {
+      const root = HEAPSCOPE.sortTree(
+        HEAPSCOPE.buildTree(profile, display, { untrimmed: untrimmedBox.checked }),
+        metricSelect.value
+      );
+      everyKey(root, "", expanded);
+      renderTree();
+    });
+    document.getElementById("collapse").addEventListener("click", function () {
+      expanded.clear();
+      renderTree();
+    });
+
+    // The heaviest path open on arrival, because a fully collapsed tree shows
+    // one row and a fully expanded one shows every stack in the program.
+    (function openHeaviestPath() {
+      const root = HEAPSCOPE.sortTree(HEAPSCOPE.buildTree(profile, display, {}), "totalBytes");
+      let node = root;
+      let prefix = "";
+      while (node.sorted && node.sorted.length > 0) {
+        const child = node.sorted[0];
+        prefix = prefix + "\n" + child.name;
+        expanded.add(prefix);
+        node = child;
+      }
+    })();
+
+    renderTree();
+
+    // ---- tables ----
+
+    function table(container, caption, columns, rows) {
+      const node = document.createElement("table");
+      if (caption) {
+        const captionNode = element("caption", null, caption);
+        node.appendChild(captionNode);
+      }
+      const head = document.createElement("thead");
+      const headRow = document.createElement("tr");
+      columns.forEach(function (column) { headRow.appendChild(element("th", null, column)); });
+      head.appendChild(headRow);
+      node.appendChild(head);
+      const body = document.createElement("tbody");
+      rows.forEach(function (row) {
+        const tr = document.createElement("tr");
+        row.forEach(function (cell) { tr.appendChild(element("td", null, cell)); });
+        body.appendChild(tr);
+      });
+      node.appendChild(body);
+      container.appendChild(node);
+    }
+
+    // The last three columns are live-block figures, so they go the same way as
+    // the two header facts in a run that has none: the column disappears rather
+    // than filling with zeroes. A table of zeroes reads as a measured result,
+    // and a reader has no way to tell it from a thread that genuinely freed
+    // everything.
+    function tally(row) {
+      const cells = [
+        amount(row.totalBytes || 0),
+        HEAPSCOPE.formatCount(row.totalBlocks || 0),
+      ];
+      if (lifetimes) {
+        cells.push(
+          amount(row.maxBytes || 0),
+          amount(row.currBytes || 0),
+          HEAPSCOPE.formatCount(row.currBlocks || 0)
+        );
+      }
+      return cells;
+    }
+    const TALLY_COLUMNS = lifetimes
+      ? ["Total", "Blocks", "Peak", "At end", "Blocks at end"]
+      : ["Total", "Blocks"];
+
+    // Threads.
+    const threadsPanel = document.getElementById("panel-threads");
+    threadsPanel.appendChild(element("h2", null, "Threads"));
+    threadsPanel.appendChild(element("p", "note",
+      "Which thread allocated what. DHAT v2 has no field for this, so it is invisible in dh_view.html."
+      + " The rows sum to the run's totals unless a banner above says otherwise."));
+    const threads = profile.threads || [];
+    if (threads.length === 0) {
+      threadsPanel.appendChild(element("div", "empty", "No thread rows were recorded."));
+    } else {
+      table(threadsPanel, null, ["Thread", "First seen"].concat(TALLY_COLUMNS), threads.map(function (thread) {
+        return [
+          thread.name ? thread.name + " (#" + thread.id + ")" : "#" + thread.id,
+          HEAPSCOPE.formatCount(thread.firstSeen || 0),
+        ].concat(tally(thread));
+      }));
+    }
+
+    // Regions.
+    const regionsPanel = document.getElementById("panel-regions");
+    regionsPanel.appendChild(element("h2", null, "Regions"));
+    regionsPanel.appendChild(element("p", "note",
+      "Phases of the run, marked by the program itself. These do not sum to the totals:"
+      + " an allocation made outside every region belongs to no row, which is where most allocations in most programs happen."));
+    const regions = profile.regions || [];
+    if (regions.length === 0) {
+      regionsPanel.appendChild(element("div", "empty", "This run used no regions."));
+    } else {
+      table(regionsPanel, null, ["Region", "Entries", "Still open"].concat(TALLY_COLUMNS), regions.map(function (region) {
+        return [
+          region.name ? region.name + " (#" + region.id + ")" : "#" + region.id,
+          HEAPSCOPE.formatCount(region.entries || 0),
+          HEAPSCOPE.formatCount(region.active || 0),
+        ].concat(tally(region));
+      }));
+    }
+
+    // Shapes.
+    const shapesPanel = document.getElementById("panel-shapes");
+    const shapes = profile.shapes || {};
+    shapesPanel.appendChild(element("h2", null, "What the program asked for"));
+    shapesPanel.appendChild(element("p", "note",
+      "Distributions rather than a mean, and exact even in a sampled run: counting a shape costs no stack walk,"
+      + " so every request is counted whether or not it was sampled."));
+
+    const classes = shapes.sizeClasses || [];
+    if (classes.length === 0) {
+      shapesPanel.appendChild(element("div", "empty", "No size classes were recorded."));
+    } else {
+      const histogram = element("div", "hist");
+      const widest = classes.reduce(function (most, entry) { return Math.max(most, entry.blocks); }, 0) || 1;
+      classes.forEach(function (entry) {
+        const range = entry.atMost === undefined
+          ? HEAPSCOPE.formatCount(entry.atLeast) + " +"
+          : HEAPSCOPE.formatCount(entry.atLeast) + "–" + HEAPSCOPE.formatCount(entry.atMost) + " B";
+        histogram.appendChild(element("div", "range", range));
+        const track = element("div", "track");
+        const fill = element("div", "fill");
+        fill.style.width = (entry.blocks / widest * 100).toFixed(2) + "%";
+        track.appendChild(fill);
+        histogram.appendChild(track);
+        histogram.appendChild(element("div", "count", HEAPSCOPE.formatCount(entry.blocks)));
+      });
+      shapesPanel.appendChild(histogram);
+    }
+
+    const alignments = shapes.alignments || [];
+    if (alignments.length > 0) {
+      shapesPanel.appendChild(element("h2", null, "Alignments"));
+      table(shapesPanel, null, ["Alignment", "Blocks"], alignments.map(function (entry) {
+        return [entry.bytes + " B", HEAPSCOPE.formatCount(entry.blocks)];
+      }));
+    }
+
+    const reallocs = shapes.reallocs;
+    if (reallocs) {
+      shapesPanel.appendChild(element("h2", null, "Reallocation"));
+      table(shapesPanel, null, ["Reallocs", "Moved", "Copied", "Grown by", "Shrunk by"], [[
+        HEAPSCOPE.formatCount(reallocs.count || 0),
+        HEAPSCOPE.formatCount(reallocs.moved || 0),
+        HEAPSCOPE.formatBytes(reallocs.bytesCopied || 0),
+        HEAPSCOPE.formatBytes(reallocs.bytesGrown || 0),
+        HEAPSCOPE.formatBytes(reallocs.bytesShrunk || 0),
+      ]]);
+    }
+
+    const zeroed = shapes.zeroed;
+    if (zeroed && zeroed.blocks) {
+      shapesPanel.appendChild(element("h2", null, "Zeroed on request"));
+      table(shapesPanel, null, ["Blocks", "Amount"], [[
+        HEAPSCOPE.formatCount(zeroed.blocks),
+        HEAPSCOPE.formatBytes(zeroed.bytes || 0),
+      ]]);
+    }
+
+    // Profiler cost.
+    const costPanel = document.getElementById("panel-cost");
+    const self = profile.selfMetrics || {};
+    costPanel.appendChild(element("h2", null, "What the profiler cost"));
+    costPanel.appendChild(element("p", "note",
+      "Every profile carries these so the overhead claim can be checked by the reader rather than taken on trust."));
+
+    const cost = self.captureCost;
+    if (cost && cost.captures) {
+      costPanel.appendChild(element("p", "note",
+        "Stack capture measured at " + (cost.nanos / cost.captures).toFixed(1) + " ns over "
+        + HEAPSCOPE.formatCount(cost.captures) + " sampled captures, at " + HEAPSCOPE.formatCount(cost.frames)
+        + " frames, using the " + cost.unwinder + " unwinder."));
+    }
+
+    const TABLES = [
+      ["Program points", self.programPoints],
+      ["Live blocks", self.liveBlocks],
+      ["Threads", self.threads],
+      ["Regions", self.regions],
+    ].filter(function (entry) { return entry[1]; });
+    if (TABLES.length > 0) {
+      table(costPanel, null, ["Table", "Entries", "Capacity", "Used", "Memory"], TABLES.map(function (entry) {
+        const usage = entry[1];
+        return [
+          entry[0],
+          HEAPSCOPE.formatCount(usage.entries || 0),
+          HEAPSCOPE.formatCount(usage.capacity || 0),
+          usage.capacity ? (usage.entries / usage.capacity * 100).toFixed(2) + "%" : "—",
+          HEAPSCOPE.formatBytes(usage.bytes || 0),
+        ];
+      }));
+    }
+
+    if (self.arena) {
+      costPanel.appendChild(element("h2", null, "Arena"));
+      table(costPanel, null, ["Reserved", "Used", "Chunks", "Refused", "Limit"], [[
+        HEAPSCOPE.formatBytes(self.arena.bytesReserved || 0),
+        HEAPSCOPE.formatBytes(self.arena.bytesUsed || 0),
+        HEAPSCOPE.formatCount(self.arena.chunks || 0),
+        HEAPSCOPE.formatCount(self.arena.refused || 0),
+        HEAPSCOPE.formatBytes(self.arena.limit || 0),
+      ]]);
+    }
+
+    if (self.captures) {
+      costPanel.appendChild(element("h2", null, "Stack captures"));
+      table(costPanel, null, ["Complete", "Truncated", "Suspect", "No frames"], [[
+        HEAPSCOPE.formatCount(self.captures.complete || 0),
+        HEAPSCOPE.formatCount(self.captures.truncated || 0),
+        HEAPSCOPE.formatCount(self.captures.suspect || 0),
+        HEAPSCOPE.formatCount(self.captures.noFrames || 0),
+      ]]);
+    }
+
+    // Modules.
+    const modulesPanel = document.getElementById("panel-modules");
+    modulesPanel.appendChild(element("h2", null, "Modules"));
+    modulesPanel.appendChild(element("p", "note",
+      "Where the code was loaded, so an address in this profile can be resolved later — on another machine, or after the process is gone."));
+    const modules = profile.modules || [];
+    if (modules.length === 0) {
+      modulesPanel.appendChild(element("div", "empty", "No modules were captured."));
+    } else {
+      table(modulesPanel, null, ["Path", "Loaded at", "Size", "Bias", "Build ID"], modules.map(function (module) {
+        return [
+          module.path || "—",
+          module.load || "—",
+          module.size ? HEAPSCOPE.formatBytes(module.size) : "—",
+          module.bias || "—",
+          module.buildId || "—",
+        ];
+      }));
+    }
+  })();
+}
+</script>
+</body>
+</html>

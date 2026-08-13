@@ -1,0 +1,30 @@
+# LeakSanitizer suppressions for ci/sanitizers.sh.
+#
+# LeakSanitizer ships with AddressSanitizer and is enabled by default on Linux
+# and not on macOS, so this file is why the two platforms can report the same
+# answer rather than differing by which tool happened to be on.
+#
+# One entry, and it is a fixture rather than the crate. `examples/cdylib_probe.rs`
+# starts a profiler inside a dynamically loaded library and `std::mem::forget`s
+# it, deliberately and with its reasons written down: the test needs the engine
+# still running when the library's thread allocates, and dropping it would arm
+# the exit handler with the default output path, dropping a `dhat-heap.json`
+# into whatever directory `cargo test` ran in. The 32 bytes LeakSanitizer
+# reports are that forgotten profiler, so the report is correct and the leak is
+# the fixture doing its job.
+#
+# `examples/lifecycle_probe.rs` is the second, for the same kind of reason. It is
+# the fixture behind `a_forgotten_profiler_is_still_written_at_exit`, whose whole
+# subject is what happens when a profiler is *not* dropped, and behind the fork
+# tests, where the child exits carrying a copy of the parent's heap. Both leaks
+# are the property under test.
+#
+# Scoped to each fixture's own image, not to a function and not to the crate. A
+# suppression that named `heapscope` would hide a real leak in the library the
+# moment one appeared; these can only ever silence allocations made from a
+# program that exists to leak. The library's own leaks stay visible, because
+# every other test binary links it and none of them is suppressed.
+leak:libcdylib_probe.so
+leak:cdylib_probe.dll
+leak:libcdylib_probe.dylib
+leak:lifecycle_probe

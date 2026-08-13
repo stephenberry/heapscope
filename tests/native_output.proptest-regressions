@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc ef1396520d7e8fa1bea0806f21cd16613ac1310e48685f4abfa9568b3d0553d1 # shrinks to stacks = [[], [], []], bytes = [10740523767359714881, 7706220306349835711], blocks = [], mode = Heap
+cc 9a4208229a8930087c18e6a2422d5bedb4304e2b31298fe98fcff9ca6bfc6b02 # shrinks to stacks = [[]], bytes = [], blocks = [], mode = Heap

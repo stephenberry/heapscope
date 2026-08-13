@@ -1,0 +1,10 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 527fcc9e1a040d4abe43c98a27707407f085db101153a9b0f7049a44962ecb1e # shrinks to points = [ProgramPoint { frames: [4096], counters: Counters { total_bytes: 1, total_blocks: 707, total_lifetime: 1, curr_bytes: 0, curr_blocks: 0, max_bytes: 0, max_blocks: 707, at_gmax_bytes: 0, at_gmax_blocks: 445 }, unretired_lifetime: 0 }, ProgramPoint { frames: [4096], counters: Counters { total_bytes: 1, total_blocks: 526, total_lifetime: 1, curr_bytes: 0, curr_blocks: 0, max_bytes: 0, max_blocks: 526, at_gmax_bytes: 0, at_gmax_blocks: 263 }, unretired_lifetime: 0 }]
+cc d63c475cc74139ab141ccfb115d7a2a454d147b6b3b770fac8c5c1bef6f0d729 # shrinks to points = [ProgramPoint { frames: [], counters: Counters { total_bytes: 65046, total_blocks: 1, total_lifetime: 65046, curr_bytes: 0, curr_blocks: 0, max_bytes: 51386, max_blocks: 1, at_gmax_bytes: 46761, at_gmax_blocks: 0 }, unretired_lifetime: 0 }, ProgramPoint { frames: [], counters: Counters { total_bytes: 11515, total_blocks: 1, total_lifetime: 11515, curr_bytes: 0, curr_blocks: 0, max_bytes: 5642, max_blocks: 1, at_gmax_bytes: 4626, at_gmax_blocks: 0 }, unretired_lifetime: 0 }], command = "", time_at_end = 0
+cc 2bfcc00bd13b8a8505be974d99c63e9ada990c92f93c66d6b8080e5cff513b1e # shrinks to points = [ProgramPoint { frames: [], counters: Counters { total_bytes: 527, total_blocks: 1, total_lifetime: 527, curr_bytes: 0, curr_blocks: 0, max_bytes: 100, max_blocks: 1, at_gmax_bytes: 1, at_gmax_blocks: 0 }, unretired_lifetime: 0 }], command = "", time_at_end = 0
+cc b072df9b8bca2d861b4e5a030959b292c75397517a86710cb5d06d977e638635 # shrinks to points = [ProgramPoint { frames: [], counters: Counters { total_bytes: 139, total_blocks: 1, total_lifetime: 139, curr_bytes: 0, curr_blocks: 0, max_bytes: 25, max_blocks: 1, at_gmax_bytes: 1, at_gmax_blocks: 0 }, unretired_lifetime: 0 }]
