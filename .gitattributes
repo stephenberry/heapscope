@@ -1,0 +1,19 @@
+# Every text file is LF in the working tree, on every platform.
+#
+# Without this, Git falls back to `core.autocrlf`, which the `windows-latest`
+# runner sets to true -- and three things in this repository are byte-sensitive:
+#
+#   `src/output/viewer.html` is embedded with `include_str!`, so its bytes are
+#   part of the compiled library. A CRLF checkout changes the page the crate
+#   emits, and it silently disarmed a test: `src/output/html.rs`'s durability
+#   check uses a sink that fails only once the page ends exactly `</html>\n`,
+#   which a CRLF page never does, so the write reported success and the
+#   assertion that a truncated page must not return `Ok` stopped testing
+#   anything. That is what failed the first `windows-latest` run.
+#
+#   `tests/data/*.txt` are compared line by line against generated output.
+#
+#   `ci/*.sh` run under bash on every platform in the matrix, Windows included.
+#
+# `text=auto` still lets Git detect and leave binary files alone.
+* text=auto eol=lf

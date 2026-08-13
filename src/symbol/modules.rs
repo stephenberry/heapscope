@@ -149,7 +149,14 @@ pub fn index_containing(modules: &[Module], address: usize) -> Option<usize> {
 ///
 /// Only the Unix backends have a build identity to format; the PE debug
 /// directory that Windows would need is not read yet.
-#[cfg(unix)]
+///
+/// The gate has to name `miri` as well, because it must match the two `imp`
+/// modules that call this — both of which are `not(miri)`, leaving the stub at
+/// the bottom of this file, which has no build identity to format. Under
+/// `cargo miri test --tests` the library is compiled as a dependency and so
+/// without `cfg(test)`, which removes the last caller: `cfg(unix)` alone made
+/// this dead code there, and the workflow's `-D warnings` made that an error.
+#[cfg(all(unix, not(miri)))]
 fn hex(bytes: &[u8]) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut text = String::with_capacity(bytes.len() * 2);
@@ -1008,7 +1015,7 @@ mod tests {
         assert!(containing(&[], 0x1000).is_none());
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, not(miri)))]
     #[test]
     fn hexadecimal_is_lower_case_and_zero_padded() {
         assert_eq!(hex(&[0x00, 0x0f, 0xa0, 0xff]), "000fa0ff");
