@@ -602,14 +602,28 @@ _malloc (in libsystem_malloc.dylib) + 32
         assert_eq!(Tool::parse("nm"), None);
     }
 
-    /// The preference list has to name every tool, or `--tool` would offer one
-    /// that automatic selection can never reach.
+    /// The preference list has to name every tool that can work here, or
+    /// `--tool` would offer one automatic selection can never reach.
+    ///
+    /// Windows names one, and that is a decision rather than an omission, so it
+    /// is pinned rather than described: `addr2line` resolves against section
+    /// VMAs and cannot take the relative virtual address a Windows profile
+    /// records, and `atos` does not exist there. Listing either would put a tool
+    /// in front of automatic selection that answers `??` for every address.
     #[test]
-    fn the_preference_order_covers_every_tool() {
+    fn the_preference_order_covers_every_tool_that_can_work_here() {
         let preferred = Tool::preference();
-        for tool in [Tool::Atos, Tool::LlvmSymbolizer, Tool::Addr2Line] {
-            assert!(preferred.contains(&tool), "{tool:?} is unreachable");
+        if cfg!(windows) {
+            assert_eq!(
+                preferred,
+                [Tool::LlvmSymbolizer],
+                "only llvm-symbolizer can resolve a relative virtual address"
+            );
+        } else {
+            for tool in [Tool::Atos, Tool::LlvmSymbolizer, Tool::Addr2Line] {
+                assert!(preferred.contains(&tool), "{tool:?} is unreachable");
+            }
+            assert_eq!(preferred.len(), 3, "a tool is listed twice");
         }
-        assert_eq!(preferred.len(), 3, "a tool is listed twice");
     }
 }
