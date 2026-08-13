@@ -877,7 +877,11 @@ fn symbolization_resolves_a_recorded_frame(profile: &json::Value) {
     for (address, file_address) in &mine {
         assert_eq!(
             *file_address,
-            address - image.bias,
+            // Wrapping, because `Module::file_address` is what produced the
+            // left-hand side and that is how it subtracts. An image mapped
+            // below its link-time base has a slide that runs the other way,
+            // and a plain `-` would panic here on a correct profile.
+            address.wrapping_sub(image.bias),
             "a frame rendered a file address that the module map contradicts"
         );
     }
@@ -891,7 +895,7 @@ fn symbolization_resolves_a_recorded_frame(profile: &json::Value) {
         image.start,
         image.size
     );
-    let known_in_file = known - image.bias;
+    let known_in_file = known.wrapping_sub(image.bias);
 
     // `nm` reports the address a symbol has *in the file*, which is an
     // independent source of truth for the bias — independent because it comes
