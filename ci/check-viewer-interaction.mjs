@@ -153,8 +153,24 @@ class Browser {
     return new Page(this, created.targetId, attached.sessionId);
   }
 
+  /**
+   * Waits for the browser to actually be gone, rather than only asking it.
+   *
+   * `kill()` sends a signal and returns; Chrome then takes its time flushing
+   * the profile directory it was given. Removing that directory in the
+   * meantime raced it, and on a Linux runner the race was lost: `ENOTEMPTY` on
+   * `profile/Default`, thrown out of the `finally` block **after** every check
+   * had already passed, so the job went red on its own cleanup.
+   */
   close() {
-    this.child.kill();
+    return new Promise((resolve) => {
+      if (this.child.exitCode !== null || this.child.signalCode !== null) {
+        resolve();
+        return;
+      }
+      this.child.once("exit", resolve);
+      this.child.kill();
+    });
   }
 }
 
@@ -659,8 +675,20 @@ try {
   console.error(`  FAIL ${failure.message}`);
   failures += 1;
 } finally {
-  browser.close();
-  rmSync(directory, { recursive: true, force: true });
+  await browser.close();
+  // Belt and braces behind the awaited exit: `maxRetries` is node's own answer
+  // to exactly this class (`ENOTEMPTY`, `EBUSY`, `EPERM`), and Chrome can leave
+  // a helper process writing for a moment after the one we spawned is gone.
+  //
+  // And a failure here is reported rather than thrown. By this point every
+  // check has run and been counted, so the exit code below is the verdict on
+  // the viewer; a temporary directory that would not delete says nothing about
+  // it, and turning that into a red build is how a green suite gets ignored.
+  try {
+    rmSync(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  } catch (cleanup) {
+    console.error(`  note: could not remove ${directory}: ${cleanup.message}`);
+  }
 }
 
 // The guard this replaces asked whether a duplicate name existed *anywhere*,
