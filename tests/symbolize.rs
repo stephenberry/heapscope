@@ -192,6 +192,7 @@ fn a_recorded_profile_resolves_to_the_function_that_allocated() {
     // ---- folded output ----
     a_folded_rendering_carries_the_resolved_names(&recorded);
     let_a_missing_binary_be_pointed_somewhere_else(&recorded, directory.path());
+    an_unreadable_image_is_reported_rather_than_called_the_wrong_build(directory.path());
 }
 
 /// Folded output, with the names the tool just resolved and the trimming those
@@ -297,19 +298,45 @@ fn let_a_missing_binary_be_pointed_somewhere_else(recorded: &Path, directory: &P
     let moved_path = directory.join("moved.native.json");
     std::fs::write(&moved_path, &moved).expect("the moved profile");
     assert!(json::parse(&moved).is_ok(), "the rewrite broke the JSON");
-    let _ = parsed;
 
-    // Without the mapping the image cannot be read, and the tool says so rather
-    // than reporting success over a profile it changed nothing in.
-    let blind = run(&[&moved_path.to_string_lossy(), "-o", "/dev/null"]);
-    assert!(
-        !blind.status.success(),
-        "resolving nothing at all reported success"
-    );
+    // Without the mapping the image cannot be read, and the tool **says so**.
+    //
+    // Not "and exits non-zero", which is what this asserted for a long time and
+    // never actually checked. The output went to `/dev/null`, and `write_output`
+    // writes `<name>.<pid>.tmp` beside its destination before renaming — so the
+    // tool was trying to create a file inside `/dev`, failing with `Operation
+    // not permitted`, and exiting non-zero for that reason. **Measured**: it does
+    // so even on a profile where every one of 35 frames resolved. The assertion
+    // was satisfied by an unwritable path, so the refusal it named was never
+    // reached, and the companion check below passed on a line `report` prints
+    // whatever the exit status is.
+    //
+    // Exiting zero here is the design rather than a shortfall: a profile spans
+    // the program and every library it loaded, and images this machine cannot
+    // symbolize — the dyld shared cache, every Windows system DLL — are the
+    // ordinary case. `symbolize` says as much where it skips one. What the tool
+    // owes the reader is the *report*, which is what is checked now, and the
+    // refusal for a run that consulted images and named nothing is pinned as a
+    // unit test on `verdict` instead.
+    let discarded = directory.join("blind.json");
+    let blind = run(&[
+        &moved_path.to_string_lossy(),
+        "-o",
+        &discarded.to_string_lossy(),
+    ]);
     let complaint = String::from_utf8_lossy(&blind.stderr);
     assert!(
-        complaint.contains("no such file here") || complaint.contains("resolved none"),
-        "the failure does not say the image was unreadable: {complaint}"
+        complaint.contains(elsewhere) && complaint.contains("no such file here"),
+        "the report does not name the image it could not read: {complaint}"
+    );
+
+    // And it changed nothing about the frames belonging to that image.
+    let blinded = json::parse(&std::fs::read_to_string(&discarded).expect("the profile"))
+        .expect("the profile is JSON");
+    assert_eq!(
+        frames(&blinded).len(),
+        frames(&parsed).len(),
+        "a run that could not read the image changed the frame table"
     );
 
     // With it, the same profile resolves.
@@ -352,6 +379,51 @@ fn a_dhat_file_is_refused_by_name(directory: &Path) {
 /// The other half of the rule every profile states about itself: *refuse a
 /// `formatVersion` you do not know*. A tool that tried anyway would be writing
 /// into a frame table that may mean something else.
+/// An image that is on this disk and that the symbolizer cannot read is not the
+/// same thing as a profile pointed at the wrong build, and must not be reported
+/// as one.
+///
+/// This is the Windows situation made portable. There, every system image has no
+/// PDB and never will, so a second run over an already-resolved profile has
+/// nothing left it can answer about — and counting those addresses as "asked"
+/// made the run report that it resolved none of them, which is the sentence
+/// reserved for the wrong build. A file that exists and is not an object file
+/// produces the same shape anywhere.
+///
+/// One module and one frame, so that nothing else can resolve and carry the run.
+fn an_unreadable_image_is_reported_rather_than_called_the_wrong_build(directory: &Path) {
+    let decoy = directory.join("not-an-object-file");
+    std::fs::write(&decoy, "this is text, not a Mach-O, ELF or PE image\n").expect("the decoy");
+
+    let path = directory.join("unreadable.native.json");
+    std::fs::write(
+        &path,
+        format!(
+            r#"{{"format":"heapscope-profile","formatVersion":1,
+                 "modules":[{{"path":{decoy:?},"load":"0x1000","start":"0x1000",
+                              "size":4096,"bias":"0x0"}}],
+                 "frames":[{{"addr":"0x1010","module":0,"fileAddr":"0x1010"}}],
+                 "points":[]}}"#
+        ),
+    )
+    .expect("the profile");
+
+    let outcome = run(&[
+        &path.to_string_lossy(),
+        "-o",
+        &directory.join("unreadable.out.json").to_string_lossy(),
+    ]);
+    let said = String::from_utf8_lossy(&outcome.stderr);
+    assert!(
+        outcome.status.success(),
+        "an image that could not be read was reported as the wrong build:\n{said}"
+    );
+    assert!(
+        said.contains("skipped"),
+        "the image that could not be read was not reported at all:\n{said}"
+    );
+}
+
 fn an_unknown_version_is_refused(directory: &Path) {
     let path = directory.join("future.native.json");
     std::fs::write(

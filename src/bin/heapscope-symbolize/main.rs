@@ -139,11 +139,25 @@ fn run() -> Result<ExitCode, String> {
     };
     write_output(options.output.as_deref(), &rendered)?;
 
-    // A run that resolved nothing at all, from a profile that had addresses to
-    // resolve, is a failure with a zero exit status unless it says so. The usual
-    // cause is a binary that is not the one the profile was recorded against —
-    // which produces exactly this: no errors, no names, and a file that looks
-    // fine.
+    verdict(&outcome, tool)?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Whether a finished run is a failure despite having written a file.
+///
+/// A run that resolved nothing at all, from images that were actually
+/// consulted, is a failure with a zero exit status unless it says so. The usual
+/// cause is a binary that is not the one the profile was recorded against —
+/// which produces exactly this: no errors, no names, and a file that looks fine.
+///
+/// Separate and pure so that it can be tested. The condition it exists for needs
+/// a binary that is the wrong build for a profile, which is not something a test
+/// can conjure portably, so an end-to-end test of it does not exist — and the
+/// end-to-end test that was believed to cover it turned out to be reporting a
+/// non-zero exit from an unwritable `-o /dev/null` instead. A rule nothing
+/// exercises is the failure this crate keeps finding; the remedy here is to make
+/// the rule a thing a unit test can hold.
+fn verdict(outcome: &Outcome, tool: Tool) -> Result<(), String> {
     if outcome.resolved == 0 && outcome.asked > 0 {
         return Err(format!(
             "{} resolved none of the {} addresses asked about. \
@@ -153,11 +167,25 @@ fn run() -> Result<ExitCode, String> {
             outcome.asked
         ));
     }
-    Ok(ExitCode::SUCCESS)
+    Ok(())
 }
 
 #[derive(Default)]
 struct Outcome {
+    /// Addresses an image actually answered about.
+    ///
+    /// Not addresses this run would have liked to know. An image that is not on
+    /// this disk contributes none of them — that arm has always `continue`d
+    /// before counting — and neither does one the symbolizer could not read.
+    /// Both appear in `skipped` instead.
+    ///
+    /// The distinction decides the exit status, through [`verdict`]. Counting
+    /// an image that errored made a run whose only remaining work was such an
+    /// image report that it resolved none of the addresses it asked about,
+    /// which is the sentence reserved for a profile pointed at the wrong build.
+    /// **Measured on Windows**, where the system images have no PDB and never
+    /// will, so a second run over an already-resolved profile has nothing else
+    /// left and failed the idempotence half of `tests/symbolize.rs`.
     asked: usize,
     resolved: usize,
     /// Images that could not be consulted, and why.
@@ -189,10 +217,11 @@ fn symbolize(profile: &mut Profile, tool: Tool, options: &Options) -> Outcome {
         }
 
         let addresses: Vec<u64> = frames.iter().map(|&(_, address)| address).collect();
-        outcome.asked += addresses.len();
 
         match tool::resolve(tool, &image.to_string_lossy(), recorded.load, &addresses) {
             Ok(answers) => {
+                // Counted here, not before the call: see `Outcome::asked`.
+                outcome.asked += addresses.len();
                 for (&(at, _), answer) in frames.iter().zip(&answers) {
                     if let Some(resolution) = answer {
                         profile.resolve_frame(at, resolution);
@@ -370,4 +399,72 @@ fn parse_arguments() -> Result<Option<Options>, String> {
         replacements,
         quiet,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{verdict, Outcome, Tool};
+
+    fn skipped(reason: &str) -> Vec<(String, String)> {
+        vec![(String::from("/some/image"), String::from(reason))]
+    }
+
+    /// The condition the rule exists for: images were consulted and answered
+    /// with nothing. A profile pointed at the wrong build looks exactly like
+    /// this, and looks like success everywhere else.
+    #[test]
+    fn a_run_that_consulted_images_and_named_nothing_is_a_failure() {
+        let outcome = Outcome {
+            asked: 12,
+            resolved: 0,
+            skipped: Vec::new(),
+        };
+        let complaint = verdict(&outcome, Tool::LlvmSymbolizer)
+            .expect_err("resolving none of twelve addresses reported success");
+        assert!(
+            complaint.contains("12") && complaint.contains("--binary"),
+            "the complaint says neither how many nor what to do: {complaint}"
+        );
+    }
+
+    /// The condition it must *not* fire on, which is what made it wrong before:
+    /// every image was skipped, so nothing was ever asked. On Windows that is
+    /// an ordinary second run — the system images have no PDB — and on any
+    /// platform it is a profile whose binaries are elsewhere.
+    #[test]
+    fn a_run_with_nothing_it_could_consult_is_not_a_failure() {
+        let outcome = Outcome {
+            asked: 0,
+            resolved: 0,
+            skipped: skipped("no such file here"),
+        };
+        assert!(
+            verdict(&outcome, Tool::LlvmSymbolizer).is_ok(),
+            "a run that could consult nothing was reported as the wrong build"
+        );
+    }
+
+    /// Partial success is success. A profile spans the program and every
+    /// library it loaded, and the images this machine cannot symbolize are
+    /// routine rather than exceptional — which is why one image failing is not
+    /// the run failing.
+    #[test]
+    fn resolving_some_addresses_is_not_a_failure_however_many_images_were_skipped() {
+        let outcome = Outcome {
+            asked: 30,
+            resolved: 1,
+            skipped: skipped("no debug info"),
+        };
+        assert!(
+            verdict(&outcome, Tool::LlvmSymbolizer).is_ok(),
+            "a run that named a frame was reported as having named none"
+        );
+    }
+
+    /// A run with no work at all — a profile with no frames, or one already
+    /// wholly resolved — is not a failure either.
+    #[test]
+    fn a_run_with_no_work_is_not_a_failure() {
+        assert!(verdict(&Outcome::default(), Tool::LlvmSymbolizer).is_ok());
+    }
 }
