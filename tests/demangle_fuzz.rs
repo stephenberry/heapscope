@@ -28,6 +28,18 @@ const CORPUS: &str = include_str!("data/mangled-symbols.txt");
 /// unbounded fails it by orders of magnitude.
 const PATIENCE: Duration = Duration::from_secs(2);
 
+/// Whether a sanitizer is watching, as declared by `ci/sanitizers.sh`.
+///
+/// Same argument as the `cfg_attr(miri, ignore)` markers here: this file drives
+/// `src/symbol/demangle`, which contains no `unsafe` at all, no raw memory and
+/// no threads, so neither ASan nor TSan can find anything in it. The invariant
+/// is enforced rather than trusted, by `tests/no_dependencies.rs`.
+///
+/// `cfg(sanitize = "..")` is unstable, so the harness says so instead.
+fn under_a_sanitizer() -> bool {
+    std::env::var_os("HEAPSCOPE_SANITIZER").is_some()
+}
+
 fn corpus() -> Vec<&'static str> {
     CORPUS
         .lines()
@@ -149,7 +161,7 @@ proptest! {
     // resolving the current directory, which its isolation makes a hard abort —
     // one that takes every other test in this binary with it.
     #![proptest_config(ProptestConfig {
-        cases: if cfg!(miri) { 4 } else { 4096 },
+        cases: if cfg!(miri) || under_a_sanitizer() { 4 } else { 4096 },
         failure_persistence: if cfg!(miri) {
             None
         } else {
@@ -249,6 +261,12 @@ fn nesting_far_past_any_limit_does_not_overflow_the_stack() {
 #[test]
 #[cfg_attr(miri, ignore = "walks the whole corpus; no unsafe here to check")]
 fn demangling_is_deterministic() {
+    if under_a_sanitizer() {
+        eprintln!(
+            "SKIPPED under a sanitizer: the corpus walk — no unsafe in the demangler to find"
+        );
+        return;
+    }
     for symbol in corpus() {
         let mut first = String::new();
         let mut second = String::new();

@@ -194,8 +194,23 @@ run_sanitizer() {
   #
   # Serial, because one process holds one engine: the suites that start a
   # profiler cannot overlap, and under instrumentation the margin is thinner.
+  #
+  # `HEAPSCOPE_SANITIZER` tells the suite a sanitizer is watching, so that the
+  # work which cannot produce a finding can stand down. `cfg(sanitize = "..")`
+  # would be the natural way to ask and is unstable, so the harness says so
+  # itself — the same arrangement `tests/symbolize.rs` uses to declare that it
+  # cannot spawn a subprocess.
+  #
+  # What stands down is the demangler's corpus walks, on the same argument that
+  # already excuses them from Miri: `src/symbol/demangle` contains no `unsafe`
+  # at all, so neither ASan nor TSan has anything there to find. That is not a
+  # claim anyone has to keep true by hand — `tests/no_dependencies.rs` fails if
+  # an `unsafe` block appears in that directory, which is why the exemption
+  # cannot quietly outlive its reason. Measured under Miri, where the same cut
+  # took the job from 37 minutes to about 15.
   echo "  suite:"
-  cargo +nightly test ${extra[@]+"${extra[@]}"} --target "$target" --tests -- --test-threads=1
+  HEAPSCOPE_SANITIZER="$sanitizer" \
+    cargo +nightly test ${extra[@]+"${extra[@]}"} --target "$target" --tests -- --test-threads=1
 }
 
 failed=0

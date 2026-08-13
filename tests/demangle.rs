@@ -52,6 +52,32 @@ fn reference(symbol: &str) -> Option<String> {
     (!rendered.is_empty()).then_some(rendered)
 }
 
+/// Whether a sanitizer is watching, as declared by the harness running this.
+///
+/// The corpus walks below cost minutes and cannot produce a sanitizer finding:
+/// `src/symbol/demangle` contains no `unsafe` at all, no raw memory and no
+/// threads, so there is nothing for ASan or TSan to see. That is the same
+/// argument the `cfg_attr(miri, ignore)` on each of them already makes, and it
+/// is not an argument anyone has to keep true by hand —
+/// `tests/no_dependencies.rs` fails if an `unsafe` block appears in that
+/// directory.
+///
+/// Read from the environment because `cfg(sanitize = "..")` is unstable, and
+/// set by `ci/sanitizers.sh`. The harness declaring its own constraints is the
+/// arrangement `tests/symbolize.rs` uses for the same reason.
+fn under_a_sanitizer() -> bool {
+    std::env::var_os("HEAPSCOPE_SANITIZER").is_some()
+}
+
+/// Says so, loudly, and returns whether the caller should stop.
+fn stood_down(what: &str) -> bool {
+    if under_a_sanitizer() {
+        eprintln!("SKIPPED under a sanitizer: {what} — no unsafe in the demangler to find");
+        return true;
+    }
+    false
+}
+
 fn corpus() -> impl Iterator<Item = &'static str> {
     CORPUS
         .lines()
@@ -68,6 +94,9 @@ fn corpus() -> impl Iterator<Item = &'static str> {
 #[test]
 #[cfg_attr(miri, ignore = "walks the whole corpus; no unsafe here to check")]
 fn every_symbol_the_reference_demangles_demangles_identically_here() {
+    if stood_down("every_symbol_the_reference_demangles_demangles_identically_here") {
+        return;
+    }
     let mut checked = 0;
     let mut mismatches = Vec::new();
     for symbol in corpus() {
@@ -99,6 +128,9 @@ fn every_symbol_the_reference_demangles_demangles_identically_here() {
 #[test]
 #[cfg_attr(miri, ignore = "walks the whole corpus; no unsafe here to check")]
 fn the_corpus_covers_both_manglings_and_every_construct_that_needs_covering() {
+    if stood_down("the_corpus_covers_both_manglings_and_every_construct_that_needs_covering") {
+        return;
+    }
     let demangled: BTreeSet<String> = corpus().filter_map(ours).collect();
     let all = demangled.iter().cloned().collect::<Vec<_>>().join("\n");
 
@@ -157,6 +189,9 @@ fn the_corpus_covers_both_manglings_and_every_construct_that_needs_covering() {
 #[test]
 #[cfg_attr(miri, ignore = "walks the whole corpus; no unsafe here to check")]
 fn the_only_divergence_from_the_reference_is_where_it_refuses_outright() {
+    if stood_down("the_only_divergence_from_the_reference_is_where_it_refuses_outright") {
+        return;
+    }
     let mut improvements = 0;
     for symbol in corpus() {
         if reference(symbol).is_some() {
@@ -184,6 +219,9 @@ fn the_only_divergence_from_the_reference_is_where_it_refuses_outright() {
 #[test]
 #[cfg_attr(miri, ignore = "walks the whole corpus; no unsafe here to check")]
 fn real_symbols_are_far_inside_the_limits() {
+    if stood_down("real_symbols_are_far_inside_the_limits") {
+        return;
+    }
     let longest = corpus().map(str::len).max().unwrap_or(0);
     let widest = corpus()
         .filter_map(ours)

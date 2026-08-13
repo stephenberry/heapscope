@@ -195,16 +195,38 @@ jobs:
   # Linux x86_64 rather than the macOS runner: it is where both sanitizers are
   # best supported, and the frame-pointer walk needs `-C force-frame-pointers`
   # there, which the script sets.
+  # One job per sanitizer, not one job running both.
+  #
+  # `ci/sanitizers.sh` has always taken `address|thread|all`, and the two share
+  # nothing at run time: separate `RUSTFLAGS`, separate target directories,
+  # separate positive controls. Running them as `all` on one runner made the
+  # job the length of both put together — **measured at over two hours**, where
+  # the whole rest of the matrix finishes in under two minutes and Miri, the
+  # other interpreter-class job, takes 51. Two runners cost the same total
+  # machine time and halve the wall clock.
+  #
+  # `timeout-minutes` because this job had no bound short of GitHub's six-hour
+  # default, and a job with no bound cannot report that it is stuck — it can
+  # only be watched. 90 is roughly triple what the slower half should now take.
   sanitizers:
-    name: Sanitizers
+    name: Sanitizers (${{ matrix.sanitizer }})
     runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [address, thread]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: rust-src
       - uses: Swatinem/rust-cache@v2
-      - run: ci/sanitizers.sh all
+        with:
+          # Or both jobs share one cache key and race to write it, and each
+          # restores a target directory built with the other's `RUSTFLAGS`.
+          key: ${{ matrix.sanitizer }}
+      - run: ci/sanitizers.sh ${{ matrix.sanitizer }}
         env:
           SANITIZER_TARGET: x86_64-unknown-linux-gnu
 
