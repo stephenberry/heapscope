@@ -18,3 +18,22 @@
 # force-reinitializes every lock. `internals/fork.rs` and `tests/lifecycle.rs`
 # check that end to end against a real forked process.
 mutex:force_reinit_releases_an_orphaned_lock
+
+# `tests/signal_reentrancy.rs` raises a signal from inside the allocator shim
+# and allocates in the handler. TSan reports `signal-unsafe call inside of a
+# signal` for the `malloc` that results, and it is right: allocating in a signal
+# handler is not async-signal-safe, and never was.
+#
+# That is the premise of the test rather than a finding about this crate. The
+# allocation originates in the test's own handler; `heapscope::Alloc` appears in
+# the stack only because it is the global allocator the program installed. What
+# section 4.6 claims is narrower than "this is safe" — it is that a signal
+# arriving while the interrupted thread is inside the shim finds the reentrancy
+# guard already held, so the handler's allocation is forwarded to the inner
+# allocator and not recorded, and the profiler does not deadlock against itself.
+# The test exists to make a program do the unsafe thing and show that heapscope
+# survives it.
+#
+# Suppressed rather than skipped, for the same reason as the entry above: the
+# test's own assertions are the check, and TSan's objection is to the workload.
+signal:signal_reentrancy
