@@ -134,13 +134,20 @@ run_sanitizer() {
 
   # `tests/cdylib_tls.rs` `dlopen`s an instrumented shared object, and on an ELF
   # platform that fails with `undefined symbol:
-  # __asan_option_detect_stack_use_after_return`. Rust links ASan's runtime
-  # *statically* into the executable, so its symbols are not in the dynamic
-  # table and the library loaded at run time cannot resolve them. Exporting them
-  # is the fix; there is nothing to do on macOS, where the runtime is already a
-  # dylib every image can see.
-  case "$sanitizer:$target" in
-    address:*linux*) RUSTFLAGS="$RUSTFLAGS -C link-arg=-Wl,--export-dynamic" ;;
+  # __asan_option_detect_stack_use_after_return`. Rust links the sanitizer
+  # runtime *statically* into the executable, so its symbols are not in the
+  # dynamic table and the library loaded at run time cannot resolve them.
+  # Exporting them is the fix; there is nothing to do on macOS, where the
+  # runtime is already a dylib every image can see.
+  #
+  # Both sanitizers, not just ASan. This read `address:*linux*` for as long as
+  # the thread half had never got far enough to need it — TSan died in the
+  # library suite, three suites before this one. With that fixed it arrived
+  # immediately, as `undefined symbol: __tsan_func_entry`, which is the same
+  # sentence about a different runtime. Nothing here was ever specific to ASan;
+  # the case was narrow because only one arm had been executed.
+  case "$target" in
+    *linux*) RUSTFLAGS="$RUSTFLAGS -C link-arg=-Wl,--export-dynamic" ;;
   esac
 
   # ASan's use-after-return detection moves locals into a heap-allocated "fake
