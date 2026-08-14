@@ -7,10 +7,12 @@
 | `aarch64-apple-darwin` | on by default | frame-pointer walk | by execution |
 | `aarch64-unknown-linux-gnu` | on by default | frame-pointer walk | by execution |
 | `x86_64-unknown-linux-gnu` | `-C force-frame-pointers=yes` | frame-pointer walk | by execution |
-| `x86_64-pc-windows-msvc` | not needed | `RtlCaptureStackBackTrace` | built and run under Wine, which is not Windows |
+| `x86_64-pc-windows-msvc` | not needed | `RtlCaptureStackBackTrace` | by execution |
 | musl / Alpine | — | — | not supported, and never will be ([why](#musl--alpine-will-never-be-supported)) |
 
-Everything in this documentation is verified by execution on the first three. On Windows, in-process symbolization has never been executed anywhere — `SymFromAddr` cannot run under Wine — so it is compiled and reviewed against Microsoft's documentation and unproven until a native run. [What the Windows path does and does not cover](symbolization.md#what-is-verified-and-what-is-not).
+All four run the suite on every push, Windows natively rather than under Wine — which is what settles in-process symbolization there, since `SymFromAddr` cannot execute under an emulator. Two sanitizers and Miri run the suite as well, each sanitizer behind a positive control that fails the job if it cannot see a planted defect through this crate's `#[global_allocator]`.
+
+What is still unproven is narrower and named: the cost of `RtlCaptureStackBackTrace` on Windows is unmeasured, no Windows browser has opened the bundled page, and `bias` on Windows is a relative virtual address rather than the address the file records — see [symbolization](symbolization.md#what-is-verified-and-what-is-not).
 
 Why each platform captures stacks the way it does is in [stack capture](stack-capture.md).
 

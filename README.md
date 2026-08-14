@@ -69,7 +69,7 @@ There are four formats and asking for several is nearly free: they all come from
 | `x86_64-unknown-linux-gnu` | `-C force-frame-pointers=yes` | frame-pointer walk |
 | `x86_64-pc-windows-msvc` | not needed | `RtlCaptureStackBackTrace` |
 
-musl / Alpine is not supported and never will be. Everything documented here is verified by execution on the first three; Windows is built and run under Wine, which is not Windows. [What that leaves unproven](docs/platforms.md).
+musl / Alpine is not supported and never will be. All four targets run the suite on every push, Windows natively. [What that still leaves unproven](docs/platforms.md).
 
 ## Documentation
 
@@ -88,7 +88,9 @@ musl / Alpine is not supported and never will be. Everything documented here is 
 
 Pre-1.0, and the version number is the promise: the public API may still change. The engine, the three emitters, the bundled viewer, sampling, and the test-time budgets are built and tested.
 
-What stands between this and 1.0 is mostly evidence rather than features. Continuous integration has not yet completed a run, so the four-platform matrix is verified locally — natively on macOS aarch64, under Docker on both Linux targets, and under Wine for Windows — rather than on a runner. A native Windows run is the other gap.
+What stands between this and 1.0 is evidence rather than features, and most of it has now been gathered. The four-platform matrix runs on every push and passes: macOS aarch64, Linux x86_64, Linux aarch64, and Windows — the last natively rather than under Wine, which also settles in-process symbolization there. ThreadSanitizer and AddressSanitizer both run the suite, each behind a positive control that fails the job if the sanitizer cannot see a planted defect through this crate's `#[global_allocator]`, and Miri runs it under the race detector.
+
+What is still open is narrower: no Windows browser has opened the bundled page, `dh_view.html` is checked against a stub DOM rather than a real one, and the cost of `RtlCaptureStackBackTrace` on Windows is unmeasured. [dev/PLAN.md](https://github.com/stephenberry/heapscope/blob/main/dev/PLAN.md) keeps the full list.
 
 `heapscope::internals` and `heapscope::unwind` are public but `#[doc(hidden)]`, and carry no stability promise: they exist because the benchmarks, the reference tracker and the property tests need to observe the engine. The supported surface is what the documentation shows, and it is written down and enforced by a test, so growing it is a decision rather than an accident.
 
