@@ -168,6 +168,35 @@ run_sanitizer() {
     export LSAN_OPTIONS="suppressions=$root/ci/lsan-suppressions.txt${LSAN_OPTIONS:+:$LSAN_OPTIONS}"
   fi
 
+  # TSan's *deadlock detector* cannot represent this crate, and says so by
+  # aborting the process rather than by reporting anything:
+  #
+  #   ThreadSanitizer: CHECK failed: sanitizer_deadlock_detector.h:67
+  #   "((n_all_locks_)) < ((sizeof(all_locks_with_contexts_)/...))" (0x80, 0x80)
+  #
+  # 0x80 is 128, the fixed size of its per-thread lock table. This crate holds
+  # **131** locks: `SHARDS` is 64 for the live-block table and 64 again for the
+  # program-point table (`internals/live.rs`, `internals/pp.rs`), plus the peak
+  # gate, the arena, and the region intern lock. A test that touches enough
+  # shards therefore walks straight past the limit.
+  #
+  # **Measured**: it killed the run 83 tests into the 526 in the library suite,
+  # right after the multi-threaded engine tests, and left the job to sit until
+  # something stopped it -- 149 minutes on one run, and 90 on the next, which is
+  # what `timeout-minutes` was added to bound. It was never slow. It was dead.
+  #
+  # What this gives up is nothing this job was relied on for. The *race*
+  # detector is untouched, and that is what section 8's sanitizer item asks for
+  # -- the first run against the real `os_unfair_lock`, the real allocator and
+  # real threads, where Miri only ever sees the `cfg(miri)` backend. Lock
+  # *ordering* has its own authority here and always has: `internals/order.rs`
+  # enforces the documented order in debug builds, which is a check that knows
+  # this crate's four lock families rather than one that runs out of slots at
+  # 128.
+  if [ "$sanitizer" = thread ]; then
+    export TSAN_OPTIONS="detect_deadlocks=0${TSAN_OPTIONS:+:$TSAN_OPTIONS}"
+  fi
+
   cargo +nightly build ${extra[@]+"${extra[@]}"} --target "$target" \
     --manifest-path "$probe_manifest"
   local binary="$CARGO_TARGET_DIR/$target/debug/sanitizer-probe"
