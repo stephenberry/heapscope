@@ -1,0 +1,20 @@
+# ThreadSanitizer suppressions, one entry, named at the site rather than broad.
+#
+# `force_reinit_releases_an_orphaned_lock` acquires a lock on a thread that then
+# exits without releasing it -- the shape a `fork` leaves in the child, an owner
+# that no longer exists -- and then calls `RawLock::force_reinit` and takes the
+# lock again to prove it recovered. TSan reports that second acquisition as
+# `double lock of a mutex`, and it is right about what it saw: from its model
+# the mutex was locked and never unlocked. It has no way to see `force_reinit`,
+# which overwrites the lock word rather than unlocking it, because overwriting
+# is exactly what recovering a lock whose owner is gone has to mean.
+#
+# So the report is a modelling gap and not a defect, and the test is suppressed
+# rather than skipped: its own assertions -- that the orphaned lock refuses,
+# and that it accepts after `force_reinit` -- are the real check and still run.
+# Skipping it would lose them to silence TSan.
+#
+# The mechanism this covers is section 4.6's `fork` row, where `child`
+# force-reinitializes every lock. `internals/fork.rs` and `tests/lifecycle.rs`
+# check that end to end against a real forked process.
+mutex:force_reinit_releases_an_orphaned_lock

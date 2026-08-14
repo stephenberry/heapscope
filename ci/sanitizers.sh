@@ -193,8 +193,14 @@ run_sanitizer() {
   # enforces the documented order in debug builds, which is a check that knows
   # this crate's four lock families rather than one that runs out of slots at
   # 128.
+  #
+  # The suppression file carries one entry, for a test whose subject is
+  # recovering a lock whose owner is gone. See ci/tsan-suppressions.txt; the
+  # arrangement is the same as ci/lsan-suppressions.txt, and for the same
+  # reason -- a report that is right about what it saw and wrong about whether
+  # it is a defect, named at the site rather than silenced broadly.
   if [ "$sanitizer" = thread ]; then
-    export TSAN_OPTIONS="detect_deadlocks=0${TSAN_OPTIONS:+:$TSAN_OPTIONS}"
+    export TSAN_OPTIONS="detect_deadlocks=0:suppressions=$root/ci/tsan-suppressions.txt${TSAN_OPTIONS:+:$TSAN_OPTIONS}"
   fi
 
   cargo +nightly build ${extra[@]+"${extra[@]}"} --target "$target" \
@@ -237,6 +243,13 @@ run_sanitizer() {
   # an `unsafe` block appears in that directory, which is why the exemption
   # cannot quietly outlive its reason. Measured under Miri, where the same cut
   # took the job from 37 minutes to about 15.
+  # Said here rather than left to the tests to say. Each one does print a line
+  # naming itself, and `libtest` captures the output of a test that passes, so
+  # none of it reaches this log -- which would make a suite that quietly stopped
+  # checking exactly as invisible as the comment above says it must not be.
+  echo "  standing down: the demangler corpus walks in tests/demangle{,_fuzz}.rs"
+  echo "                 (no unsafe in src/symbol/demangle for a sanitizer to find;"
+  echo "                  enforced by tests/no_dependencies.rs, not assumed)"
   echo "  suite:"
   HEAPSCOPE_SANITIZER="$sanitizer" \
     cargo +nightly test ${extra[@]+"${extra[@]}"} --target "$target" --tests -- --test-threads=1
