@@ -69,20 +69,24 @@ It does not rewrite the bundled HTML page: that page renders from display names 
 
 In-process symbolization does not work on the binaries people ship: on a stripped image `dladdr` returns *success* with a null symbol name, and `strip = true` is common in release profiles. Resolving offline also means a profile recorded on one machine can be symbolized on another, against an archived build, a year later — which is why the build identity is recorded alongside the path.
 
-Whether a frame is named or not, it stays resolvable afterwards by a tool that was not running when the profile was recorded. In a rendered frame, the second number is the address **as it appears in the file**, not an offset from where the image was mapped — those are different numbers on macOS, where file addresses start at 0x1_0000_0000, and on a non-PIE executable, where they start at 0x400000. It is what the ELF tools take directly:
+Whether a frame is named or not, it stays resolvable afterwards by a tool that was not running when the profile was recorded. In a rendered frame, the second number is the address **as it appears in the file**, not an offset from where the image was mapped — those are different numbers on macOS, where file addresses start at 0x1_0000_0000, and on a non-PIE executable, where they start at 0x400000. It is what the ELF tools take, less one.
+
+Every recorded frame is a return address, the instruction *after* the call, so ask about one byte earlier to name the call itself. The address as recorded names whatever the compiler placed next, which across inlining is often another function entirely: on Linux, a `Vec` growing in `finish_grow` resolves to the `map_err` inlined after the allocator call. For a frame recorded at file address `0x10002c1f0`, ask about `0x10002c1ef`, and ask for inlined frames too, which name the function the code lies in as well as the one inlined there:
 
 ```sh
-llvm-symbolizer --obj=/path/to/program 0x10002c1f0
-addr2line -f -C -e /path/to/program 0x10002c1f0
+llvm-symbolizer --obj=/path/to/program --inlines 0x10002c1ef
+addr2line -f -C -i -e /path/to/program 0x10002c1ef
 ```
 
-Every recorded frame is a return address, the instruction *after* the call, so ask about one byte earlier to name the call itself. The address as recorded names whatever the compiler placed next, which across inlining is often another function entirely: on Linux, a `Vec` growing in `finish_grow` resolves to the `map_err` inlined after the allocator call. `heapscope-symbolize` makes that adjustment for you.
-
-`atos` works from the runtime address instead, given the image's load address, which the profile's module map records alongside the path:
+`atos` works from the runtime address instead, given the image's load address, which the profile's module map records alongside the path. The same one byte applies:
 
 ```sh
-atos -o /path/to/program -l 0x1044a0000 0x1044c81f0
+atos -o /path/to/program -l 0x1044a0000 -i 0x1044c81ef
 ```
+
+`heapscope-symbolize` makes the adjustment for you, and the names this library finds in-process are looked up the same way. The numbers a profile records are unchanged: `addr`, `fileAddr`, and `symbolOffset` are still measured from the return address.
+
+A profile already resolved by the 0.1.0 `heapscope-symbolize` carries names found at the return address, and running a newer one over it changes nothing, because a frame that already has a `function` is never asked about again. Resolve the original recording instead.
 
 **On macOS, use `atos` for system libraries.** Almost everything under `/usr/lib` is mapped from the dyld shared cache rather than from the file at that path, and a cache image's segments are laid out at cache addresses. The recorded offset is therefore an address in the cache, not in the file — for `/usr/lib/dyld`, `0x1801344e4` where the file wants `0x204e4`, a difference of the in-cache `__TEXT` address — so `llvm-symbolizer` and `addr2line` resolve it to nothing even though the file exists and its UUID matches. `atos` works, because it takes the load address this crate records as `image_base` and asks the running system. Your own binaries and anything you built are unaffected.
 
