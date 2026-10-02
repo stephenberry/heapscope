@@ -51,8 +51,8 @@
 
 use std::fmt;
 use std::num::NonZeroU64;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
-use std::time::Duration;
+use std::sync::atomic::{fence, AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use super::arena::Arena;
 use super::clock::{Clock, TimeSource};
@@ -411,11 +411,13 @@ pub struct Reset {
 pub enum ResetError {
     /// Recording has stopped, or never started.
     ///
-    /// A stopped run's profile has been, or is being, written from its final
-    /// counts, and [`HeapStats::get`](crate::HeapStats::get) keeps answering
-    /// with them. Restarting them then would change numbers a reader has
-    /// already been given.
-    NotRunning,
+    /// The same condition [`StatsError::NotRecording`](crate::StatsError::NotRecording)
+    /// names, seen from the other side. A run stops when it is stopped
+    /// explicitly or when the process starts to exit, and its profile has then
+    /// been, or is being, written from its final counts, which
+    /// [`HeapStats::get`](crate::HeapStats::get) keeps answering with.
+    /// Restarting them would change numbers a reader has already been given.
+    NotRecording,
     /// This process is a `fork` child of a profiled parent.
     ///
     /// The counters came across the `fork` and describe the parent's run, as
@@ -430,26 +432,35 @@ pub enum ResetError {
     ///
     /// Either it is already inside it (this was called from a signal handler
     /// that interrupted an allocation, or from a `Drop` running under the
-    /// allocator) or the profiler's table of threads is full. A restart takes
-    /// locks the interrupted allocation may hold, and on Apple platforms taking
-    /// one twice kills the process rather than deadlocking it.
-    Reentrant,
+    /// allocator) or the profiler's table of threads is full, so this thread
+    /// has no slot to enter with. A restart takes locks an interrupted
+    /// allocation may hold, and on Apple platforms taking one twice kills the
+    /// process rather than deadlocking it.
+    ///
+    /// One variant for both because the profiler's entry point answers one
+    /// question, whether this thread may enter now, on the allocator's hot
+    /// path; telling the two apart would add a branch there for the sake of an
+    /// error message here. What the two have in common is the remedy: call
+    /// again from ordinary code on a thread the profiler already knows, which
+    /// any thread that has allocated is.
+    CannotEnter,
     /// Other threads kept the profiler busy past the deadline.
     ///
     /// A restart needs a quiet point, when no thread is midway through moving
-    /// a counter, and waits for one for as long as a profile written at
-    /// shutdown would. A thread stopped inside the profiler, under a debugger
-    /// say, can hold it off for longer than that.
+    /// a counter or a live-block entry, and waits for one for as long as a
+    /// profile written at shutdown would. A thread stopped inside the
+    /// profiler, under a debugger say, can hold it off for longer than that.
     Busy,
 }
 
 impl fmt::Display for ResetError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ResetError::NotRunning => write!(
+            ResetError::NotRecording => write!(
                 f,
-                "the heapscope profiler is not recording, so there are no counts \
-                 to restart; reset before the profiler is dropped"
+                "the heapscope profiler has stopped recording, explicitly or \
+                 because the process is exiting, so its counts are final and \
+                 there is nothing to restart"
             ),
             ResetError::ForkedChild => write!(
                 f,
@@ -461,7 +472,7 @@ impl fmt::Display for ResetError {
                 "the profiler reported an internal failure and stopped \
                  recording; restarting would carry its live counts forward"
             ),
-            ResetError::Reentrant => write!(
+            ResetError::CannotEnter => write!(
                 f,
                 "this thread could not enter the profiler to restart its counts: \
                  it is already inside it (a signal handler, or a Drop running \
@@ -529,13 +540,16 @@ pub struct GlobalStats {
     pub curr_bytes: u64,
     /// Live blocks now.
     pub curr_blocks: u64,
-    /// Greatest live bytes reached. DHAT's `gmax`.
+    /// Greatest live bytes reached since the run started or its counts were
+    /// last restarted. DHAT's `gmax`.
     pub max_bytes: u64,
     /// Live blocks at the moment of that peak.
     pub max_blocks: u64,
-    /// Bytes ever allocated.
+    /// Bytes allocated since the run started or its counts were last
+    /// restarted.
     pub total_bytes: u64,
-    /// Blocks ever allocated.
+    /// Blocks allocated since the run started or its counts were last
+    /// restarted.
     pub total_blocks: u64,
     /// Clock reading at the peak. DHAT's `tg`.
     pub time_at_max: u64,
@@ -666,13 +680,20 @@ pub struct Engine {
     /// generates no coherence traffic.
     sampling: AtomicU64,
 
+    /// Twice the number of restarts of the counts, plus one while a restart is
+    /// being applied: a sequence lock around [`Engine::reset`].
+    ///
+    /// A reading of the counters outside the gate, which is what
+    /// [`HeapStats::get`](crate::HeapStats::get) is, cannot otherwise say
+    /// which window it read. [`Engine::read_window`] is the reader's half, and
+    /// the comments there and in [`Engine::reset`] give the orderings.
+    reset_sequence: AtomicU64,
     /// The most recent restart of the counts, field by field. See [`Reset`].
     ///
     /// Written only by [`Engine::reset`], with the peak gate held exclusively,
     /// and read together only in a flush window, which holds it too: so a
     /// profile never pairs half of one restart with half of another. Nothing on
     /// the allocator path reads them.
-    resets: AtomicU64,
     reset_at: AtomicU64,
     reset_epoch: AtomicU64,
     carried_bytes: AtomicU64,
@@ -719,7 +740,7 @@ impl Engine {
             mode: AtomicU8::new(Mode::Heap as u8),
             serialized: AtomicBool::new(false),
             sampling: AtomicU64::new(0),
-            resets: AtomicU64::new(0),
+            reset_sequence: AtomicU64::new(0),
             reset_at: AtomicU64::new(0),
             reset_epoch: AtomicU64::new(0),
             carried_bytes: AtomicU64::new(0),
@@ -1487,7 +1508,7 @@ impl Engine {
         // realloc-heavy site, which is exactly where a reader looks first.
         //
         // A block carried across a restart of the counts has none to record:
-        // it is in none of the window's block counts. The block it becomes is
+        // it is in none of the window's allocation counts. The block it becomes is
         // born here, so it is in them, and its lifetime will count.
         let old_lifetime = old.lifetime_at(now);
 
@@ -2029,9 +2050,17 @@ impl Engine {
     /// [`super::order`] fixes, and the one [`Engine::fork_prepare`] takes
     /// them in. Holding both means no block is inserted or removed and no
     /// counter moves while the restart is applied, so it is one step at one
-    /// instant. The gate is waited for with the deadline a profile written at
-    /// shutdown has, and [`ResetError::Busy`] is the result of missing it,
-    /// with nothing changed.
+    /// instant.
+    ///
+    /// All of it is waited for against one deadline, the one a profile written
+    /// at shutdown has, and [`ResetError::Busy`] is the result of missing it,
+    /// with every lock taken so far released and nothing changed. The shards
+    /// are polled for rather than blocked on, unlike `fork_prepare`'s, because
+    /// that handler has no way to give up and this does: a thread stopped while
+    /// holding one shard, under a debugger say, would otherwise hold the
+    /// restart forever, and with it every thread whose blocks hash to a shard
+    /// the restart already holds. Bounded, the worst a wedged shard costs is
+    /// those threads stalling for the deadline, once.
     ///
     /// # What is not exact while other threads are recording
     ///
@@ -2045,6 +2074,12 @@ impl Engine {
     /// restart and counted just after it brings a lifetime from before. Both
     /// are bounded by the threads in flight at that instant.
     ///
+    /// # Readers outside the gate
+    ///
+    /// [`Engine::reset_sequence`] is made odd before the first counter moves
+    /// and even again after the last, so a reader that does not take the gate
+    /// can still tell which window it read. See [`Engine::read_window`].
+    ///
     /// # Why this takes a [`Guard`]
     ///
     /// For the reason [`Engine::record_event`] does, and with more at stake:
@@ -2057,9 +2092,19 @@ impl Engine {
         // to wait two seconds to be told it is stopped.
         self.resettable()?;
 
-        let mut live = self.live.lock_all();
+        // `checked_add` for the reason `RawLock::try_lock_for` gives: a panic
+        // here would be inside the profiler, and two seconds from now is
+        // representable on every platform this runs on, so the fallback is
+        // never taken in practice.
+        let deadline = Instant::now().checked_add(Self::FLUSH_TIMEOUT);
+        let Some(mut live) = self.live.lock_all_until(deadline) else {
+            return Err(ResetError::Busy);
+        };
         let _order = super::order::enter(super::order::Level::PeakGate);
-        let Some(_gate) = self.gate.write_for(Self::FLUSH_TIMEOUT) else {
+        let remaining = deadline.map_or(Self::FLUSH_TIMEOUT, |deadline| {
+            deadline.saturating_duration_since(Instant::now())
+        });
+        let Some(_gate) = self.gate.write_for(remaining) else {
             return Err(ResetError::Busy);
         };
         // Asked again now that nothing can move: a shutdown or a poison may have
@@ -2071,6 +2116,16 @@ impl Engine {
         let curr_bytes = self.curr_bytes.load(Ordering::Relaxed);
         let curr_blocks = self.curr_blocks.load(Ordering::Relaxed);
         let epoch = self.epoch.load(Ordering::Relaxed) + 1;
+
+        // The writer's half of the sequence lock. Relaxed load: the gate makes
+        // this the only writer, and the value it last wrote is its own. Odd
+        // before anything moves, then a release fence, so that a reader which
+        // observes any store below has, through its own acquire fence, also
+        // observed this one. See `read_window` for that side.
+        let sequence = self.reset_sequence.load(Ordering::Relaxed);
+        debug_assert!(sequence.is_multiple_of(2), "a restart began inside another");
+        self.reset_sequence.store(sequence + 1, Ordering::Relaxed);
+        fence(Ordering::Release);
 
         self.total_bytes.store(0, Ordering::Relaxed);
         self.total_blocks.store(0, Ordering::Relaxed);
@@ -2085,7 +2140,6 @@ impl Engine {
         self.shapes.clear();
         live.for_each_mut(|_, block| block.birth = LiveBlock::CARRIED);
 
-        self.resets.fetch_add(1, Ordering::Relaxed);
         self.reset_at.store(now, Ordering::Relaxed);
         self.reset_epoch.store(epoch, Ordering::Relaxed);
         self.carried_bytes.store(curr_bytes, Ordering::Relaxed);
@@ -2097,6 +2151,9 @@ impl Engine {
         // Released last, as `apply_locked` releases it, so that a reader that
         // observes the new epoch also observes the counters that justify it.
         self.epoch.store(epoch, Ordering::Release);
+        // Even again, with release: a reader that loads this value with
+        // acquire sees every store above, so it reads the new window whole.
+        self.reset_sequence.store(sequence + 2, Ordering::Release);
         Ok(())
     }
 
@@ -2105,7 +2162,9 @@ impl Engine {
         match self.state() {
             State::Running => {}
             State::ForkedChild => return Err(ResetError::ForkedChild),
-            State::Idle | State::Starting | State::Finished => return Err(ResetError::NotRunning),
+            State::Idle | State::Starting | State::Finished => {
+                return Err(ResetError::NotRecording)
+            }
         }
         if super::diagnostic::is_poisoned() {
             return Err(ResetError::Poisoned);
@@ -2119,7 +2178,9 @@ impl Engine {
     /// [`Engine::flush_and_visit`] reads it. A caller that needs to know only
     /// *whether* the counts moved under it wants [`Engine::resets`].
     pub fn last_reset(&self) -> Option<Reset> {
-        let count = self.resets.load(Ordering::Relaxed);
+        // Even, and the count it implies complete, wherever the gate is held,
+        // because the restart holds the gate across the whole odd interval.
+        let count = self.reset_sequence.load(Ordering::Relaxed) / 2;
         if count == 0 {
             return None;
         }
@@ -2133,10 +2194,57 @@ impl Engine {
         })
     }
 
-    /// How many times the counts have been restarted. One word, so exact
-    /// whenever it is read.
+    /// How many restarts of the counts have completed.
+    ///
+    /// Exact as a count, and not a statement about any counter read beside
+    /// it: a restart may land between the two reads. A reader that needs both
+    /// to describe one window wants [`Engine::read_window`].
     pub fn resets(&self) -> u64 {
-        self.resets.load(Ordering::Relaxed)
+        self.reset_sequence.load(Ordering::Acquire) / 2
+    }
+
+    /// Runs `read` and returns what it read with the number of restarts that
+    /// had completed, guaranteeing that no restart landed in between.
+    ///
+    /// The reader's half of a sequence lock around [`Engine::reset`], and how a
+    /// reading outside the gate pairs its counters with its window without
+    /// taking a lock. `read` may run more than once, so it must only load.
+    ///
+    /// # Orderings
+    ///
+    /// The first load is `Acquire`: if it sees the even value a restart
+    /// released at its end, every store that restart made is visible to
+    /// `read`, which then reads the new window whole. An odd value means a
+    /// restart is under way, and the reading waits it out rather than read
+    /// half of one.
+    ///
+    /// `read` loads with `Relaxed`, then an `Acquire` fence, then the second
+    /// load. If `read` saw any store a restart made after its release fence,
+    /// the two fences synchronize, the restart's odd store happens before the
+    /// second load, and the second load cannot return the first's value: the
+    /// reading is retried. That covers the totals, which are what a window
+    /// check compares, without exception: after a restart's store to one, every
+    /// later write to it is a read-modify-write, which extends the restart's
+    /// store's release sequence, so a total read from the new window
+    /// synchronizes however many allocations have added to it since. A
+    /// counter some path writes with a plain store, the peak's, is covered on
+    /// every platform this runs on but not by the language's model in every
+    /// interleaving; nothing compares a peak across two readings.
+    pub fn read_window<T>(&self, mut read: impl FnMut() -> T) -> (u64, T) {
+        loop {
+            let before = self.reset_sequence.load(Ordering::Acquire);
+            if !before.is_multiple_of(2) {
+                // A restart holds the gate and every shard for a sweep of the
+                // tables, which is long enough to be worth giving the core up.
+                std::thread::yield_now();
+                continue;
+            }
+            let value = read();
+            fence(Ordering::Acquire);
+            if self.reset_sequence.load(Ordering::Relaxed) == before {
+                return (before / 2, value);
+            }
+        }
     }
 
     /// How long the shutdown flush waits for in-flight events to finish.
@@ -3556,16 +3664,22 @@ mod tests {
 
     // ---- restarting the counts ------------------------------------------
 
-    /// Restarts `engine`'s counts as the program would, holding the lock every
-    /// test that poisons holds.
+    /// The lock every test that poisons holds, for a test to hold from its
+    /// first line to its last.
     ///
     /// A restart refuses a poisoned profiler, and the poison flag is
     /// process-wide: a test elsewhere in this binary that poisons on purpose
-    /// would otherwise make this one fail for a reason it has nothing to do
-    /// with. Holding the lock across the call is enough, because those tests
-    /// clear the flag before they release it.
+    /// would otherwise make a restart here fail, or a later `is_poisoned`
+    /// assertion here fail, for a reason the test has nothing to do with.
+    /// Holding it around the restart alone was not enough, because these tests
+    /// go on to assert the flag is clear after the restart has released it.
+    fn quiet() -> super::super::lock::RawGuard<'static> {
+        super::super::diagnostic::POISON_TESTS.lock()
+    }
+
+    /// Restarts `engine`'s counts as the program would. The caller holds
+    /// [`quiet`].
     fn reset(engine: &Engine) {
-        let _quiet = super::super::diagnostic::POISON_TESTS.lock();
         engine
             .reset_guarded()
             .expect("a running engine restarts its counts");
@@ -3595,6 +3709,7 @@ mod tests {
     /// allocates only afterwards.
     #[test]
     fn a_restart_forgets_what_happened_and_keeps_what_is() {
+        let _quiet = quiet();
         let engine = engine();
         engine.record_alloc_guarded(0x1000, Shape::of(4_096), &[0xAA]);
         engine.record_alloc_guarded(0x2000, Shape::of(1_024), &[0xBB]);
@@ -3655,7 +3770,7 @@ mod tests {
 
         // The window's own events. A carried block freed: live bytes come down
         // by exactly its size, and it brings no lifetime with it, because it is
-        // in none of the window's block counts.
+        // in none of the window's allocation counts.
         engine.record_alloc_guarded(0x4000, Shape::of(8_192), &[0xDD]);
         engine.record_alloc_guarded(0x5000, Shape::of(16), &[0xEE]);
         engine.record_free(0x1000, 4_096);
@@ -3696,6 +3811,7 @@ mod tests {
     /// returning to it is an equal peak that moves the snapshot to now.
     #[test]
     fn a_restart_is_a_peak_the_lazy_scheme_honours() {
+        let _quiet = quiet();
         let engine = engine();
         engine.record_alloc_guarded(0x1000, Shape::of(1_000), &[0xAA]);
         engine.record_alloc_guarded(0x2000, Shape::of(3_000), &[0xBB]);
@@ -3728,6 +3844,7 @@ mod tests {
     /// bytes in the totals, and a lifetime for the new one when it goes.
     #[test]
     fn a_carried_block_reallocated_after_a_restart_is_a_new_block_of_the_window() {
+        let _quiet = quiet();
         let engine = engine();
         engine.record_alloc_guarded(0x1000, Shape::of(100), &[0xAA]);
         for i in 0..5usize {
@@ -3764,6 +3881,7 @@ mod tests {
     /// and the live figures, and the requests to the blocks recorded.
     #[test]
     fn a_restart_restarts_the_rows_and_the_shapes_with_the_totals() {
+        let _quiet = quiet();
         let engine = engine();
         engine.record_alloc_guarded(0x1000, Shape::of(4_096), &[0xAA]);
         engine.record_alloc_guarded(0x2000, Shape::of(64), &[0xBB]);
@@ -3796,6 +3914,7 @@ mod tests {
     /// Refused events restart too: they qualify the totals, not the run.
     #[test]
     fn an_event_run_restarts_its_totals() {
+        let _quiet = quiet();
         let engine = Engine::with_limits(1 << 10, 1 << 12);
         assert!(
             engine.start(TimeSource::Events, || engine.configure(Settings {
@@ -3828,6 +3947,7 @@ mod tests {
     /// drifting by a rounding error, and its estimate brings no lifetime.
     #[test]
     fn a_sampled_run_restarts_and_still_balances() {
+        let _quiet = quiet();
         const SIZE: usize = 256;
         let engine = sampled(4_096);
         let address = record_until_sampled(&engine, 0x10_0000, SIZE, &[0xAA]);
@@ -3853,13 +3973,13 @@ mod tests {
         let _quiet = super::super::diagnostic::POISON_TESTS.lock();
 
         let idle = Engine::with_limits(1 << 10, 1 << 12);
-        assert_eq!(idle.reset_guarded(), Err(ResetError::NotRunning));
+        assert_eq!(idle.reset_guarded(), Err(ResetError::NotRecording));
 
         let stopped = engine();
         stopped.record_alloc_guarded(0x1000, Shape::of(64), &[0xAA]);
         stopped.stop(Shutdown::Explicit);
         let before = stopped.stats();
-        assert_eq!(stopped.reset_guarded(), Err(ResetError::NotRunning));
+        assert_eq!(stopped.reset_guarded(), Err(ResetError::NotRecording));
         assert_eq!(
             stopped.stats(),
             before,
@@ -3899,6 +4019,7 @@ mod tests {
     /// from it.
     #[test]
     fn a_second_restart_describes_the_window_since_it() {
+        let _quiet = quiet();
         let engine = engine();
         engine.record_alloc_guarded(0x1000, Shape::of(100), &[0xAA]);
         reset(&engine);

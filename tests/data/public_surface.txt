@@ -42,6 +42,7 @@ field heapscope::Baseline::total_blocks
 field heapscope::Baseline::total_bytes
 field heapscope::EventStats::mode
 field heapscope::EventStats::refused_events
+field heapscope::EventStats::resets
 field heapscope::EventStats::total_events
 field heapscope::EventStats::total_weight
 field heapscope::HeapStats::curr_blocks
@@ -189,6 +190,7 @@ field heapscope::output::ThreadStats::name
 field heapscope::output::ThreadStats::overflow
 field heapscope::stats::EventStats::mode
 field heapscope::stats::EventStats::refused_events
+field heapscope::stats::EventStats::resets
 field heapscope::stats::EventStats::total_events
 field heapscope::stats::EventStats::total_weight
 field heapscope::stats::HeapStats::curr_blocks
@@ -672,10 +674,10 @@ variant heapscope::Mode::AdHoc
 variant heapscope::Mode::Copy
 variant heapscope::Mode::Heap
 variant heapscope::ResetError::Busy
+variant heapscope::ResetError::CannotEnter
 variant heapscope::ResetError::ForkedChild
-variant heapscope::ResetError::NotRunning
+variant heapscope::ResetError::NotRecording
 variant heapscope::ResetError::Poisoned
-variant heapscope::ResetError::Reentrant
 variant heapscope::StartError::AlreadyRecorded
 variant heapscope::StartError::AlreadyRunning
 variant heapscope::StartError::NoBacktraces

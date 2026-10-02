@@ -122,12 +122,21 @@ fn a_reset_leaves_the_warm_up_out_of_everything_a_run_reports() {
     heapscope::assert_max_bytes!(window.max_bytes);
     heapscope::assert_max_bytes!(restarted.curr_bytes + (MIB as u64));
 
-    // ---- a mark from before the reset is refused, not subtracted ----
-    let refused = failure_message(|| heapscope::assert_no_leaks!(since: warm));
+    // ---- a mark from before the reset ----
+    // Its totals are another window's, and the count of resets says so to
+    // code that subtracts them.
+    assert_ne!(window.resets, warm.resets);
+    // Its live figures carry across the reset unchanged, so a leak check from
+    // it asks whether the warm-up and the work together left anything behind:
+    // nothing beyond the cache, which was live at the mark too.
+    heapscope::assert_no_leaks!(since: warm);
+    let leaked = black_box(vec![0u8; 64]);
+    let message = failure_message(|| heapscope::assert_no_leaks!(since: warm));
     assert!(
-        refused.contains("read before Profiler::reset"),
-        "a mark from another window was measured from: {refused}"
+        message.contains("more blocks are live than at the mark"),
+        "a block allocated after a pre-reset mark went unseen: {message}"
     );
+    drop(leaked);
     let mark = HeapStats::get().expect("a running heap run has counters");
     steady_state(8);
     heapscope::assert_no_leaks!(since: mark);
@@ -136,7 +145,7 @@ fn a_reset_leaves_the_warm_up_out_of_everything_a_run_reports() {
     {
         let _inside = heapscope::internals::guard::enter()
             .expect("the test thread is not inside the profiler");
-        assert_eq!(profiler.reset(), Err(ResetError::Reentrant));
+        assert_eq!(profiler.reset(), Err(ResetError::CannotEnter));
     }
     assert_eq!(HeapStats::get().unwrap().resets, 1);
 
@@ -178,7 +187,7 @@ fn a_reset_leaves_the_warm_up_out_of_everything_a_run_reports() {
 
     // ---- a stopped run is not restarted ----
     heapscope::engine().stop(heapscope::output::Shutdown::Explicit);
-    assert_eq!(profiler.reset(), Err(ResetError::NotRunning));
+    assert_eq!(profiler.reset(), Err(ResetError::NotRecording));
 
     drop(cache);
     drop(profiler);

@@ -300,17 +300,21 @@ pub struct Tally {
 /// One row's counters, read out.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TallyStats {
-    /// Bytes ever allocated by this thread, or in this region.
+    /// Bytes allocated by this thread, or in this region,
+    /// since the run started or its counts were last restarted.
     pub total_bytes: u64,
-    /// Blocks ever allocated. In a non-heap run, events recorded.
+    /// Blocks allocated since the run started or its counts were last restarted. In a
+    /// non-heap run, events recorded.
     pub total_blocks: u64,
     /// Bytes still live.
     pub curr_bytes: u64,
     /// Blocks still live.
     pub curr_blocks: u64,
-    /// Greatest `curr_bytes` this row ever reached.
+    /// Greatest `curr_bytes` this row reached
+    /// since the run started or its counts were last restarted.
     pub max_bytes: u64,
-    /// Greatest `curr_blocks` this row ever reached.
+    /// Greatest `curr_blocks` this row reached
+    /// since the run started or its counts were last restarted.
     pub max_blocks: u64,
 }
 

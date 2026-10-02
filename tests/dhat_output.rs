@@ -974,11 +974,29 @@ fn a_restart_is_declared_where_the_viewer_shows_it_and_relaxes_nothing_undeclare
             Value::String(String::from("target/debug/example")),
         );
     });
+    let too_much = "more bytes were live at once than were allocated and carried";
     assert!(
-        undeclared
-            .iter()
-            .any(|p| p.contains("more bytes were live at once than were ever allocated")),
+        undeclared.iter().any(|p| p.contains(too_much)),
         "{undeclared:?}"
+    );
+
+    // Declared, and still bounded: the point peaked at 12,288 bytes having
+    // allocated 4,096, which the 8,192 carried explains and 4,096 does not.
+    let understated = damaged_by(&profile, |root| {
+        let Some(Value::Object(extension)) = root.get_mut("heapscope") else {
+            panic!("the heapscope section is an object");
+        };
+        let Some(Value::Object(reset)) = extension.get_mut("reset") else {
+            panic!("the restart is declared");
+        };
+        reset.insert(
+            String::from("carriedBytes"),
+            Value::Number(String::from("4096")),
+        );
+    });
+    assert!(
+        understated.iter().any(|p| p.contains(too_much)),
+        "{understated:?}"
     );
 }
 

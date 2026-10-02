@@ -91,10 +91,19 @@
 //! peak forgotten. That is usually the budget that was meant, and it needs no
 //! mark.
 //!
+//! The same goes for every bare form. [`assert_alloc_count!`](crate::assert_alloc_count)
+//! counts the allocations made since the reset, and
+//! [`assert_no_leaks!`](crate::assert_no_leaks) asks about everything live,
+//! which includes what the warm-up left live, because a reset keeps it.
+//!
 //! A mark is a reading from one window. Its totals and its peak are not
 //! comparable with anything read after a reset, which is what
-//! [`HeapStats::resets`] records, and every `since: mark` assertion refuses a
-//! mark from another window rather than subtracting it.
+//! [`HeapStats::resets`] records: a program subtracting one reading's totals
+//! from another's compares that first. Its live figures are another matter,
+//! because a reset carries them across unchanged, so
+//! `assert_no_leaks!(since: mark)` with a mark from before a reset is a
+//! legitimate question, whether setup and work together left anything behind,
+//! and is answered.
 //!
 //! ## A finished run keeps answering
 //!
@@ -211,9 +220,13 @@ pub struct HeapStats {
     /// [restarted](crate::Profiler::reset) when this was read.
     ///
     /// The totals and the peak describe the window since the most recent
-    /// restart, so two readings can be compared only if this is the same in
-    /// both. The `since: mark` assertions check exactly that, and refuse a mark
-    /// from another window rather than subtract it.
+    /// restart, so two readings' totals or peaks can be compared only if this
+    /// is the same in both. The live figures carry across a restart, and can be
+    /// compared whatever this says.
+    ///
+    /// Read together with the counters, never beside them: a reading whose
+    /// counters are from one window and whose count is from another is not one
+    /// this returns, however a restart on another thread lands.
     ///
     /// Public rather than kept for the assertions, because the arithmetic the
     /// [module documentation](crate::stats) recommends (a reading before the
@@ -247,21 +260,31 @@ pub struct EventStats {
     /// Which of the two modes produced these, and therefore what
     /// [`total_weight`](EventStats::total_weight) is counted in.
     pub mode: Mode,
-    /// Summed weight of every event recorded.
+    /// Summed weight of the events recorded since the run started or its
+    /// counts were last [restarted](crate::Profiler::reset).
     ///
     /// Bytes under [`Mode::Copy`]. Under [`Mode::AdHoc`] it means whatever the
     /// program said it means when it called [`event`](fn@crate::event): retries,
     /// rows, cache misses.
     pub total_weight: u64,
-    /// Events recorded.
+    /// Events recorded since the run started or its counts were last
+    /// restarted.
     pub total_events: u64,
     /// Calls to the reporting function this run does *not* count.
     ///
     /// [`copied`](crate::copied) during an ad hoc run, or
     /// [`event`](fn@crate::event) during a copy one. Non-zero means instrumentation
     /// is being reported into a run that discards it, so a test asserting on a
-    /// weight is asserting on a number that is missing those calls.
+    /// weight is asserting on a number that is missing those calls. Restarted
+    /// with the other counts.
     pub refused_events: u64,
+    /// How many times the run's counts had been
+    /// [restarted](crate::Profiler::reset) when this was read.
+    ///
+    /// The same figure [`HeapStats::resets`] is, read the same way, and for
+    /// the same reason: every other field here is restarted, so two readings
+    /// can be compared only when this is the same in both.
+    pub resets: u64,
 }
 
 /// Why there are no statistics to read.
@@ -392,15 +415,12 @@ impl HeapStats {
         if engine.is_sampled() {
             return Err(StatsError::Sampled);
         }
-        // Before the counters, and the order is what makes a race with a reset
-        // on another thread fail safe. Read first, a restart landing between
-        // this and the counters gives a reading whose counters are from the new
-        // window and whose count says the old one: a mark like that is refused
-        // by every later reading, which costs a retry. Read after, it would be
-        // the reverse, old counters claiming the new window, and a mark like
-        // that is accepted and subtracts across the restart.
-        let resets = engine.resets();
-        let stats = engine.stats();
+        // In one window, which reading the restart count beside the counters
+        // would not be: a restart on another thread landing between the two
+        // reads pairs one window's counters with the other's count, whichever
+        // is read first. `read_window` retries until no restart landed, without
+        // a lock, which is what keeps this reading lock-free.
+        let (resets, stats) = engine.read_window(|| engine.stats());
         // Checked *after* the counters are read, not before: a poison raised
         // while they were being read would otherwise be missed, and the whole
         // point of this module is to refuse rather than to guess.
@@ -444,13 +464,15 @@ impl EventStats {
         if engine.is_sampled() {
             return Err(StatsError::Sampled);
         }
-        let stats = engine.stats();
+        // In one window, for the reason `HeapStats::of` gives.
+        let (resets, stats) = engine.read_window(|| engine.stats());
         unpoisoned()?;
         Ok(EventStats {
             mode,
             total_weight: stats.total_bytes,
             total_events: stats.total_blocks,
             refused_events: stats.refused_events,
+            resets,
         })
     }
 }
@@ -737,9 +759,9 @@ impl fmt::Display for Complaint {
             } => write!(
                 f,
                 "the mark was read before Profiler::reset restarted the counts \
-                 ({} restarts when it was read, {} now), so it describes another \
-                 window and nothing can be measured since it; read the mark after \
-                 the reset",
+                 (HeapStats::resets was {} when it was read, {} now), so its \
+                 totals describe another window and nothing can be counted since \
+                 it; read the mark after the reset",
                 count(*mark_resets),
                 count(*resets)
             ),
@@ -874,15 +896,10 @@ fn allocations_since(stats: &HeapStats, since: Option<HeapStats>) -> Result<u64,
 
 pub(crate) fn check_no_leaks(engine: &Engine, since: Option<HeapStats>) -> Result<(), Complaint> {
     let stats = assertable(engine)?;
-    // Refused even here, where the arithmetic would survive a restart: live
-    // figures carry across one, so `curr_blocks` before and after is the same
-    // counter. The rule is the one every `since:` form applies, so that a mark
-    // has one contract rather than one per assertion: it belongs to the window
-    // it was read in. A mark read before a reset was almost always meant
-    // to be read after it.
-    if let Some(mark) = &since {
-        same_window(&stats, mark)?;
-    }
+    // No window check: this compares live blocks, which a restart carries
+    // across unchanged, so a mark from before one still measures what it
+    // says. "Did setup and the work together leave anything behind" is a
+    // question worth asking across a reset, and this answers it.
     // Blocks, not bytes, decide whether anything leaked: a live zero-sized
     // allocation is a block that was never freed and contributes no bytes, and
     // gating on bytes would report it as clean.
@@ -902,14 +919,26 @@ pub(crate) fn check_no_leaks(engine: &Engine, since: Option<HeapStats>) -> Resul
     Ok(())
 }
 
-/// Whether `mark` was read in the same window of the run as `stats`, and so can
-/// be measured from at all.
+/// Whether `mark` was read in the same window of the run as `stats`, so that
+/// its totals can be subtracted from the reading's.
 ///
-/// Every `since: mark` check asks this first. A restart of the counts sets the
-/// totals and the peak back to where nothing about the old ones survives, so a
-/// mark from before one is not behind the new readings or ahead of them; it is
-/// beside them. A difference taken anyway is a number with no meaning, and
-/// whether it happens to come out negative is luck.
+/// Every `since: mark` check that subtracts a total asks this first. A restart
+/// of the counts sets the totals back to where nothing about the old ones
+/// survives, so a mark from before one is not behind the new readings or ahead
+/// of them; it is beside them. A difference taken anyway is a number with no
+/// meaning, and whether it happens to come out negative is luck. A check of
+/// live figures, which carry across, does not ask.
+///
+/// No caller yet: `assert_alloc_count!(since: mark)` is the first form that
+/// subtracts totals, and its check calls this before it subtracts.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the window check for `assert_alloc_count!(since:)`, which \
+                  arrives separately; this expectation fails once it is wired"
+    )
+)]
 fn same_window(stats: &HeapStats, mark: &HeapStats) -> Result<(), Complaint> {
     if mark.resets != stats.resets {
         return Err(Complaint::MarkFromAnotherWindow {
@@ -1436,7 +1465,8 @@ macro_rules! assert_max_bytes {
     };
 }
 
-/// Fails unless the run made exactly `expected` allocations, or, written
+/// Fails unless the run made exactly `expected` allocations since it started
+/// or its counts were last [restarted](crate::Profiler::reset), or, written
 /// `<= ceiling`, at most that many.
 ///
 /// ```
@@ -1635,9 +1665,10 @@ macro_rules! assert_alloc_count {
 /// begin with.
 ///
 /// A [`Profiler::reset`](crate::Profiler::reset) keeps everything live, so the
-/// bare form still sees a block allocated before one. A mark read before a
-/// reset is refused: like every `since: mark` assertion, this one measures
-/// within the window the mark was read in, and says so rather than guessing.
+/// bare form still sees a block allocated before one, and a mark read before a
+/// reset still works: the live figures it compares carry across a reset
+/// unchanged, so the question it answers is whether anything allocated since
+/// the mark, warm-up included, is still live.
 ///
 /// Either form takes a trailing [`format_args!`] message —
 /// `assert_no_leaks!("after {fixture}")`, or
@@ -1859,6 +1890,22 @@ mod tests {
         assert_eq!(stats.total_weight, 1_000);
         assert_eq!(stats.total_events, 2);
         assert_eq!(stats.refused_events, 1);
+        assert_eq!(stats.resets, 0);
+
+        // A restart takes every one of them back to zero, and the reading says
+        // which window it is from.
+        engine
+            .reset_guarded()
+            .expect("a running engine restarts its counts");
+        let guard = crate::internals::guard::enter().expect("not inside the profiler");
+        engine.record_event(&guard, 5, &[0x1000]);
+        drop(guard);
+        let after = EventStats::of(&engine).expect("an ad hoc run has event statistics");
+        assert_eq!(
+            (after.total_weight, after.total_events, after.refused_events),
+            (5, 1, 0)
+        );
+        assert_eq!(after.resets, 1);
     }
 
     #[test]
@@ -2257,15 +2304,75 @@ mod tests {
         assert_eq!(check_no_leaks(&engine, Some(mark)), Ok(()));
     }
 
+    /// A reading never pairs one window's totals with another window's count of
+    /// restarts, however a restart on another thread lands.
+    ///
+    /// The property, checked without knowing the schedule: within one window a
+    /// total only grows, so two readings that report the same count of
+    /// restarts must not see the total fall. A reading that took its count
+    /// before a restart and its totals after shows exactly that fall, and the
+    /// first version of this reading, which loaded the count and then the
+    /// counters with nothing tying the two together, could produce it.
+    #[test]
+    fn a_reading_racing_a_restart_is_of_one_window() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        const RESETS: usize = if cfg!(miri) { 3 } else { 2_000 };
+        let _serial = serialized();
+        let engine = engine(Mode::Heap);
+        let done = AtomicBool::new(false);
+
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                while !done.load(Ordering::Relaxed) {
+                    record(&engine, 0x100, 8);
+                    engine.record_free(0x100, 8);
+                }
+            });
+            s.spawn(|| {
+                for _ in 0..RESETS {
+                    engine
+                        .reset_guarded()
+                        .expect("a running engine restarts its counts");
+                }
+                done.store(true, Ordering::Relaxed);
+            });
+
+            let mut last = HeapStats::of(&engine).expect("a running heap run has counters");
+            let mut readings = 0u64;
+            while !done.load(Ordering::Relaxed) {
+                let reading = HeapStats::of(&engine).expect("a running heap run has counters");
+                assert!(
+                    reading.resets >= last.resets,
+                    "the count of restarts went back"
+                );
+                if reading.resets == last.resets {
+                    assert!(
+                        reading.total_blocks >= last.total_blocks,
+                        "two readings of window {} saw its total fall from {} to {}: \
+                         one of them paired that window's count with another's totals",
+                        reading.resets,
+                        last.total_blocks,
+                        reading.total_blocks
+                    );
+                }
+                last = reading;
+                readings += 1;
+            }
+            assert!(readings > 0, "nothing was read while the restarts landed");
+        });
+    }
+
     /// A reset restarts what a reading reports, and a mark from before one is
-    /// refused rather than measured from.
+    /// told apart: refused where totals would be subtracted, and accepted where
+    /// only the live figures, which carry across, are compared.
     ///
     /// The fixture's six figures are distinct, so this also pins which ones
     /// restart: the live pair is kept, the totals go to zero, and the peak
     /// starts again from what is live, which is what makes a bare
     /// `assert_max_bytes!` afterwards a budget on the window alone.
     #[test]
-    fn a_reading_after_a_reset_describes_the_window_and_refuses_an_older_mark() {
+    fn a_reading_after_a_reset_describes_the_window_and_knows_an_older_mark() {
         let _serial = serialized();
         let engine = distinct_figures();
         let mark = HeapStats::of(&engine).unwrap();
@@ -2285,14 +2392,21 @@ mod tests {
             Ok(()),
             "the warm-up's peak of 448 survived the reset"
         );
+        // The window check, for the form that subtracts totals: a mark from
+        // before the reset is beside the reading, not behind it.
         assert_eq!(
-            check_no_leaks(&engine, Some(mark)),
+            same_window(&after, &mark),
             Err(Complaint::MarkFromAnotherWindow {
                 mark_resets: 0,
                 resets: 1,
             }),
-            "a mark from before the reset was measured from"
+            "a mark from before the reset passed the window check"
         );
+        assert_eq!(same_window(&after, &after), Ok(()));
+        // Live figures carry across, so a leak check from before the reset
+        // asks a question with an answer: the fixture's two live blocks were
+        // live at the mark too.
+        assert_eq!(check_no_leaks(&engine, Some(mark)), Ok(()));
 
         // A mark from the window is good, and stays good until the next one.
         let fresh = HeapStats::of(&engine).unwrap();
@@ -2832,7 +2946,7 @@ mod tests {
         .to_string();
         assert!(elsewhere.contains("Profiler::reset"), "{elsewhere}");
         assert!(
-            elsewhere.contains("1 restarts when it was read, 3 now"),
+            elsewhere.contains("HeapStats::resets was 1 when it was read, 3 now"),
             "{elsewhere}"
         );
         assert!(elsewhere.contains("read the mark after"), "{elsewhere}");

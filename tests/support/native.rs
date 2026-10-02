@@ -43,6 +43,8 @@ struct Restart {
     /// Bytes live at the restart, which the window counts as live without
     /// having allocated them.
     carried_bytes: u64,
+    /// Blocks live at the restart. See `carried_bytes`.
+    carried_blocks: u64,
     /// The part of `notRecorded.blocks` from before the window.
     dropped_blocks: u64,
 }
@@ -326,9 +328,11 @@ fn check_reset(
             ));
         }
     }
-    let carried_bytes = if lifetimes {
-        integer(reset, "run.reset", "carriedBlocks", problems);
-        integer(reset, "run.reset", "carriedBytes", problems).unwrap_or(0)
+    let (carried_bytes, carried_blocks) = if lifetimes {
+        (
+            integer(reset, "run.reset", "carriedBytes", problems).unwrap_or(0),
+            integer(reset, "run.reset", "carriedBlocks", problems).unwrap_or(0),
+        )
     } else {
         for field in ["carriedBytes", "carriedBlocks"] {
             if reset.get(field).is_some() {
@@ -338,10 +342,11 @@ fn check_reset(
                 ));
             }
         }
-        0
+        (0, 0)
     };
     Some(Restart {
         carried_bytes,
+        carried_blocks,
         dropped_blocks,
     })
 }
@@ -638,18 +643,24 @@ fn check_tally(
     // now than the most it ever held. Both are arithmetic the row does for
     // itself, so a row that fails one has a counter moving without its pair.
     //
-    // After a restart the first is not true: a row can peak on what it carried
-    // across the restart, which it holds and did not allocate in the window,
-    // and the file does not say what each row carried. The second still holds,
-    // because the restart starts each peak from what the row held.
+    // After a restart the first is true only up to what the row carried: it
+    // can peak on blocks it held at the restart and did not allocate in the
+    // window. The file does not say what each row carried, but no row carried
+    // more than the run did, so the run's figure is the bound, and without a
+    // restart it is zero and the rule is the original. The second holds
+    // unchanged, because the restart starts each peak from what the row held.
+    let (carried_bytes, carried_blocks) = totals.restart.map_or((0, 0), |restart| {
+        (restart.carried_bytes, restart.carried_blocks)
+    });
     if curr_bytes > max_bytes {
         problems.push(format!(
             "`{path}` holds {curr_bytes} bytes, more than its own peak of {max_bytes}"
         ));
     }
-    if totals.restart.is_none() && max_bytes > total_bytes {
+    if max_bytes > total_bytes + carried_bytes {
         problems.push(format!(
-            "`{path}` peaked at {max_bytes} bytes having only ever allocated {total_bytes}"
+            "`{path}` peaked at {max_bytes} bytes having allocated {total_bytes} \
+             and the run carried {carried_bytes} across a restart"
         ));
     }
     if curr_blocks > max_blocks {
@@ -657,9 +668,10 @@ fn check_tally(
             "`{path}` holds {curr_blocks} blocks, more than its own peak of {max_blocks}"
         ));
     }
-    if totals.restart.is_none() && max_blocks > total_blocks {
+    if max_blocks > total_blocks + carried_blocks {
         problems.push(format!(
-            "`{path}` peaked at {max_blocks} blocks having only ever allocated {total_blocks}"
+            "`{path}` peaked at {max_blocks} blocks having allocated {total_blocks} \
+             and the run carried {carried_blocks} across a restart"
         ));
     }
     // A row's live bytes are a subset of the run's at every instant, so its
@@ -1083,12 +1095,24 @@ fn check_points(
                 .and_then(Value::as_u64)
                 .unwrap_or(0);
 
-            // The same rule a row follows, relaxed after a restart for the same
-            // reason: a point can peak on what it carried into the window.
+            // The same rule a row follows, bounded after a restart the same
+            // way: a point can peak on what it carried into the window, and no
+            // point carried more than the run did.
+            let (carried_bytes, carried_blocks) = totals.restart.map_or((0, 0), |restart| {
+                (restart.carried_bytes, restart.carried_blocks)
+            });
             let max = point.get("maxBytes").and_then(Value::as_u64).unwrap_or(0);
-            if totals.restart.is_none() && max > bytes {
+            if max > bytes + carried_bytes {
                 problems.push(format!(
-                    "a point peaked at {max} bytes having only ever allocated {bytes}"
+                    "a point peaked at {max} bytes having allocated {bytes} and the \
+                     run carried {carried_bytes} across a restart"
+                ));
+            }
+            let max_blocks = point.get("maxBlocks").and_then(Value::as_u64).unwrap_or(0);
+            if max_blocks > blocks + carried_blocks {
+                problems.push(format!(
+                    "a point peaked at {max_blocks} blocks having allocated {blocks} \
+                     and the run carried {carried_blocks} across a restart"
                 ));
             }
         } else {

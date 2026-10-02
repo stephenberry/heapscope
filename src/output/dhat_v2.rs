@@ -696,11 +696,17 @@ fn push_restart_note(command: &mut String, snapshot: &Snapshot) {
     let Some(reset) = &snapshot.reset else {
         return;
     };
+    // A run without block lifetimes has no peak and no lifetimes to restart.
+    let covered = if snapshot.settings.mode.block_lifetimes() {
+        "totals, peaks and lifetimes cover"
+    } else {
+        "totals cover"
+    };
     // Into a `String`, which cannot fail.
     let _ = write!(
         command,
-        " [heapscope: counts restarted by Profiler::reset at {} {}; totals, \
-         peaks and lifetimes cover only what followed]",
+        " [heapscope: counts restarted by Profiler::reset at {} {}; {covered} \
+         only what followed]",
         reset.at,
         snapshot.time_source.unit()
     );
@@ -1251,6 +1257,23 @@ mod tests {
         );
         assert!(json.contains(r#""cmd":"test""#), "{json}");
         assert!(!json.contains(r#""reset""#), "{json}");
+    }
+
+    /// An event run has no peak and no lifetimes, so its note names only what
+    /// it restarted.
+    #[test]
+    fn an_event_run_says_only_its_totals_were_restarted() {
+        let mut restarted = snapshot(vec![point(&[0x10], counters(64, 64))]);
+        restarted.settings.mode = Mode::AdHoc;
+        restarted.reset = Some(crate::output::Reset {
+            count: 1,
+            ..crate::output::Reset::default()
+        });
+        let json = emit(&restarted, &RawAddresses);
+        assert!(
+            json.contains("; totals cover only what followed]"),
+            "{json}"
+        );
     }
 
     // ---- what a renderer is allowed to hide ----

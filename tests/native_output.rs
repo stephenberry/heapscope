@@ -906,7 +906,16 @@ fn a_restarted_profile_may_hold_what_its_window_did_not_allocate() {
             let end = key + undeclared[key..].find('}').expect("and closed") + 1;
             format!("{}{}", &undeclared[..start], &undeclared[end..])
         }),
-        "having only ever allocated",
+        "a point peaked at 12288 bytes having allocated 4096 and the run carried 0",
+    );
+
+    // Declared, and still bounded: 4,096 allocated and 8,192 carried explain
+    // the 12,288 peak, and 4,096 carried does not.
+    rejects(
+        &damaged_by(&text, |t| {
+            replacing(t, r#""carriedBytes":8192"#, r#""carriedBytes":4096"#)
+        }),
+        "a point peaked at 12288 bytes having allocated 4096 and the run carried 4096",
     );
 }
 
@@ -1279,17 +1288,32 @@ fn the_validator_rejects_a_reallocation_that_copied_without_moving() {
 /// with the emitter by construction and prove nothing.
 #[test]
 fn the_dhat_file_carries_no_number_the_native_file_lacks() {
-    let snapshot = snapshot(vec![
+    the_two_files_agree(&snapshot(vec![
         point(&[0x1500, 0x1600], 4096, 8),
         point(&[0x4500], 512, 1),
-    ]);
+    ]));
+}
 
+/// The same, for a run whose counts were restarted: the restart is declared in
+/// both files, field for field, and `cmd` is the command with a note after it.
+#[test]
+fn a_restart_is_the_same_restart_in_both_files() {
+    let mut restarted = restarted(0);
+    if let Some(reset) = restarted.reset.as_mut() {
+        reset.count = 2;
+        reset.dropped_blocks = 3;
+    }
+    restarted.stats.dropped_blocks = 5;
+    the_two_files_agree(&restarted);
+}
+
+fn the_two_files_agree(snapshot: &Snapshot) {
     let mut buffer = Vec::new();
     snapshot
         .write_dhat_v2(&mut buffer)
         .expect("writing to a Vec cannot fail");
     let dhat = parse(&String::from_utf8(buffer).expect("valid UTF-8"));
-    let native = parse(&emit(&snapshot));
+    let native = parse(&emit(snapshot));
 
     let at = |value: &Value, path: &str| -> u64 {
         let mut current = value.clone();
@@ -1333,21 +1357,69 @@ fn the_dhat_file_carries_no_number_the_native_file_lacks() {
         );
     }
 
+    let text = |value: &Value, path: &str| -> String {
+        let mut current = value.clone();
+        for step in path.split('.') {
+            current = current.get(step).expect("the field exists").clone();
+        }
+        current.as_str().expect("a string").to_string()
+    };
     for (dhat_path, native_path) in [
         ("mode", "run.mode"),
-        ("cmd", "run.command"),
         ("heapscope.shutdown", "run.shutdown"),
         ("heapscope.unwinder", "run.unwinder"),
         ("tu", "run.timeSource"),
     ] {
-        let text = |value: &Value, path: &str| -> String {
-            let mut current = value.clone();
-            for step in path.split('.') {
-                current = current.get(step).expect("the field exists").clone();
-            }
-            current.as_str().expect("a string").to_string()
-        };
         assert_eq!(text(&dhat, dhat_path), text(&native, native_path));
+    }
+
+    // `cmd` is the command, and after a restart the command with a note on the
+    // end, because it is the one line of text dh_view shows.
+    let command = text(&native, "run.command");
+    let cmd = text(&dhat, "cmd");
+    assert!(
+        cmd.starts_with(&command),
+        "`cmd` is {cmd:?}, which does not begin with the command {command:?}"
+    );
+    let restart = (
+        dhat.get("heapscope")
+            .and_then(|section| section.get("reset")),
+        native.get("run").and_then(|run| run.get("reset")),
+    );
+    match restart {
+        (None, None) => assert_eq!(cmd, command, "a run never restarted has a note"),
+        (Some(_), Some(_)) => {
+            assert!(
+                cmd.len() > command.len(),
+                "a restarted run's `cmd` has no note"
+            );
+            // The section's own spelling for blocks the table turned away is
+            // `droppedBlocks`, as at its top level; the native file says
+            // `notRecorded`, as it does everywhere.
+            for (dhat_path, native_path) in [
+                ("heapscope.reset.count", "run.reset.count"),
+                ("heapscope.reset.at", "run.reset.at"),
+                ("heapscope.reset.carriedBytes", "run.reset.carriedBytes"),
+                ("heapscope.reset.carriedBlocks", "run.reset.carriedBlocks"),
+                (
+                    "heapscope.reset.droppedBlocks",
+                    "run.reset.notRecordedBlocks",
+                ),
+            ] {
+                assert_eq!(
+                    at(&dhat, dhat_path),
+                    at(&native, native_path),
+                    "`{dhat_path}` and `{native_path}` describe the same restart \
+                     and disagree"
+                );
+            }
+        }
+        (dhat_reset, native_reset) => panic!(
+            "one file declares a restart and the other does not: DHAT {:?}, \
+             native {:?}",
+            dhat_reset.is_some(),
+            native_reset.is_some()
+        ),
     }
 
     // The module map, which both files carry and nothing compared. It is the one

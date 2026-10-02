@@ -364,9 +364,10 @@ pub struct Snapshot {
     /// the window since [`Reset::at`], and the live figures still describe
     /// everything live, including what was allocated before it. So a point may
     /// hold more than it allocated, and the peak may exceed the bytes allocated
-    /// in the window. Every emitter says so where its reader will see it,
-    /// because nothing in the numbers themselves would. Read in the same window
-    /// as [`Snapshot::stats`].
+    /// in the window. The native, DHAT, HTML and text emitters say so where
+    /// their reader will see it, because nothing in the numbers themselves
+    /// would. Folded stacks cannot: see [`Snapshot::write_folded`]. Read in the
+    /// same window as [`Snapshot::stats`].
     pub reset: Option<Reset>,
 }
 
@@ -790,6 +791,16 @@ impl Snapshot {
     /// refused in a mode that has none rather than written as zeroes — see
     /// [`FoldedMetric::needs_block_lifetimes`], which is the check that predicts
     /// this.
+    ///
+    /// # A run whose counts were restarted
+    ///
+    /// Written like any other, and without saying so: the format is a stack and
+    /// a number per line, with no header and nowhere for a note a flame graph
+    /// tool would not take for a stack. The totals are the window's, as they
+    /// are everywhere, and [`FoldedMetric::PeakBytes`] and
+    /// [`FoldedMetric::LiveBytes`] include what was carried into it. A reader
+    /// who needs to know whether a file is of a window reads
+    /// [`Snapshot::reset`], or another output of the same run.
     pub fn write_folded<W: Write>(&self, out: W, metric: FoldedMetric) -> io::Result<()> {
         let names = FunctionNames::new(&self.modules);
         if self.settings.trim_frames {
@@ -1545,15 +1556,15 @@ mod tests {
     /// in exactly the profile that was meant to leave the warm-up out.
     #[test]
     fn a_block_carried_across_a_restart_has_no_lifetime_at_the_end() {
+        // For the whole test: a restart refuses a poisoned profiler, and a
+        // snapshot of one says so, and the flag is process-wide.
+        let _quiet = crate::internals::diagnostic::POISON_TESTS.lock();
         static ENGINE: Engine = Engine::new();
         ENGINE.start(TimeSource::Events, || {});
         ENGINE.record_alloc_guarded(0x1000, Shape::of(64), &[0xAA]);
-        {
-            let _quiet = crate::internals::diagnostic::POISON_TESTS.lock();
-            ENGINE
-                .reset_guarded()
-                .expect("a running engine restarts its counts");
-        }
+        ENGINE
+            .reset_guarded()
+            .expect("a running engine restarts its counts");
         ENGINE.record_alloc_guarded(0x2000, Shape::of(16), &[0xBB]);
         for address in 0..4 {
             ENGINE.record_alloc_guarded(0x3000 + address * 16, Shape::of(16), &[0xCC]);
