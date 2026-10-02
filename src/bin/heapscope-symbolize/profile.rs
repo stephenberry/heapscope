@@ -123,6 +123,8 @@ impl Profile {
     /// the tool — `atos` works from where the image was mapped and the other two
     /// from where the code sits in the file — so the choice is made here, once,
     /// against [`Tool::wants_runtime_addresses`](crate::tool::Tool::wants_runtime_addresses).
+    /// Either way it is the [`call_site`] of what was recorded, not the recorded
+    /// number itself.
     ///
     /// Frames already carrying a resolved `function` are skipped, so running
     /// this tool twice over one profile does no work the second time and cannot
@@ -152,7 +154,7 @@ impl Profile {
             // A frame with no `fileAddr` is one whose image reported no bias —
             // the Windows module map does not — and asking a file-address tool
             // about a runtime address would name whatever happens to live there.
-            if let Some(address) = address {
+            if let Some(address) = address.and_then(call_site) {
                 batches.entry(module).or_default().push((at, address));
             }
         }
@@ -256,11 +258,36 @@ impl Profile {
     /// The best available name wins: what this tool resolved, then what the
     /// running process knew, then nothing.
     fn render_frame(&self, frame: &Value) -> String {
+        self.render_frame_as(frame, frame.get("function").and_then(Value::as_str))
+    }
+
+    /// The frame rendered once for every function its address is in, innermost
+    /// first: the one the symbolizer named, then each caller that inlined it.
+    ///
+    /// Every entry carries the frame's own address and image, because every one
+    /// of them is a true answer about that one instruction. A frame with nothing
+    /// inlined, or that no symbolizer resolved, is the one entry
+    /// [`render_frame`](Self::render_frame) makes.
+    fn render_inlined(&self, frame: &Value) -> Vec<String> {
+        let mut rendered = vec![self.render_frame(frame)];
+        let callers = frame
+            .get("inlinedBy")
+            .and_then(Value::as_array)
+            .unwrap_or(&[]);
+        for caller in callers {
+            if let Some(name) = caller.get("function").and_then(Value::as_str) {
+                rendered.push(self.render_frame_as(frame, Some(name)));
+            }
+        }
+        rendered
+    }
+
+    /// The frame, named `resolved` where there is a name to give it.
+    fn render_frame_as(&self, frame: &Value, resolved: Option<&str>) -> String {
         let mut out = String::new();
         push_hex(&mut out, frame.get("addr").and_then(Value::as_address));
         out.push_str(": ");
 
-        let resolved = frame.get("function").and_then(Value::as_str);
         let recorded = frame.get("symbol").and_then(Value::as_str);
         match (resolved, recorded) {
             (Some(name), _) => heapscope::output::push_display(&mut out, name),
@@ -310,6 +337,25 @@ impl Profile {
     /// trimming at record time: the rule reads frame names, so on Linux, where
     /// `dladdr` names almost nothing, it had nothing to work with and left every
     /// stack whole. Here the names exist.
+    ///
+    /// # Trimmed by function, not by frame
+    ///
+    /// The rule reads each frame as every function its address is in. With
+    /// inlining one address is in several at once, and reading any single one
+    /// of them is wrong somewhere. A `Vec::with_capacity` call in
+    /// `tests/symbolize.rs` is one frame that is `RawVec::with_capacity_in`,
+    /// inlined into `Vec::with_capacity_in`, inlined into `Vec::with_capacity`
+    /// **\[measured, Linux and Windows\]**. Judged by the innermost, the frame
+    /// is the allocation path and goes, taking with it the call the program
+    /// wrote; judged by the outermost, it stays and is shown by a name the rule
+    /// exists to hide.
+    ///
+    /// Expanded, the stack is the one the source describes, the rule applies to
+    /// it unchanged, and a frame that keeps any of its functions is shown by
+    /// the innermost one kept — so where the cut falls no longer depends on
+    /// where the optimiser happened to leave a frame boundary. The same holds at
+    /// the other end: on Windows `std`'s runtime marker arrives inlined into its
+    /// caller **\[measured\]**, and is found there.
     pub fn to_folded(&self, metric: &str) -> Result<String, String> {
         if !METRICS.contains(&metric) {
             return Err(format!(
@@ -317,10 +363,10 @@ impl Profile {
                 METRICS.join(", ")
             ));
         }
-        let frames = self.frames();
-        let rendered: Vec<String> = frames
+        let rendered: Vec<Vec<String>> = self
+            .frames()
             .iter()
-            .map(|frame| self.render_frame(frame))
+            .map(|frame| self.render_inlined(frame))
             .collect();
 
         let mut totals: Vec<(String, u64)> = Vec::new();
@@ -351,12 +397,34 @@ impl Profile {
                 .filter_map(|at| usize::try_from(at).ok())
                 .filter(|&at| at < rendered.len())
                 .collect();
-            let shown: Vec<String> = indices.iter().map(|&at| rendered[at].clone()).collect();
-            let keep = heapscope::symbol::trim::worth_showing(&shown);
+
+            // Every function on the stack, innermost first, each with the
+            // position of the frame it belongs to.
+            let mut functions: Vec<String> = Vec::new();
+            let mut owners: Vec<usize> = Vec::new();
+            for (position, &at) in indices.iter().enumerate() {
+                for function in &rendered[at] {
+                    functions.push(function.clone());
+                    owners.push(position);
+                }
+            }
+            let keep = heapscope::symbol::trim::worth_showing(&functions);
+
+            // A frame per owner, named by the innermost function it kept. The
+            // range is contiguous and the owners ascend, so a change of owner
+            // is a new frame.
+            let mut shown: Vec<&str> = Vec::new();
+            let mut previous = None;
+            for at in keep {
+                if previous != Some(owners[at]) {
+                    previous = Some(owners[at]);
+                    shown.push(&functions[at]);
+                }
+            }
 
             stack.clear();
             // Outermost first, which is where a flame graph puts its root.
-            for frame in shown[keep].iter().rev() {
+            for frame in shown.iter().rev() {
                 if !stack.is_empty() {
                     stack.push(';');
                 }
@@ -388,6 +456,34 @@ impl Profile {
         }
         Ok(out)
     }
+}
+
+/// The address to ask a symbolizer about for a recorded frame: one byte before
+/// it, inside the call instruction rather than after it.
+///
+/// Every frame a profile records is a return address — the frame-pointer walk,
+/// `backtrace`, and `RtlCaptureStackBackTrace` all report where execution will
+/// *resume* — and that is the instruction after the call, which belongs to
+/// whatever the compiler placed next. Within one function that is usually the
+/// same line; across inlining it is routinely a different function. `std` ends
+/// `RawVecInner::finish_grow` by calling the allocator and then `map_err` on
+/// the result, so the return address lies in the inlined `map_err`, and the
+/// frame read as `<core::result::Result<…>>::map_err` — which trimming rightly
+/// does not recognise as the allocation path. One byte earlier the same frame
+/// is `alloc::alloc::alloc`, inlined through `Global::allocate` into
+/// `finish_grow`, which it does. Elsewhere in the same profile a thread's entry
+/// frame read as `core::mem::size_of_val_raw` and a `read_to_end` frame as
+/// `Vec::len` **\[measured, Linux x86_64, rustc 1.98, binutils 2.42\]**.
+///
+/// Any byte of the call instruction would do, and the last is the one known
+/// without decoding anything, on every architecture. It is the adjustment the
+/// `backtrace` crate makes before symbolizing, and so `std`'s own backtraces. The
+/// recorded `addr` and `fileAddr` are not changed: they are what the stack walk
+/// saw, and what a reader resolving them by hand should start from.
+///
+/// `None` for zero, which no stack walk records as a return address.
+fn call_site(return_address: u64) -> Option<u64> {
+    return_address.checked_sub(1)
 }
 
 /// The two labels the library's emitters give a point with no frames. Repeated
@@ -571,10 +667,19 @@ mod tests {
         let profile = Profile::parse(&a_profile()).expect("a native profile");
 
         let by_file = profile.batches(false);
-        assert_eq!(by_file[&0], vec![(0, 0x100), (1, 0x200)]);
+        assert_eq!(by_file[&0], vec![(0, 0xff), (1, 0x1ff)]);
 
         let by_runtime = profile.batches(true);
-        assert_eq!(by_runtime[&0], vec![(0, 0x1100), (1, 0x1200)]);
+        assert_eq!(by_runtime[&0], vec![(0, 0x10ff), (1, 0x11ff)]);
+    }
+
+    /// A recorded frame is a return address, which is the instruction after
+    /// the call, and asking about it names whatever the compiler put there.
+    /// What is asked about is inside the call itself.
+    #[test]
+    fn a_symbolizer_is_asked_about_the_call_rather_than_where_it_returns() {
+        assert_eq!(call_site(0x1c3ca0), Some(0x1c3c9f));
+        assert_eq!(call_site(0), None, "zero is no return address");
     }
 
     /// An address in no image has nothing to be resolved against, and a module
@@ -598,7 +703,7 @@ mod tests {
         let mut profile = Profile::parse(&a_profile()).expect("a native profile");
         assert_eq!(profile.batches(false)[&0].len(), 2);
         profile.resolve_frame(0, &resolution("program::churn"));
-        assert_eq!(profile.batches(false)[&0], vec![(1, 0x200)]);
+        assert_eq!(profile.batches(false)[&0], vec![(1, 0x1ff)]);
         assert_eq!(profile.resolved_frames(), 1);
     }
 
@@ -672,6 +777,127 @@ mod tests {
         assert!(!folded.contains('\u{1b}'), "an escape survived: {folded}");
         assert!(!folded.contains('\u{202e}'), "an override survived");
         assert!(folded.contains(r"\u{202e}"), "{folded}");
+    }
+
+    /// A resolution naming `functions`, innermost first.
+    fn inlined(functions: &[&str]) -> Resolution {
+        Resolution {
+            frames: functions
+                .iter()
+                .map(|function| Frame {
+                    function: String::from(*function),
+                    file: None,
+                    line: None,
+                })
+                .collect(),
+        }
+    }
+
+    /// A profile of one point whose stack is `depth` frames, all in one image.
+    fn a_stack(depth: usize) -> Profile {
+        let frames: Vec<String> = (0..depth)
+            .map(|at| {
+                format!(
+                    r#"{{"addr":"{:#x}","module":0,"fileAddr":"{at:#x}"}}"#,
+                    0x1000 + at
+                )
+            })
+            .collect();
+        let indices: Vec<String> = (0..depth).map(|at| at.to_string()).collect();
+        Profile::parse(&format!(
+            r#"{{"format":"heapscope-profile","formatVersion":1,
+                "frames":[{}],
+                "points":[{{"kind":"recorded","totalBytes":1,"frames":[{}]}}],
+                "modules":[{{"path":"/bin/program","load":"0x1000"}}]}}"#,
+            frames.join(","),
+            indices.join(",")
+        ))
+        .expect("a native profile")
+    }
+
+    /// The names a folded stack shows, innermost first.
+    fn shown(profile: &Profile) -> Vec<String> {
+        let folded = profile.to_folded("totalBytes").expect("a metric");
+        let stack = folded
+            .lines()
+            .next()
+            .expect("a line")
+            .rsplit_once(' ')
+            .expect("a count")
+            .0;
+        stack
+            .rsplit(';')
+            .map(|frame| {
+                let name = frame.split_once(": ").expect("an address").1;
+                String::from(name.split_once(" (").expect("an image").0)
+            })
+            .collect()
+    }
+
+    /// Allocation machinery inlined into the call the program wrote. Judged by
+    /// its innermost function the frame goes, and `Vec::with_capacity` with
+    /// it; judged by its outermost it stays, named `RawVec`. Neither is right.
+    #[test]
+    fn a_frame_is_shown_by_the_innermost_function_trimming_keeps() {
+        let mut profile = a_stack(3);
+        profile.resolve_frame(0, &inlined(&["__rustc::__rust_alloc"]));
+        profile.resolve_frame(
+            1,
+            &inlined(&[
+                "<alloc::raw_vec::RawVec<u8>>::with_capacity_in",
+                "<alloc::vec::Vec<u8>>::with_capacity_in",
+                "<alloc::vec::Vec<u8>>::with_capacity",
+            ]),
+        );
+        profile.resolve_frame(2, &inlined(&["program::grow"]));
+        assert_eq!(
+            shown(&profile),
+            ["<alloc::vec::Vec<u8>>::with_capacity_in", "program::grow"]
+        );
+    }
+
+    /// A frame that is machinery all the way out goes whole, however much was
+    /// inlined into it.
+    #[test]
+    fn a_frame_that_is_machinery_throughout_is_trimmed() {
+        let mut profile = a_stack(2);
+        profile.resolve_frame(
+            0,
+            &inlined(&[
+                "alloc::alloc::alloc",
+                "<alloc::alloc::Global as core::alloc::Allocator>::allocate",
+                "<alloc::raw_vec::RawVecInner>::finish_grow",
+            ]),
+        );
+        profile.resolve_frame(1, &inlined(&["program::grow"]));
+        assert_eq!(shown(&profile), ["program::grow"]);
+    }
+
+    /// Only the choice of name moves: a frame nothing was trimmed from still
+    /// shows its innermost function, which is the more specific answer.
+    #[test]
+    fn a_kept_frame_still_shows_what_was_inlined_into_it() {
+        let mut profile = a_stack(1);
+        profile.resolve_frame(0, &inlined(&["program::helper", "program::outer"]));
+        assert_eq!(shown(&profile), ["program::helper"]);
+    }
+
+    /// The runtime marker, found where Windows puts it: inlined into the frame
+    /// that calls the thread's closure. The frame stays, because a function
+    /// inside the marker is in it, and everything outside goes.
+    #[test]
+    fn an_inlined_runtime_marker_still_ends_the_stack() {
+        let mut profile = a_stack(3);
+        profile.resolve_frame(0, &inlined(&["program::allocates"]));
+        profile.resolve_frame(
+            1,
+            &inlined(&[
+                "program::main",
+                "std::sys::backtrace::__rust_begin_short_backtrace::<fn()>",
+            ]),
+        );
+        profile.resolve_frame(2, &inlined(&["std::rt::lang_start_internal"]));
+        assert_eq!(shown(&profile), ["program::allocates", "program::main"]);
     }
 
     /// A profile with no module map is the degraded case, not a crash.

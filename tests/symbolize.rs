@@ -232,6 +232,16 @@ fn a_folded_rendering_carries_the_resolved_names(recorded: &Path) {
     // is where a program decided to allocate and stays; the `RawVec`,
     // `alloc::alloc` and `__rust_alloc` frames beneath it are the same on every
     // stack in the process and go.
+    //
+    // Searched for anywhere in the frame rather than where its name starts, and
+    // that is deliberate. A frame resolved at the instruction *after* the
+    // allocator call names whatever the compiler inlined there, and then the
+    // machinery shows only in the generic arguments:
+    // `<core::result::Result<…>>::map_err::<…, <alloc::raw_vec::RawVecInner>::finish_grow::{closure#0}>`
+    // is what that looked like **[measured, Linux]**. The one spelling exempted
+    // is Windows': its debug information writes the default allocator out as a
+    // generic argument, `Vec<u8,alloc::alloc::Global>`, in the name of every
+    // `Vec` method a stack is meant to end in **[measured]**.
     for line in folded.lines() {
         let innermost = line
             .rsplit_once(' ')
@@ -240,10 +250,17 @@ fn a_folded_rendering_carries_the_resolved_names(recorded: &Path) {
             .rsplit(';')
             .next()
             .expect("a frame");
-        for machinery in ["__rust_alloc", "alloc::alloc::", "alloc::raw_vec"] {
+        let without_allocator_argument = innermost.replace(",alloc::alloc::Global", "");
+        for machinery in [
+            "__rust_alloc",
+            "__rust_realloc",
+            "alloc::alloc::",
+            "alloc::raw_vec",
+        ] {
             assert!(
-                !innermost.contains(machinery),
-                "a stack still ends in the allocation path: {innermost}"
+                !without_allocator_argument.contains(machinery),
+                "a stack still ends in the allocation path: {innermost}\n\
+                 the whole stack, outermost first: {line}"
             );
         }
     }

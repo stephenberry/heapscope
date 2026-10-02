@@ -76,6 +76,8 @@ llvm-symbolizer --obj=/path/to/program 0x10002c1f0
 addr2line -f -C -e /path/to/program 0x10002c1f0
 ```
 
+Every recorded frame is a return address, the instruction *after* the call, so ask about one byte earlier to name the call itself. The address as recorded names whatever the compiler placed next, which across inlining is often another function entirely: on Linux, a `Vec` growing in `finish_grow` resolves to the `map_err` inlined after the allocator call. `heapscope-symbolize` makes that adjustment for you.
+
 `atos` works from the runtime address instead, given the image's load address, which the profile's module map records alongside the path:
 
 ```sh
