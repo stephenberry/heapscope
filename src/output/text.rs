@@ -1256,7 +1256,7 @@ mod tests {
         // Each row's share is of the figure the order is by: 256 of the run's
         // 1,234 blocks, not 8 KiB of its 1 MiB.
         assert!(
-            by_blocks.contains("of all blocks allocated)"),
+            by_blocks.contains("(20.7% of all blocks allocated)"),
             "{by_blocks}"
         );
         assert!(

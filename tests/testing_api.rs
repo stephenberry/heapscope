@@ -170,6 +170,9 @@ fn the_testing_api_gates_a_real_program() {
     let counted = HeapStats::get().unwrap().total_blocks as usize;
     heapscope::assert_alloc_count!(counted);
     heapscope::assert_max_bytes!(usize::MAX);
+    // `NonZeroU64` met the bound these macros used to have, so it has to meet
+    // the narrower one too.
+    heapscope::assert_max_bytes!(std::num::NonZeroU64::MAX);
 
     // Each macro's trailing message, exercised once. Only `assert_max_bytes!`
     // had a test, so the wiring in the other two could be deleted rule by rule

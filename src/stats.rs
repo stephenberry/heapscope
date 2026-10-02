@@ -1138,7 +1138,10 @@ const WHOLE_RUN_NOTE: &str = "the program points printed to stderr, and any prof
 /// of zero or one: `assert_alloc_count!(since: mark, used <= 4)` asserted that
 /// the stage made exactly one allocation whenever `used <= 4` held. A budget
 /// that type-checks as something it is not is the cannot-fail shape again, so
-/// the bound is this instead, and its impls are the twelve integer types.
+/// the bound is this instead, and its impls are the twelve integer types and
+/// their `NonZero` forms. The `NonZero` impls are not a nicety: `NonZeroU64`
+/// satisfied the old bound, so a budget held in one compiled before the bound
+/// narrowed and has to compile after it.
 ///
 /// Public only so that it can appear in the hidden entry points' signatures;
 /// it lives in a private module, so no caller can name it, let alone implement
@@ -1160,6 +1163,14 @@ const WHOLE_RUN_NOTE: &str = "the program points printed to stderr, and any prof
 /// heapscope::assert_max_bytes!('k');
 /// ```
 mod integer {
+    use core::num::NonZero;
+
+    #[diagnostic::on_unimplemented(
+        message = "`{Self}` is not an integer count or byte budget",
+        label = "expected an integer here",
+        note = "a heapscope count or budget is an integer type, or the `NonZero` form of one; \
+                a `bool` here is usually a comparison written where the number belongs"
+    )]
     pub trait Integer: Copy {
         /// The value as a `u64`, or `None` when it is negative or too large.
         fn to_u64(self) -> Option<u64>;
@@ -1178,6 +1189,23 @@ mod integer {
     }
 
     integers!(u8 u16 u32 u64 u128 usize i8 i16 i32 i64 i128 isize);
+
+    // A `NonZero` is a number that is already known not to be zero, so it
+    // converts through the integer it wraps: a negative `NonZero<i32>` is
+    // refused exactly as a negative `i32` is.
+    macro_rules! non_zero {
+        ($($integer:ty)*) => {
+            $(
+                impl Integer for NonZero<$integer> {
+                    fn to_u64(self) -> Option<u64> {
+                        self.get().to_u64()
+                    }
+                }
+            )*
+        };
+    }
+
+    non_zero!(u8 u16 u32 u64 u128 usize i8 i16 i32 i64 i128 isize);
 }
 
 /// A macro argument as the `u64` the engine keeps its counters in.
@@ -1264,10 +1292,12 @@ pub fn __assert_no_leaks(since: Option<HeapStats>, context: Option<fmt::Argument
 /// a memory budget is actually about — a program that allocates a gigabyte one
 /// kilobyte at a time, freeing as it goes, has a peak of a kilobyte.
 ///
-/// Takes any integer that fits a `u64`, so a budget held in a `usize` works
-/// without a cast. A trailing message is formatted as [`format_args!`] and
-/// printed with the failure, which is worth using when the same assertion runs
-/// over several fixtures.
+/// Takes any integer that fits a `u64`, or the `NonZero` form of one, so a
+/// budget held in a `usize` works without a cast. Only integers: the bound was
+/// once `TryInto<u64>`, which let a `bool` or a `char` through as a budget of
+/// zero, one, or a code point. A trailing message is formatted as
+/// [`format_args!`] and printed with the failure, which is worth using when
+/// the same assertion runs over several fixtures.
 ///
 /// ```
 /// # #[global_allocator]
@@ -1296,7 +1326,8 @@ pub fn __assert_no_leaks(since: Option<HeapStats>, context: Option<fmt::Argument
 /// When the peak exceeded `limit`, and when there are no numbers to check — see
 /// the [module documentation](crate::stats) for that list. It does **not** pass
 /// quietly in either case. And when `limit` is negative, because a budget of
-/// `-1` read as `u64::MAX` could not fail.
+/// `-1` read as `u64::MAX` could not fail, and when it is larger than
+/// `u64::MAX`.
 #[macro_export]
 macro_rules! assert_max_bytes {
     ($limit:expr $(,)?) => {
@@ -1327,10 +1358,11 @@ macro_rules! assert_max_bytes {
 /// A reallocation counts as an allocation, so a `Vec` that grows four times made
 /// five. See [`HeapStats::total_blocks`].
 ///
-/// Takes any integer that fits a `u64`, so `items.len()` works without a cast,
-/// and nothing that is not an integer: a comparison written where the count
-/// belongs, `assert_alloc_count!(used <= 4)`, is a type error rather than a
-/// count of zero or one. Every form takes a trailing message, formatted as
+/// Takes any integer that fits a `u64`, or the `NonZero` form of one, so
+/// `items.len()` works without a cast. Only integers: the bound was once
+/// `TryInto<u64>`, which let a `bool` or a `char` through, so a comparison
+/// written where the count belongs, `assert_alloc_count!(used <= 4)`, ran as a
+/// count of zero or one. It is a type error now. Every form takes a trailing message, formatted as
 /// [`format_args!`] and printed with the failure, which is worth using when
 /// the same assertion runs over several fixtures.
 ///
@@ -1393,7 +1425,8 @@ macro_rules! assert_max_bytes {
 ///
 /// When the count differs or exceeds the ceiling, when the mark is ahead of the
 /// run, and when there are no numbers to check. And when the count or ceiling
-/// is negative, because a ceiling of `-1` read as `u64::MAX` could not fail.
+/// is negative or larger than `u64::MAX`, because a ceiling of `-1` read as
+/// `u64::MAX` could not fail.
 #[macro_export]
 macro_rules! assert_alloc_count {
     // The `since:` and `<=` arms come first, and neither can capture a call
@@ -2511,6 +2544,24 @@ mod tests {
         assert_eq!(as_count(64i128), 64);
         assert_eq!(as_count(64isize), 64);
         assert_eq!(as_count(u64::MAX), u64::MAX);
+    }
+
+    /// `NonZeroU64` satisfied the old `TryInto<u64>` bound, so a budget held
+    /// in one has to keep compiling; the other widths come with it, and a
+    /// negative one is refused like the integer it wraps.
+    #[test]
+    fn a_limit_can_be_a_non_zero_integer() {
+        use std::num::NonZero;
+        assert_eq!(as_count(NonZero::<u64>::MAX), u64::MAX);
+        assert_eq!(as_count(NonZero::new(64usize).unwrap()), 64);
+        assert_eq!(as_count(NonZero::new(64i8).unwrap()), 64);
+        assert_eq!(as_count(NonZero::new(64u128).unwrap()), 64);
+    }
+
+    #[test]
+    #[should_panic(expected = "not a byte count")]
+    fn a_negative_non_zero_limit_is_refused() {
+        as_count(std::num::NonZero::new(-1i32).unwrap());
     }
 
     /// Every complaint has to read as a sentence naming both numbers, because it
