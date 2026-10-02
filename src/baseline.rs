@@ -570,7 +570,7 @@ pub fn __assert_baseline(
             screened(path)
         );
     }
-    crate::stats::report(outcome.map(|_| ()), context);
+    crate::stats::report(outcome.map(|_| ()), crate::stats::Scope::WholeRun, context);
 }
 
 /// What a check that did not fail did.

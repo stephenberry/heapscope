@@ -24,6 +24,18 @@ There is a sixth way to reach zeros, and it is not on that list because it is re
 
 **A failing assertion writes a profile.** "The budget was 64 KiB and the peak was 400 KiB" says a test failed; it does not say which call site spent the difference, which is the only thing anyone wants to know next. So a failure prints the heaviest program points to stderr and writes a DHAT file, and the panic message names it. A second failure in the same run gets a file of its own, because a message pointing at a profile another test has since overwritten is worse than no profile.
 
+**Counting allocations, from the start or from a mark.** `assert_alloc_count!(3)` means exactly three. Read as a ceiling, a bare number would pass a run that allocated nothing, and nothing at the call site would say so. A ceiling is spelled out instead, as `<= 3`, where a reader can see that zero passes. Either form counts from when the profiler started, or from a mark read just before the code under test:
+
+```rust
+warm_up();
+let mark = heapscope::HeapStats::get().unwrap();
+compile(FIXTURE);
+
+heapscope::assert_alloc_count!(since: mark, <= 4, "while compiling {name}");
+```
+
+A mark recording more allocations than the run has made was not taken from that run, and the count since it is unknown, so the assertion fails instead of counting zero. A failure since a mark still writes a profile of the whole run, because a mark holds totals and no program points, and its message says so. `assert_max_bytes!` takes no mark: when the run's peak was set before the mark, two readings of it say nothing about the stage's own peak.
+
 **Baselines, for the gate you cannot write a number for.** Nobody knows what the budget should be until they have measured it once:
 
 ```rust

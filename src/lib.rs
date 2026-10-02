@@ -175,7 +175,9 @@ pub use symbol::demangle;
 #[doc(hidden)]
 pub use baseline::__assert_baseline;
 #[doc(hidden)]
-pub use stats::{__assert_alloc_count, __assert_max_bytes, __assert_no_leaks};
+pub use stats::{
+    __assert_alloc_count, __assert_alloc_count_at_most, __assert_max_bytes, __assert_no_leaks,
+};
 
 /// The version of this crate, as reported in profile headers.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
