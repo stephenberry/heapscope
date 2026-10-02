@@ -88,11 +88,12 @@ A frame with no name is `[program+0x2c1f0]`: the image's file name and the frame
 
 Frames are trimmed as in every other output: the allocation path above a stack and the runtime entry below it are left out. Trimming reads names, and the names come from the running process, so on Linux, where in-process symbolization names almost nothing, a folded file written at record time is untrimmed and mostly `[program+0x…]` frames. `heapscope-symbolize profile.native.json -f folded` writes the same file from names an offline symbolizer found, trimmed by the same rules; see [symbolization](symbolization.md).
 
-What a name alone gives up is the offset from the symbol, which is how a reader spots a name the platform matched from too far away, and resolvability: a folded file is a picture of the profile, and the native profile is the record. Folded output up to 0.1.0 used the addressed rendering, and it is one argument away for anyone who wants it:
+What a name alone gives up is the offset from the symbol, which is how a reader spots a name the platform matched from too far away, and resolvability: a folded file is a picture of the profile, and the native profile is the record. Folded output up to 0.1.0 used the addressed rendering, trimmed by default, and it is one argument away for anyone who wants it:
 
 ```rust
-use heapscope::symbol::Symbolized;
+use heapscope::symbol::{Symbolized, Trimmed};
 
 let file = std::fs::File::create("target/addressed.folded")?;
-snapshot.write_folded_with(file, &Symbolized::new(&snapshot.modules), FoldedMetric::TotalBytes)?;
+let addressed = Trimmed::new(Symbolized::new(&snapshot.modules));
+snapshot.write_folded_with(file, &addressed, FoldedMetric::TotalBytes)?;
 ```

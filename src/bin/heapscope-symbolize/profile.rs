@@ -550,32 +550,36 @@ enum Function<'a> {
 /// Every function `frame`'s address is in, innermost first: the one the frame
 /// is named by, then each caller that inlined it.
 ///
-/// The first is what this tool resolved, then what the running process knew,
-/// then nothing. Each inlined caller is what this tool resolved for it, or
-/// nothing; never the recorded name, which the process found for the address
-/// and not for that caller.
+/// Each level is what this tool resolved for it. Where it resolved nothing,
+/// the outermost level, the function the address physically lies in, falls
+/// back to what the running process knew: `symbol` is the name the image's
+/// symbol table gives that address, which is that function's, and it is what
+/// the library writes for the same frame. A level inside it has no such
+/// fallback, since the recorded name is not its name.
 ///
-/// An inlined caller with no name is kept, as [`Function::Unnamed`], rather
-/// than dropped. It is a real level of the call chain, and the trimming rules
-/// treat a level they cannot read as program code: dropping it would let the
-/// leading run of allocation-path functions continue through code that might
-/// be the program's own and remove it.
+/// An inner level with no name is kept, as [`Function::Unnamed`], rather than
+/// dropped. It is a real level of the call chain, and the trimming rules treat
+/// a level they cannot read as program code: dropping it would let the leading
+/// run of allocation-path functions continue through code that might be the
+/// program's own and remove it.
 fn functions_of(frame: &Value) -> Vec<Function<'_>> {
-    let first = match (
-        resolved_name(frame),
-        frame.get("symbol").and_then(Value::as_str),
-    ) {
-        (Some(name), _) => Function::Resolved(name),
-        (None, Some(symbol)) => Function::Recorded(symbol),
-        (None, None) => Function::Unnamed,
-    };
     let callers = frame
         .get("inlinedBy")
         .and_then(Value::as_array)
-        .unwrap_or(&[])
-        .iter()
-        .map(|caller| resolved_name(caller).map_or(Function::Unnamed, Function::Resolved));
-    std::iter::once(first).chain(callers).collect()
+        .unwrap_or(&[]);
+    let entries = std::iter::once(frame).chain(callers);
+    let outermost = callers.len();
+    entries
+        .enumerate()
+        .map(|(level, entry)| match resolved_name(entry) {
+            Some(name) => Function::Resolved(name),
+            None if level == outermost => frame
+                .get("symbol")
+                .and_then(Value::as_str)
+                .map_or(Function::Unnamed, Function::Recorded),
+            None => Function::Unnamed,
+        })
+        .collect()
 }
 
 /// Appends `function`'s name, screened, and says whether there was one.
@@ -1160,37 +1164,71 @@ mod tests {
         assert_eq!(shown(&profile), ["program::allocates", "program::main"]);
     }
 
-    /// An inlined level the symbolizer could not name is still a level. It
-    /// stops the leading run of allocation-path functions, as any frame the
-    /// rules cannot read does, so the program code that may be there is not
-    /// trimmed away; and where it is the outermost function kept, the frame is
-    /// shown as its image and file address rather than borrowing a name.
+    /// One level of a resolution, named or not.
+    fn level(function: Option<&str>) -> Frame {
+        Frame {
+            function: function.map(String::from),
+            file: Some(String::from("/src/main.rs")),
+            line: Some(3),
+        }
+    }
+
+    /// An inlined level the symbolizer could not name is still a level. In the
+    /// middle of a chain of machinery it stops the leading run of
+    /// allocation-path functions, as any frame the rules cannot read does, so
+    /// whatever program code it may be is not trimmed away. Without it this
+    /// frame would be machinery throughout and go.
     #[test]
-    fn an_unnamed_inlined_level_is_kept_and_stops_the_trim() {
+    fn an_unnamed_middle_level_is_kept_and_stops_the_trim() {
         let mut profile = a_stack(2);
         profile.resolve_frame(
             0,
             &Resolution {
                 frames: vec![
-                    Frame {
-                        function: Some(String::from("alloc::alloc::alloc")),
-                        file: None,
-                        line: None,
-                    },
-                    Frame {
-                        function: None,
-                        file: Some(String::from("/src/main.rs")),
-                        line: Some(3),
-                    },
+                    level(Some("alloc::alloc::alloc")),
+                    level(None),
+                    level(Some("<alloc::raw_vec::RawVecInner>::finish_grow")),
                 ],
             },
         );
         profile.resolve_frame(1, &inlined(&["program::main"]));
-        assert_eq!(shown(&profile), ["[program+0x0]", "program::main"]);
+        assert_eq!(
+            shown(&profile),
+            [
+                "<alloc::raw_vec::RawVecInner>::finish_grow",
+                "program::main"
+            ]
+        );
+    }
+
+    /// The outermost level is the function the address physically lies in,
+    /// and the name the running process recorded for the address is that
+    /// function's. Where the symbolizer left that level unnamed, the recorded
+    /// name stands in, as it does in the library's own output.
+    #[test]
+    fn an_unnamed_outermost_level_takes_the_recorded_name() {
+        let text = r#"{
+  "format":"heapscope-profile","formatVersion":1,
+  "frames":[
+    {"addr":"0x1100","module":0,"fileAddr":"0x100","symbol":"_ZN7program5churn17h0123456789abcdefE","symbolOffset":16},
+    {"addr":"0x1200","module":0,"fileAddr":"0x200"}
+  ],
+  "points":[{"kind":"recorded","totalBytes":64,"frames":[0,1]}],
+  "modules":[{"path":"/bin/program","load":"0x1000","start":"0x1000","size":4096,"bias":"0x1000"}]
+}"#;
+        let mut profile = Profile::parse(text).expect("a native profile");
+        profile.resolve_frame(
+            0,
+            &Resolution {
+                frames: vec![level(Some("alloc::alloc::alloc")), level(None)],
+            },
+        );
+        profile.resolve_frame(1, &inlined(&["program::main"]));
+        assert_eq!(shown(&profile), ["program::churn", "program::main"]);
     }
 
     /// Version 0.1.0 wrote `"???"` into `inlinedBy` entries as well as into
-    /// frames. Read as no name there too, it is the same unnamed level as
+    /// frames. Read as no name there too, it is an unnamed level like the ones
     /// above, and not a function called `???`.
     #[test]
     fn the_placeholder_an_older_version_wrote_into_an_inlined_caller_is_not_a_name() {

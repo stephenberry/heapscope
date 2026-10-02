@@ -25,7 +25,7 @@
 //! is routinely another function, and at the end of a function that never
 //! returns it is the next function in the image. So everything that asks what a
 //! frame *is* — which image holds it, which symbol names it — asks about
-//! [`call_site`] instead, one byte earlier, inside the call itself. What is
+//! `call_site` instead, one byte earlier, inside the call itself. What is
 //! *written* is still the recorded number: a frame's address, its file address,
 //! and a symbol's offset are all measured from the return address, so the
 //! format's numbers mean exactly what they did and a reader resolving one by
@@ -96,7 +96,7 @@ pub struct Resolved {
 /// last in the main executable, and `(void *)-1` is precisely what a bad stack
 /// walk produces.
 ///
-/// Located and named at its [`call_site`]; see the [module
+/// Located and named at its `call_site`; see the [module
 /// documentation](self). The file address and the symbol offset are still
 /// those of `address` itself.
 pub fn resolve(modules: &[Module], address: usize) -> Resolved {
@@ -154,7 +154,7 @@ pub fn call_site(return_address: u64) -> Option<u64> {
     return_address.checked_sub(1)
 }
 
-/// [`call_site`] for an address of this process.
+/// `call_site` for an address of this process.
 fn call_site_of(return_address: usize) -> Option<usize> {
     // Lossless both ways: the result is no larger than the argument, which
     // was a `usize`.
@@ -163,7 +163,7 @@ fn call_site_of(return_address: usize) -> Option<usize> {
 
 /// Which image a recorded frame is in, and its file address there.
 ///
-/// The image is the one holding the [`call_site`]: a return address one past
+/// The image is the one holding the `call_site`: a return address one past
 /// the end of an image's code belongs to that image, whose last instruction
 /// made the call, and one at an image's first byte does not. The file address
 /// is the return address's own, translated, because that is what the format
@@ -177,7 +177,7 @@ fn locate(modules: &[Module], address: usize) -> Option<(usize, usize)> {
 
 /// Names the call a recorded frame made, with the offset of the frame itself.
 ///
-/// The symbol is the one holding the [`call_site`]. The offset is measured from
+/// The symbol is the one holding the `call_site`. The offset is measured from
 /// the return address, so a rendered `name+0x24` and a native `symbolOffset`
 /// still say how far the *recorded* address is past the symbol: the offset
 /// `lookup` reported, plus the byte stepped back.
@@ -417,11 +417,13 @@ impl std::fmt::Debug for Symbolized<'_> {
 /// in every frame, which made the files large and every label in `inferno` or
 /// `speedscope` a path first and a name somewhere after it.
 ///
-/// Folded output used [`Symbolized`] up to 0.1.0. The default changed before
-/// 1.0, which is when a default can still change; [`Symbolized`] is one
-/// argument away, through
-/// [`Snapshot::write_folded_with`](crate::Snapshot::write_folded_with), for a
-/// flame graph that has to keep every return address apart.
+/// Folded output used [`Symbolized`], wrapped in [`Trimmed`] as the default
+/// `trim_frames` setting asks, up to 0.1.0. The default changed before 1.0,
+/// which is when a default can still change. That rendering is one argument
+/// away, through
+/// [`Snapshot::write_folded_with`](crate::Snapshot::write_folded_with), as
+/// `&Trimmed::new(Symbolized::new(&snapshot.modules))`, for a flame graph that
+/// has to keep every return address apart.
 ///
 /// # The name
 ///
@@ -449,12 +451,13 @@ impl std::fmt::Debug for Symbolized<'_> {
 /// Written `[image+0xfileaddress]`: the image's file name and the address as it
 /// appears in that file, the second half of what [`ModuleOffsets`] says, in
 /// brackets. As there, the image is the one that made the call and the number
-/// is the recorded return address's, not the [`call_site`]'s, so it is the
-/// number the native profile carries. Distinct addresses stay distinct, because merging every unnamed
-/// frame in an image into one, as `stackcollapse-perf.pl` does with its
-/// `[module]`, would draw call paths that never happened. The brackets are that
-/// convention's, and they mark the frame as something other than a function name
-/// to a reader and to [`name_of`](FrameFormat::name_of). No demangled name
+/// is the recorded return address's, not the call site's, so it is the number
+/// the native profile carries. Distinct addresses stay distinct, because
+/// merging every unnamed frame in an image into one, as `stackcollapse-perf.pl`
+/// does with its `[module]`, would draw call paths that never happened. The
+/// brackets are that convention's, and they mark the frame as something other
+/// than a function name to a reader and to [`name_of`](FrameFormat::name_of).
+/// No demangled name
 /// begins with one, and no symbol a compiler emits does; a garbage symbol from a
 /// damaged table that did would only be left untrimmed.
 ///

@@ -756,8 +756,9 @@ impl Snapshot {
     /// and the image path in every frame would make every label a path. Where
     /// no name is found the frame is `[image+0xfileaddress]`, by file name.
     /// [`FunctionNames`] has the details and what the rendering gives up; this
-    /// method rendered with [`Symbolized`] up to 0.1.0, and
-    /// [`Snapshot::write_folded_with`] still takes it.
+    /// method rendered with [`Symbolized`] up to 0.1.0, wrapped in [`Trimmed`]
+    /// when frames are trimmed, and [`Snapshot::write_folded_with`] still takes
+    /// `&Trimmed::new(Symbolized::new(&snapshot.modules))` for that rendering.
     ///
     /// Trimmed because a flame graph is read at a glance, so it is where the
     /// nine frames of runtime entry every stack shares cost the most.
