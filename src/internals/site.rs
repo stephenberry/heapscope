@@ -314,6 +314,46 @@ pub struct TallyStats {
     pub max_blocks: u64,
 }
 
+/// What was recorded while no region was open on the recording thread.
+///
+/// The row that makes the region rows add up: for each of these four columns,
+/// the region rows (the shared overflow row included) plus this one equal the
+/// run's own total. It follows the attribution every region row follows — an
+/// allocation is charged to whatever was innermost on its thread when it was
+/// made, and its free and every reallocation of it come back to the same place,
+/// on whatever thread they happen — so "outside every region" is a place a
+/// block lives, not a moment.
+///
+/// # Why there is no peak here
+///
+/// Every region row carries its own high-water mark, and this one does not,
+/// because it is not a row the engine keeps. It is the run's totals less the
+/// region rows, read in the same window as both. Keeping it as a real row would
+/// have cost more than it is worth: allocations outside every region are most
+/// allocations in most programs, regions or not, and every one of them would
+/// pay up to six more read-modify-writes on a single word shared by every
+/// thread — contended by construction, as the global counters are, where the
+/// per-thread and per-region rows are cheap precisely because they are not.
+/// The four columns here are exact without it; a peak is the one figure that
+/// cannot be had by subtraction, so it is absent rather than estimated.
+///
+/// `#[non_exhaustive]` for the same reason: if a peak is ever kept, it lands
+/// here without breaking anyone who reads the rest.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct OutsideRegions {
+    /// Bytes allocated outside every region. In a non-heap run, the weight of
+    /// the events recorded outside every region.
+    pub total_bytes: u64,
+    /// Blocks allocated outside every region. In a non-heap run, events.
+    pub total_blocks: u64,
+    /// Bytes allocated outside every region and still live. Zero in a run with
+    /// no block lifetimes, where nothing is ever live.
+    pub curr_bytes: u64,
+    /// Blocks allocated outside every region and still live.
+    pub curr_blocks: u64,
+}
+
 impl Tally {
     /// A row that has recorded nothing.
     pub const fn new() -> Self {
@@ -911,6 +951,36 @@ impl Regions {
     /// Arena bytes the interned rows occupy.
     pub fn bytes(&self) -> usize {
         self.len() * std::mem::size_of::<RegionRecord>()
+    }
+
+    /// The four additive columns summed over every row this table holds, the
+    /// overflow row included.
+    ///
+    /// Every row, not only the ones [`Regions::visit`] would report: what this
+    /// answers is how much of the run the table accounts for, and a row skipped
+    /// for having nothing to say contributes nothing either way. Returned as an
+    /// [`OutsideRegions`] because the only use of the sum is the subtraction that
+    /// makes one, and the type already names exactly these four columns.
+    ///
+    /// Saturating rather than wrapping, though no real run approaches the
+    /// limit: each term is a share of a `u64` total, so a sum that overflows
+    /// is already a defect, and a saturated one is what the caller's check
+    /// against the totals then reports.
+    pub fn attributed(&self) -> OutsideRegions {
+        let mut sum = OutsideRegions::default();
+        let mut add = |counts: TallyStats| {
+            sum.total_bytes = sum.total_bytes.saturating_add(counts.total_bytes);
+            sum.total_blocks = sum.total_blocks.saturating_add(counts.total_blocks);
+            sum.curr_bytes = sum.curr_bytes.saturating_add(counts.curr_bytes);
+            sum.curr_blocks = sum.curr_blocks.saturating_add(counts.curr_blocks);
+        };
+        for index in 0..self.len() {
+            if let Some(record) = self.record(index) {
+                add(record.tally.snapshot());
+            }
+        }
+        add(self.overflow.tally.snapshot());
+        sum
     }
 
     /// Visits every row that was **entered**, in id order, then the overflow

@@ -324,6 +324,12 @@ fn write_threads<W: Write>(
 }
 
 /// What for. Left out for a run that entered no regions, which is most of them.
+///
+/// The row for what was recorded outside every region comes last, after the
+/// cut that `top` makes, rather than sorted in among the regions. It is not one
+/// of them, and it is the row that makes the rest add up: without it, a reader
+/// who wants to know how much of the run the regions cover has to subtract
+/// from the totals, and get the overflow row right while doing it.
 fn write_regions<W: Write>(
     out: &mut W,
     snapshot: &Snapshot,
@@ -338,7 +344,13 @@ fn write_regions<W: Write>(
     let mut order: Vec<&super::RegionStats> = snapshot.regions.iter().collect();
     order.sort_by_key(|row| std::cmp::Reverse(row.counts.total_bytes));
     let shown = order.len().min(top);
-    let width = label_width(order.iter().take(shown).map(|row| region_label(row).len()));
+    let width = label_width(
+        order
+            .iter()
+            .take(shown)
+            .map(|row| region_label(row).len())
+            .chain([OUTSIDE_REGIONS.len()]),
+    );
 
     writeln!(out)?;
     writeln!(out, "heapscope regions")?;
@@ -358,8 +370,33 @@ fn write_regions<W: Write>(
             )?;
         }
     }
-    write_remainder(out, order.len(), shown)
+    write_remainder(out, order.len(), shown)?;
+
+    let outside = &snapshot.outside_regions;
+    write!(out, "  {OUTSIDE_REGIONS:width$}  ")?;
+    write!(
+        out,
+        "{} in {} {per_count} ({})",
+        amount(outside.total_bytes),
+        count(outside.total_blocks),
+        percent(outside.total_bytes, snapshot.stats.total_bytes)
+    )?;
+    // Live, and no peak: this row is the totals less the regions, and a peak is
+    // the one figure a subtraction cannot give. See `OutsideRegions`.
+    if snapshot.settings.mode.block_lifetimes() {
+        write!(out, ", {} live", amount(outside.curr_bytes))?;
+    }
+    writeln!(out)
 }
+
+/// The label of the row for what was recorded outside every region.
+///
+/// Parenthesised, like the overflow rows, because a region name is whatever the
+/// program passed and these are not names. A program can still enter a region
+/// called this, and the two would print alike; this row is always the last
+/// line of the section, after any `and N more`, which is what tells them
+/// apart here. The file keeps them apart structurally.
+const OUTSIDE_REGIONS: &str = "(no region)";
 
 /// One attribution row's counters, in the mode's own units.
 fn write_row<W: Write>(
@@ -1001,6 +1038,60 @@ mod tests {
             text.contains("parsing") && text.contains("512.0 KiB in 500 blocks (50.0%)"),
             "{text}"
         );
+    }
+
+    /// What no region covered is the last row of the section, after the cut
+    /// `top` makes, so the rows a reader sees always account for the whole run.
+    /// It has live bytes and no peak, because it is a remainder and a peak is
+    /// the one figure a subtraction cannot give.
+    #[test]
+    fn the_regions_end_with_what_no_region_covered() {
+        let mut snapshot = snapshot(vec![point(&[0x10], 1_024)]);
+        let region = |id: u16, name: &str, total_bytes: u64| crate::output::RegionStats {
+            id,
+            overflow: false,
+            name: Some(String::from(name)),
+            first_seen: 0,
+            entries: 1,
+            active: 0,
+            counts: crate::output::TallyStats {
+                total_bytes,
+                total_blocks: 10,
+                curr_bytes: 0,
+                curr_blocks: 0,
+                max_bytes: 512,
+                max_blocks: 1,
+            },
+        };
+        snapshot.regions = vec![
+            region(0, "parsing", 524_288),
+            region(1, "emitting", 262_144),
+        ];
+        snapshot.outside_regions.total_bytes = 262_144;
+        snapshot.outside_regions.total_blocks = 1_214;
+        snapshot.outside_regions.curr_bytes = 1_024;
+        snapshot.outside_regions.curr_blocks = 2;
+
+        // One region shown, so the remainder comes after "and 1 more".
+        let text = render(&snapshot, 1);
+        let section = &text[text.find("heapscope regions").expect("{text}")..];
+        let lines: Vec<&str> = section.lines().take(4).collect();
+        assert!(lines[1].contains("parsing"), "{text}");
+        assert!(lines[2].contains("and 1 more"), "{text}");
+        assert!(
+            lines[3].contains("(no region)")
+                && lines[3].ends_with("256.0 KiB in 1,214 blocks (25.0%), 1.0 KiB live"),
+            "the remainder is missing, misplaced, or carries a peak: {text}"
+        );
+
+        // In a mode with no live blocks, it has nothing live to report either.
+        snapshot.settings.mode = crate::Mode::AdHoc;
+        let text = render(&snapshot, 8);
+        let line = text
+            .lines()
+            .find(|line| line.contains("(no region)"))
+            .expect("the remainder is shown in every mode");
+        assert!(!line.contains("live"), "{text}");
     }
 
     /// One row that repeats the totals is not a section. The file carries it

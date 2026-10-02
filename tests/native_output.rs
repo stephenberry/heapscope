@@ -144,8 +144,15 @@ fn snapshot(points: Vec<ProgramPoint>) -> Snapshot {
         },
     ];
     // One region, holding a strict subset of the run: an allocation made
-    // outside every region belongs to no row, so these do not sum to the
-    // totals and the validator must not expect them to.
+    // outside every region belongs to no row, so the rows alone do not sum to
+    // the totals. What does is the rows plus `outside_regions`, the remainder,
+    // which is set below from the same shares rather than written out, so the
+    // two cannot drift apart. The region keeps none of its bytes live, so the
+    // remainder holds every live one and a sum that forgot it is visibly short.
+    snapshot.outside_regions.total_bytes = major + spare;
+    snapshot.outside_regions.total_blocks = major_blocks + spare_blocks;
+    snapshot.outside_regions.curr_bytes = stats.curr_bytes;
+    snapshot.outside_regions.curr_blocks = stats.curr_blocks;
     snapshot.regions = vec![RegionStats {
         id: 0,
         overflow: false,
@@ -626,6 +633,120 @@ fn the_validator_rejects_a_region_open_more_times_than_it_was_entered() {
         }),
         "is open 3 times",
     );
+}
+
+/// What was recorded outside every region is in the file, apart from the
+/// region rows, and it is what makes them add up: read back here against the
+/// totals rather than against the numbers the fixture wrote, so that an emitter
+/// writing the wrong field into the right key is caught.
+#[test]
+fn a_profile_says_what_was_recorded_outside_every_region() {
+    let text = emit(&snapshot(vec![point(&[0x1500], 4096, 8)]));
+    native::assert_valid(&text);
+    let root = parse(&text);
+
+    let outside = root
+        .get("outsideRegions")
+        .expect("a profile says what was recorded outside every region");
+    let region = &root
+        .get("regions")
+        .and_then(Value::as_array)
+        .expect("regions")[0];
+    let totals = root.get("totals").expect("totals");
+    for field in ["totalBytes", "totalBlocks", "currBytes", "currBlocks"] {
+        let read = |row: &Value| row.get(field).and_then(Value::as_u64).unwrap_or(0);
+        assert_eq!(
+            read(region) + read(outside),
+            read(totals),
+            "the region rows and the remainder do not add up on `{field}`"
+        );
+    }
+    assert_ne!(
+        outside.get("totalBytes").and_then(Value::as_u64),
+        totals.get("totalBytes").and_then(Value::as_u64),
+        "the fixture's region holds nothing, so this test cannot tell the \
+         remainder from the totals"
+    );
+    for field in ["maxBytes", "maxBlocks"] {
+        assert!(
+            outside.get(field).is_none(),
+            "the remainder carries `{field}`, which nothing measured"
+        );
+    }
+}
+
+/// The rule that makes the remainder worth carrying. Without it, any number in
+/// `outsideRegions` would be as good as the right one.
+#[test]
+fn the_validator_rejects_a_remainder_that_does_not_complete_the_regions() {
+    let text = emit(&snapshot(vec![point(&[0x1500], 4096, 8)]));
+    let problems = damaged_by(&text, |t| {
+        replacing(
+            t,
+            r#""outsideRegions":{"totalBytes":3072"#,
+            r#""outsideRegions":{"totalBytes":3071"#,
+        )
+    });
+    assert_eq!(
+        problems.len(),
+        1,
+        "one byte out should be caught by the sum and by nothing else: {problems:?}"
+    );
+    rejects(&problems, "region rows and `outsideRegions` account for");
+}
+
+/// The remainder is required even though older files lack it, because the
+/// validator checks files this writer produced — and a peak on it is refused,
+/// because it is a subtraction and a peak is the one figure a subtraction
+/// cannot give.
+#[test]
+fn the_validator_rejects_a_missing_or_overstated_remainder() {
+    let text = emit(&snapshot(vec![point(&[0x1500], 4096, 8)]));
+    rejects(
+        &damaged_by(&text, |t| {
+            replacing(t, r#""outsideRegions":"#, r#""outsideRegionsGone":"#)
+        }),
+        "missing object `outsideRegions`",
+    );
+    rejects(
+        &damaged_by(&text, |t| {
+            replacing(
+                t,
+                r#""outsideRegions":{"#,
+                r#""outsideRegions":{"maxBytes":1,"#,
+            )
+        }),
+        "which nothing measured",
+    );
+}
+
+/// In a mode with no live blocks the remainder carries no live columns, for the
+/// reason no other row does.
+#[test]
+fn the_remainder_in_a_non_heap_mode_carries_no_live_columns() {
+    for mode in [Mode::AdHoc, Mode::Copy] {
+        let text = emit(&as_mode(snapshot(vec![point(&[0x1500], 4096, 8)]), mode));
+        native::assert_valid(&text);
+        let root = parse(&text);
+        let outside = root.get("outsideRegions").expect("outsideRegions");
+        assert!(outside.get("totalBytes").is_some());
+        for field in ["currBytes", "currBlocks"] {
+            assert!(
+                outside.get(field).is_none(),
+                "a {mode} profile's remainder carries `{field}`"
+            );
+        }
+        rejects(
+            &damaged_by(&text, |t| {
+                replacing(
+                    t,
+                    r#""outsideRegions":{"#,
+                    r#""outsideRegions":{"currBytes":0,"#,
+                )
+            }),
+            "in a mode with no live blocks",
+        );
+    }
 }
 
 /// A row id is what a reader joins on, so two rows sharing one is a file that
