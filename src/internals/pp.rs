@@ -140,11 +140,11 @@ impl fmt::Debug for PpId {
 /// field.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Counters {
-    /// Bytes allocated here
-    /// since the run started or its counts were last restarted. DHAT's `tb`.
+    /// Bytes allocated here since the run started or its counts were last
+    /// restarted. DHAT's `tb`.
     pub total_bytes: u64,
-    /// Blocks allocated here since the run started or its counts were last restarted. DHAT's
-    /// `tbk`.
+    /// Blocks allocated here since the run started or its counts were last
+    /// restarted. DHAT's `tbk`.
     pub total_blocks: u64,
     /// Summed lifetime of the blocks counted in `total_blocks` that have been
     /// freed. DHAT's `tl`.
@@ -158,13 +158,12 @@ pub struct Counters {
     /// Blocks currently live. Becomes DHAT's `ebk`.
     pub curr_blocks: u64,
 
-    /// Greatest `curr_bytes` reached
-    /// since the run started or its counts were last restarted,, which starts it again from what the point
-    /// held then. DHAT's `mb`; see the module docs for why this differs from
-    /// Valgrind's.
+    /// Greatest `curr_bytes` reached since the run started or its counts were
+    /// last restarted, which starts it again from what the point held then.
+    /// DHAT's `mb`; see the module docs for why this differs from Valgrind's.
     pub max_bytes: u64,
-    /// Greatest `curr_blocks` reached since the run started or its counts were last restarted. DHAT's
-    /// `mbk`.
+    /// Greatest `curr_blocks` reached since the run started or its counts were
+    /// last restarted. DHAT's `mbk`.
     pub max_blocks: u64,
 
     /// Bytes live when the whole heap peaked. DHAT's `gb`.

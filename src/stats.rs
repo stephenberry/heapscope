@@ -330,6 +330,14 @@ pub enum StatsError {
     /// refusal is where the number is read because there it needs no declaration
     /// and cannot be bypassed.
     Sampled,
+    /// A restart of the counts is under way, and this thread cannot wait for it.
+    ///
+    /// A reading waits out a [`Profiler::reset`](crate::Profiler::reset) in
+    /// progress, which takes no longer than a sweep of the profiler's tables.
+    /// A thread inside the profiler cannot: the reset may be running on it, as
+    /// it is for a signal handler that interrupted one, and waiting there
+    /// would wait forever. Read again from ordinary code.
+    ResetInProgress,
 }
 
 impl fmt::Display for StatsError {
@@ -373,6 +381,12 @@ impl fmt::Display for StatsError {
                 "this run samples allocations, so its counters are estimates \
                  and not a budget worth asserting against; build the profiler \
                  without sampling(..) for a test that asserts"
+            ),
+            StatsError::ResetInProgress => write!(
+                f,
+                "a restart of the counts is under way and this thread, being \
+                 inside the profiler (a signal handler, say), cannot wait for it; \
+                 read the counters again from ordinary code"
             ),
         }
     }
@@ -418,9 +432,12 @@ impl HeapStats {
         // In one window, which reading the restart count beside the counters
         // would not be: a restart on another thread landing between the two
         // reads pairs one window's counters with the other's count, whichever
-        // is read first. `read_window` retries until no restart landed, without
-        // a lock, which is what keeps this reading lock-free.
-        let (resets, stats) = engine.read_window(|| engine.stats());
+        // is read first. `read_window` retries until no restart landed. It
+        // takes no lock, but waits out a restart in progress, and refuses
+        // where waiting could never end.
+        let (resets, stats) = engine
+            .read_window(|| engine.stats())
+            .ok_or(StatsError::ResetInProgress)?;
         // Checked *after* the counters are read, not before: a poison raised
         // while they were being read would otherwise be missed, and the whole
         // point of this module is to refuse rather than to guess.
@@ -465,7 +482,9 @@ impl EventStats {
             return Err(StatsError::Sampled);
         }
         // In one window, for the reason `HeapStats::of` gives.
-        let (resets, stats) = engine.read_window(|| engine.stats());
+        let (resets, stats) = engine
+            .read_window(|| engine.stats())
+            .ok_or(StatsError::ResetInProgress)?;
         unpoisoned()?;
         Ok(EventStats {
             mode,
@@ -2317,30 +2336,40 @@ mod tests {
     fn a_reading_racing_a_restart_is_of_one_window() {
         use std::sync::atomic::{AtomicBool, Ordering};
 
+        /// Clears the flag however the restarting thread ends, so that a
+        /// panic there fails this test instead of leaving the other two
+        /// threads spinning until a CI runner times out with no message.
+        struct Finished<'a>(&'a AtomicBool);
+        impl Drop for Finished<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+
         const RESETS: usize = if cfg!(miri) { 3 } else { 2_000 };
         let _serial = serialized();
         let engine = engine(Mode::Heap);
-        let done = AtomicBool::new(false);
+        let restarting = AtomicBool::new(true);
 
         std::thread::scope(|s| {
             s.spawn(|| {
-                while !done.load(Ordering::Relaxed) {
+                while restarting.load(Ordering::Acquire) {
                     record(&engine, 0x100, 8);
                     engine.record_free(0x100, 8);
                 }
             });
             s.spawn(|| {
+                let _finished = Finished(&restarting);
                 for _ in 0..RESETS {
                     engine
                         .reset_guarded()
                         .expect("a running engine restarts its counts");
                 }
-                done.store(true, Ordering::Relaxed);
             });
 
             let mut last = HeapStats::of(&engine).expect("a running heap run has counters");
             let mut readings = 0u64;
-            while !done.load(Ordering::Relaxed) {
+            while restarting.load(Ordering::Acquire) {
                 let reading = HeapStats::of(&engine).expect("a running heap run has counters");
                 assert!(
                     reading.resets >= last.resets,
