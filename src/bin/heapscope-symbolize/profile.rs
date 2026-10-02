@@ -123,8 +123,10 @@ impl Profile {
     /// the tool — `atos` works from where the image was mapped and the other two
     /// from where the code sits in the file — so the choice is made here, once,
     /// against [`Tool::wants_runtime_addresses`](crate::tool::Tool::wants_runtime_addresses).
-    /// Either way it is the [`call_site`] of what was recorded, not the recorded
-    /// number itself.
+    /// Either way it is the
+    /// [`call_site`](heapscope::symbol::call_site) of what was recorded, not the
+    /// recorded number itself, which is the rule the library's own lookups
+    /// follow.
     ///
     /// Frames already carrying a resolved `function` are skipped, so running
     /// this tool twice over one profile does no work the second time and cannot
@@ -154,7 +156,7 @@ impl Profile {
             // A frame with no `fileAddr` is one whose image reported no bias —
             // the Windows module map does not — and asking a file-address tool
             // about a runtime address would name whatever happens to live there.
-            if let Some(address) = address.and_then(call_site) {
+            if let Some(address) = address.and_then(heapscope::symbol::call_site) {
                 batches.entry(module).or_default().push((at, address));
             }
         }
@@ -458,34 +460,6 @@ impl Profile {
     }
 }
 
-/// The address to ask a symbolizer about for a recorded frame: one byte before
-/// it, inside the call instruction rather than after it.
-///
-/// Every frame a profile records is a return address — the frame-pointer walk,
-/// `backtrace`, and `RtlCaptureStackBackTrace` all report where execution will
-/// *resume* — and that is the instruction after the call, which belongs to
-/// whatever the compiler placed next. Within one function that is usually the
-/// same line; across inlining it is routinely a different function. `std` ends
-/// `RawVecInner::finish_grow` by calling the allocator and then `map_err` on
-/// the result, so the return address lies in the inlined `map_err`, and the
-/// frame read as `<core::result::Result<…>>::map_err` — which trimming rightly
-/// does not recognise as the allocation path. One byte earlier the same frame
-/// is `alloc::alloc::alloc`, inlined through `Global::allocate` into
-/// `finish_grow`, which it does. Elsewhere in the same profile a thread's entry
-/// frame read as `core::mem::size_of_val_raw` and a `read_to_end` frame as
-/// `Vec::len` **\[measured, Linux x86_64, rustc 1.98, binutils 2.42\]**.
-///
-/// Any byte of the call instruction would do, and the last is the one known
-/// without decoding anything, on every architecture. It is the adjustment the
-/// `backtrace` crate makes before symbolizing, and so `std`'s own backtraces. The
-/// recorded `addr` and `fileAddr` are not changed: they are what the stack walk
-/// saw, and what a reader resolving them by hand should start from.
-///
-/// `None` for zero, which no stack walk records as a return address.
-fn call_site(return_address: u64) -> Option<u64> {
-    return_address.checked_sub(1)
-}
-
 /// The two labels the library's emitters give a point with no frames. Repeated
 /// as text rather than shared because they are `pub(super)` there — and because
 /// what has to match is the *file*, which a test compares.
@@ -671,15 +645,6 @@ mod tests {
 
         let by_runtime = profile.batches(true);
         assert_eq!(by_runtime[&0], vec![(0, 0x10ff), (1, 0x11ff)]);
-    }
-
-    /// A recorded frame is a return address, which is the instruction after
-    /// the call, and asking about it names whatever the compiler put there.
-    /// What is asked about is inside the call itself.
-    #[test]
-    fn a_symbolizer_is_asked_about_the_call_rather_than_where_it_returns() {
-        assert_eq!(call_site(0x1c3ca0), Some(0x1c3c9f));
-        assert_eq!(call_site(0), None, "zero is no return address");
     }
 
     /// An address in no image has nothing to be resolved against, and a module
