@@ -57,7 +57,7 @@ pub use dhat_v2::{FrameFormat, RawAddresses};
 pub use folded::FoldedMetric;
 
 pub(crate) use dhat_v2::push_hex;
-pub(crate) use text::count;
+pub(crate) use text::{count, Ranking};
 
 /// How much of one of the profiler's tables is in use.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -834,12 +834,7 @@ impl Snapshot {
     /// output someone reads without opening anything, so it is where a name
     /// earns the most and where a wall of `lang_start` costs the most.
     pub fn write_text_summary<W: Write>(&self, out: W, top: usize) -> io::Result<()> {
-        let names = Symbolized::new(&self.modules);
-        if self.settings.trim_frames {
-            self.write_text_summary_with(out, &Trimmed::new(names), top)
-        } else {
-            self.write_text_summary_with(out, &names, top)
-        }
+        self.write_text_summary_ranked(out, top, Ranking::Bytes)
     }
 
     /// Writes a human-readable summary, rendering frames with `format`.
@@ -849,8 +844,38 @@ impl Snapshot {
         format: &dyn FrameFormat,
         top: usize,
     ) -> io::Result<()> {
+        self.write_text_summary_ranked_with(out, format, top, Ranking::Bytes)
+    }
+
+    /// [`write_text_summary`](Snapshot::write_text_summary), with the program
+    /// points ranked by `ranking`.
+    ///
+    /// Crate-private because the one caller that wants anything but bytes is a
+    /// failing allocation count, which knows what it measured; a public
+    /// parameter would be a promise made for a use nobody outside has asked for.
+    pub(crate) fn write_text_summary_ranked<W: Write>(
+        &self,
+        out: W,
+        top: usize,
+        ranking: Ranking,
+    ) -> io::Result<()> {
+        let names = Symbolized::new(&self.modules);
+        if self.settings.trim_frames {
+            self.write_text_summary_ranked_with(out, &Trimmed::new(names), top, ranking)
+        } else {
+            self.write_text_summary_ranked_with(out, &names, top, ranking)
+        }
+    }
+
+    fn write_text_summary_ranked_with<W: Write>(
+        &self,
+        out: W,
+        format: &dyn FrameFormat,
+        top: usize,
+        ranking: Ranking,
+    ) -> io::Result<()> {
         let _quiet = crate::internals::guard::enter();
-        text::write(self, format, out, top)
+        text::write(self, format, out, top, ranking)
     }
 }
 

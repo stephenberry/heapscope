@@ -393,6 +393,7 @@ impl heapscope::baseline::Baseline: Copy (derived)
 impl heapscope::baseline::Baseline: Debug (derived)
 impl heapscope::baseline::Baseline: Eq (derived)
 impl heapscope::baseline::Baseline: PartialEq (derived)
+impl heapscope::baseline::Failure: crate::stats::AssertionFailure
 impl heapscope::baseline::Failure: fmt::Display
 impl heapscope::baseline::Regression: Clone (derived)
 impl heapscope::baseline::Regression: Copy (derived)
@@ -498,6 +499,7 @@ impl heapscope::output::ThreadStats: Clone (derived)
 impl heapscope::output::ThreadStats: Debug (derived)
 impl heapscope::output::ThreadStats: Eq (derived)
 impl heapscope::output::ThreadStats: PartialEq (derived)
+impl heapscope::stats::Complaint: AssertionFailure
 impl heapscope::stats::Complaint: fmt::Display
 impl heapscope::stats::EventStats: Clone (derived)
 impl heapscope::stats::EventStats: Copy (derived)

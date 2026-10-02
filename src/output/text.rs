@@ -10,14 +10,41 @@
 
 use std::io::{self, Write};
 
-use super::{FrameFormat, Snapshot};
+use super::{Counters, FrameFormat, Snapshot};
 
-/// Writes a summary of `snapshot`, showing at most `top` program points.
+/// Which figure decides the order the program points are listed in.
+///
+/// Bytes, everywhere but one place: a failing allocation count. A count is
+/// about how many allocations were made, and ranking it by bytes buries the
+/// answer: a stage making a thousand 16-byte allocations sits under a warm-up's
+/// one 4 MiB buffer, so the sites a reader is shown are the ones that did not
+/// cause the failure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Ranking {
+    /// Heaviest by bytes allocated, ties broken by blocks.
+    Bytes,
+    /// Most blocks allocated, ties broken by bytes.
+    Blocks,
+}
+
+impl Ranking {
+    /// The figure ranked on first, and the one that breaks its ties.
+    fn key(self, counters: &Counters) -> (u64, u64) {
+        match self {
+            Ranking::Bytes => (counters.total_bytes, counters.total_blocks),
+            Ranking::Blocks => (counters.total_blocks, counters.total_bytes),
+        }
+    }
+}
+
+/// Writes a summary of `snapshot`, showing at most `top` program points,
+/// ranked by `ranking`.
 pub(super) fn write<W: Write>(
     snapshot: &Snapshot,
     format: &dyn FrameFormat,
     mut out: W,
     top: usize,
+    ranking: Ranking,
 ) -> io::Result<()> {
     let stats = &snapshot.stats;
     // What the run counted decides both the words and the arithmetic. An ad hoc
@@ -114,13 +141,17 @@ pub(super) fn write<W: Write>(
     let mut order: Vec<usize> = (0..snapshot.points.len()).collect();
     order.sort_unstable_by(|&a, &b| {
         let (left, right) = (&snapshot.points[a], &snapshot.points[b]);
-        right
-            .counters
-            .total_bytes
-            .cmp(&left.counters.total_bytes)
-            .then_with(|| right.counters.total_blocks.cmp(&left.counters.total_blocks))
+        ranking
+            .key(&right.counters)
+            .cmp(&ranking.key(&left.counters))
             .then_with(|| a.cmp(&b))
     });
+    // The header and each row's share name the figure the order is by, so a
+    // list ranked by blocks never reads as though it were ranked by bytes.
+    let (ranked_by, ranked_total) = match ranking {
+        Ranking::Bytes => (many, stats.total_bytes),
+        Ranking::Blocks => (per_count, stats.total_blocks),
+    };
 
     let shown = order.len().min(top);
 
@@ -142,7 +173,7 @@ pub(super) fn write<W: Write>(
     writeln!(out)?;
     writeln!(
         out,
-        "Top {shown} of {} program points, by {many} {verb}. Times are in {}.",
+        "Top {shown} of {} program points, by {ranked_by} {verb}. Times are in {}.",
         count(snapshot.points.len() as u64),
         snapshot.time_source.unit_long()
     )?;
@@ -167,11 +198,11 @@ pub(super) fn write<W: Write>(
         writeln!(out)?;
         writeln!(
             out,
-            "{:>3}. {} in {} {per_count} ({} of all {many} {verb})",
+            "{:>3}. {} in {} {per_count} ({} of all {ranked_by} {verb})",
             rank + 1,
             amount(counters.total_bytes),
             count(counters.total_blocks),
-            percent(counters.total_bytes, stats.total_bytes)
+            percent(ranking.key(counters).0, ranked_total)
         )?;
         // The time unit is named once, in the header. Repeating it here would
         // mean choosing between "1 events" and a pluralisation rule for every
@@ -658,8 +689,13 @@ mod tests {
     }
 
     fn render(snapshot: &Snapshot, top: usize) -> String {
+        render_ranked(snapshot, top, Ranking::Bytes)
+    }
+
+    fn render_ranked(snapshot: &Snapshot, top: usize, ranking: Ranking) -> String {
         let mut buffer = Vec::new();
-        write(snapshot, &RawAddresses, &mut buffer, top).expect("writing to a Vec cannot fail");
+        write(snapshot, &RawAddresses, &mut buffer, top, ranking)
+            .expect("writing to a Vec cannot fail");
         String::from_utf8(buffer).expect("valid UTF-8")
     }
 
@@ -686,7 +722,8 @@ mod tests {
         snapshot.command = String::from("prog \u{1b}[2J --flag \u{202e}gnp.exe\u{0}");
 
         let mut buffer = Vec::new();
-        write(&snapshot, &Hostile, &mut buffer, 5).expect("writing to a Vec cannot fail");
+        write(&snapshot, &Hostile, &mut buffer, 5, Ranking::Bytes)
+            .expect("writing to a Vec cannot fail");
         let summary = String::from_utf8(buffer).expect("valid UTF-8");
 
         let offenders: Vec<char> = summary
@@ -748,7 +785,8 @@ mod tests {
         ]);
 
         let mut buffer = Vec::new();
-        write(&taken, &Outermost, &mut buffer, 5).expect("writing to a Vec cannot fail");
+        write(&taken, &Outermost, &mut buffer, 5, Ranking::Bytes)
+            .expect("writing to a Vec cannot fail");
         let text = String::from_utf8(buffer).expect("valid UTF-8");
 
         assert!(
@@ -1174,6 +1212,59 @@ mod tests {
         assert!(first < second && second < third, "{text}");
     }
 
+    /// A count assertion ranks by blocks, and the case that matters is the
+    /// one where the two rankings disagree: many small allocations against one
+    /// large one. Ranked by bytes the large one leads, which is a failing
+    /// count's summary pointing away from its cause.
+    #[test]
+    fn a_ranking_by_blocks_puts_the_many_small_allocations_first() {
+        let mut many = point(&[0x10], 4_096);
+        many.counters.total_blocks = 256;
+        let mut large = point(&[0x20], 1_048_576);
+        large.counters.total_blocks = 1;
+        let mut tied = point(&[0x30], 8_192);
+        tied.counters.total_blocks = 256;
+        let snapshot = snapshot(vec![many, large, tied]);
+
+        let by_bytes = render_ranked(&snapshot, 3, Ranking::Bytes);
+        let by_blocks = render_ranked(&snapshot, 3, Ranking::Blocks);
+        let position = |text: &str, address: &str| text.find(address).expect(address);
+
+        assert!(
+            position(&by_bytes, "0x20") < position(&by_bytes, "0x30"),
+            "{by_bytes}"
+        );
+        assert!(
+            by_bytes.contains("program points, by bytes allocated"),
+            "{by_bytes}"
+        );
+
+        // Equal block counts fall back to bytes, so the tie is not left to the
+        // order the points happen to be stored in.
+        assert!(
+            position(&by_blocks, "0x30") < position(&by_blocks, "0x10"),
+            "{by_blocks}"
+        );
+        assert!(
+            position(&by_blocks, "0x10") < position(&by_blocks, "0x20"),
+            "{by_blocks}"
+        );
+        assert!(
+            by_blocks.contains("program points, by blocks allocated"),
+            "{by_blocks}"
+        );
+        // Each row's share is of the figure the order is by: 256 of the run's
+        // 1,234 blocks, not 8 KiB of its 1 MiB.
+        assert!(
+            by_blocks.contains("of all blocks allocated)"),
+            "{by_blocks}"
+        );
+        assert!(
+            !by_blocks.contains("of all bytes allocated)"),
+            "{by_blocks}"
+        );
+    }
+
     #[test]
     fn only_the_requested_number_of_points_is_shown() {
         let points = (1..=10)
@@ -1237,7 +1328,7 @@ mod tests {
         }
 
         let snapshot = snapshot(vec![point(&[0x10], 512)]);
-        let result = write(&snapshot, &RawAddresses, FailsOnFlush, 5);
+        let result = write(&snapshot, &RawAddresses, FailsOnFlush, 5, Ranking::Bytes);
         assert!(
             result.is_err(),
             "a summary that could not be made durable must say so, not return Ok"

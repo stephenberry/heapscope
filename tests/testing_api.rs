@@ -151,7 +151,18 @@ fn the_testing_api_gates_a_real_program() {
     // ---- a bare count is an exact count of the whole run ----
     heapscope::assert_alloc_count!(mark.total_blocks + 1);
     let wrong = failure_message(|| heapscope::assert_alloc_count!(mark.total_blocks));
-    assert!(wrong.contains("allocations were made, not"), "{wrong}");
+    // Built from the mark rather than written out, because what the harness
+    // allocated before it is not this test's to know; and through
+    // `allocations_made`, because in practice it allocated nothing, so the
+    // count is one and the sentence is singular.
+    assert!(
+        wrong.contains(&format!(
+            "{}, not {}",
+            allocations_made(mark.total_blocks + 1),
+            thousands(mark.total_blocks)
+        )),
+        "{wrong}"
+    );
 
     // A `usize` is what a call site has — `items.len()`, a budget computed from
     // a size — and a macro taking `u64` rejects every one of them. Read fresh:
@@ -165,11 +176,14 @@ fn the_testing_api_gates_a_real_program() {
     // with everything green.
     let annotated = failure_message(|| heapscope::assert_alloc_count!(0, "fixture {}", 7));
     assert!(annotated.contains("fixture 7"), "{annotated}");
+    assert!(annotated.contains(" made, not 0"), "{annotated}");
 
     // ---- every form of the count, through the macro ----
     // Each arm is its own expansion, so each is exercised passing, with a
     // trailing comma and with a message: a rule miswired to the wrong body, or
     // a `since:` arm swallowing a bare count, would otherwise compile and pass.
+    // Every ceiling arm passes at least once strictly *under* its ceiling,
+    // because a ceiling arm wired to the equality passes at the ceiling.
     // One allocation is made after the mark, and nothing after it allocates
     // before the assertions do, because a passing assertion allocates nothing.
     let stage = HeapStats::get().unwrap();
@@ -184,10 +198,13 @@ fn the_testing_api_gates_a_real_program() {
     heapscope::assert_alloc_count!(since: stage, <= 2,);
     heapscope::assert_alloc_count!(since: stage, <= one.len());
     heapscope::assert_alloc_count!(since: stage, <= 1, "stage {}", 1,);
+    heapscope::assert_alloc_count!(since: stage, <= 2, "stage {}", 1);
     heapscope::assert_alloc_count!(<= whole);
     heapscope::assert_alloc_count!(<= whole,);
+    heapscope::assert_alloc_count!(<= whole + 1);
     heapscope::assert_alloc_count!(<= whole as usize);
     heapscope::assert_alloc_count!(<= whole, "whole run {}", 1);
+    heapscope::assert_alloc_count!(<= whole + 1, "whole run {}", 1);
     heapscope::assert_alloc_count!(whole,);
     // A count held in a variable named `since` is still a bare count. The
     // `since:` arms need the colon after it, and no expression has one there.
@@ -198,13 +215,12 @@ fn the_testing_api_gates_a_real_program() {
     // And failing, with what was counted and from where. Each is read fresh,
     // because the message `failure_message` copies out is an allocation the
     // next count includes.
+    // Exactly one so far, which is also the case the grammar has to get right.
     let made = HeapStats::get().unwrap().total_blocks - stage.total_blocks;
+    assert_eq!(made, 1, "something allocated between the stage and here");
     let wrong_since = failure_message(|| heapscope::assert_alloc_count!(since: stage, 0));
     assert!(
-        wrong_since.contains(&format!(
-            "{} allocations were made since the mark, not 0",
-            thousands(made)
-        )),
+        wrong_since.contains("1 allocation was made since the mark, not 0"),
         "{wrong_since}"
     );
     let made = HeapStats::get().unwrap().total_blocks - stage.total_blocks;
@@ -213,8 +229,8 @@ fn the_testing_api_gates_a_real_program() {
     );
     assert!(
         over_since.contains(&format!(
-            "{} allocations were made since the mark, above the ceiling of 0",
-            thousands(made)
+            "{} since the mark, above the ceiling of 0",
+            allocations_made(made)
         )),
         "{over_since}"
     );
@@ -226,16 +242,29 @@ fn the_testing_api_gates_a_real_program() {
     let over_run = failure_message(|| heapscope::assert_alloc_count!(<= 0));
     assert!(
         over_run.contains(&format!(
-            "{} allocations were made, above the ceiling of 0",
-            thousands(made)
+            "{}, above the ceiling of 0",
+            allocations_made(made)
         )),
         "{over_run}"
     );
+    // The wording as well as the message, because the message alone is the
+    // same whichever body the arm calls.
     let annotated = failure_message(|| heapscope::assert_alloc_count!(<= 0, "fixture {}", 8));
     assert!(annotated.contains("fixture 8"), "{annotated}");
+    assert!(annotated.contains("above the ceiling of 0"), "{annotated}");
     let annotated =
         failure_message(|| heapscope::assert_alloc_count!(since: stage, 0, "fixture {}", 9));
     assert!(annotated.contains("fixture 9"), "{annotated}");
+    assert!(annotated.contains("since the mark, not 0"), "{annotated}");
+
+    // A mark ahead of the run is refused, through the macro, even against the
+    // widest ceiling there is. The fields are public, so a mark can be edited
+    // after it is read, and that is all it takes; zero would pass this.
+    let mut edited = HeapStats::get().unwrap();
+    edited.total_blocks += 1_000;
+    let ahead = failure_message(|| heapscope::assert_alloc_count!(since: edited, <= u64::MAX));
+    assert!(ahead.contains("the mark records"), "{ahead}");
+    assert!(ahead.contains("cannot be known"), "{ahead}");
     // The note about the profile's scope belongs to a profile, and dumping is
     // off here.
     assert!(!over_since.contains("whole run"), "{over_since}");
@@ -368,7 +397,7 @@ fn the_testing_api_gates_a_real_program() {
     let leaked = one_block();
     let leak = failure_message(|| heapscope::assert_no_leaks!(since: mark));
     assert!(
-        leak.contains("more blocks are live than at the mark"),
+        leak.contains("1 more block is live than at the mark"),
         "{leak}"
     );
     drop(leaked);
@@ -563,6 +592,18 @@ fn thousands(value: u64) -> String {
         grouped.push(digit);
     }
     grouped
+}
+
+/// "N allocations were made", agreeing with N the way the failure messages do.
+///
+/// Written out here rather than reached through the crate, for the reason
+/// [`thousands`] is.
+fn allocations_made(count: u64) -> String {
+    if count == 1 {
+        String::from("1 allocation was made")
+    } else {
+        format!("{} allocations were made", thousands(count))
+    }
 }
 
 /// The smallest whole percentage that lets every figure of `now` through
