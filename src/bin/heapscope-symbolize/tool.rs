@@ -157,10 +157,14 @@ impl Tool {
                 let mut arguments = vec![
                     format!("--obj={image}"),
                     String::from("--no-demangle"),
-                    // One answer per address, with inlined callers included.
-                    // Without this an address inside an inlined function is
-                    // reported as the function it was inlined into, which is the
-                    // frame the reader already had.
+                    // Every function the address is in, innermost first: the
+                    // inlined one and each caller it was inlined into. Without
+                    // it the answer is the innermost alone, and the function
+                    // the code physically lies in — the name every in-process
+                    // lookup gives the frame, and the one a folded stack shows
+                    // — is not reported at all. It is this tool's default, and
+                    // is passed so that the shape the parser below depends on
+                    // is asked for rather than assumed.
                     String::from("--inlines"),
                 ];
                 // What `Module::bias` records on Windows is the image base, so
@@ -177,10 +181,10 @@ impl Tool {
                 String::from("-f"),
                 // Inlined callers, as `--inlines` asks of `llvm-symbolizer`, and
                 // for the same reason. Without it the answer is the innermost
-                // inlined function alone, which is the most specific name and
-                // the wrong one to trim by: `RawVec::with_capacity_in`
-                // inlined into `Vec::with_capacity` is the program's frame, and
-                // reads as the allocation path.
+                // inlined function alone, which is the wrong one both to trim
+                // by and to show: `RawVec::with_capacity_in` inlined into
+                // `Vec::with_capacity` is the program's frame, and reads as the
+                // allocation path.
                 String::from("-i"),
                 // The address before each answer. `-i` makes an answer any
                 // number of lines long, so this is what says where the next one
@@ -304,14 +308,27 @@ fn is_unknown(name: &str) -> bool {
 /// file `C` at line `\src\main.rs`. The rule that survives both is: a trailing
 /// segment is a number or it is part of the path, and a column exists only when
 /// the segment before it is *also* a number.
+///
+/// binutils `addr2line` adds two spellings of its own, and with `-i` they turn
+/// up at every inlined level rather than occasionally: `file:12
+/// (discriminator 3)`, where the annotation distinguishes basic blocks on one
+/// line and says nothing a reader of a profile needs, and `file:?`, a known file
+/// with no line. Both keep the file.
 fn split_location(text: &str) -> (Option<String>, Option<u32>) {
     let text = text.trim();
+    let text = match text.rsplit_once(" (discriminator ") {
+        Some((location, annotation)) if annotation.ends_with(')') => location,
+        _ => text,
+    };
     if text.is_empty() || text.starts_with("??") {
         return (None, None);
     }
     let Some((head, tail)) = text.rsplit_once(':') else {
         return (None, None);
     };
+    if tail == "?" {
+        return ((!head.is_empty()).then(|| String::from(head)), None);
+    }
     if tail.parse::<u32>().is_err() {
         return (None, None);
     }
@@ -606,6 +623,17 @@ _ZN17profile_a_program5churn17h0123456789abcdefE
         assert_eq!(answers.len(), 1, "{answers:#?}");
     }
 
+    /// `llvm-addr2line` echoes the address unpadded where binutils pads it to
+    /// sixteen digits. Read as a number, the two are the same header.
+    #[test]
+    fn an_unpadded_addr2line_header_is_the_same_address() {
+        let padded = "0x0000000000012340\n_ZN1a1bE\n/src/a.rs:1\n";
+        let unpadded = "0x12340\n_ZN1a1bE\n/src/a.rs:1\n";
+        let expected = parse_addr2line(padded, &[0x12340]);
+        assert_eq!(expected.len(), 1, "{expected:#?}");
+        assert_eq!(parse_addr2line(unpadded, &[0x12340]), expected);
+    }
+
     /// The echoed address is what ties an answer to a question, so an answer
     /// about some other address ends the reading rather than being taken as the
     /// answer to this one.
@@ -664,6 +692,28 @@ _malloc (in libsystem_malloc.dylib) + 32
             split_location("/src/main.rs:129"),
             (Some(String::from("/src/main.rs")), Some(129))
         );
+    }
+
+    /// binutils' own spellings, which `-i` makes routine: a discriminator after
+    /// the line, and a file whose line is unknown. Both keep the file.
+    #[test]
+    fn binutils_annotations_do_not_cost_the_location() {
+        assert_eq!(
+            split_location("/src/main.rs:12 (discriminator 3)"),
+            (Some(String::from("/src/main.rs")), Some(12))
+        );
+        assert_eq!(
+            split_location(r"C:\src\main.rs:12 (discriminator 1)"),
+            (Some(String::from(r"C:\src\main.rs")), Some(12))
+        );
+        assert_eq!(
+            split_location("/rustc/library/std/src/process.rs:?"),
+            (
+                Some(String::from("/rustc/library/std/src/process.rs")),
+                None
+            )
+        );
+        assert_eq!(split_location("??:?"), (None, None));
     }
 
     #[test]
