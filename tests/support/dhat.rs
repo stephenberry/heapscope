@@ -22,7 +22,8 @@
 //! A profile whose counts were restarted by `Profiler::reset` declares it in
 //! `heapscope.reset`, and only that declaration relaxes the rules a restart
 //! makes untrue: a point can hold, and peak on, blocks it allocated before the
-//! window its totals describe.
+//! window its totals describe. Relaxed to the bound that still holds, not
+//! dropped: no point carried more than the run did.
 
 #![allow(dead_code)]
 
@@ -146,10 +147,16 @@ pub fn problems(text: &str) -> Vec<String> {
     };
 
     // Read before the points, because it changes what a point may say.
-    let restarted = root
+    let carried = root
         .get("heapscope")
         .and_then(|extension| extension.get("reset"))
-        .is_some();
+        .map(|reset| {
+            let field = |name: &str| reset.get(name).and_then(Value::as_u64).unwrap_or(0);
+            Carried {
+                bytes: field("carriedBytes"),
+                blocks: field("carriedBlocks"),
+            }
+        });
     let mut sequences: Vec<&[Value]> = Vec::new();
     let mut totals = Totals::default();
     for (at, point) in points.iter().enumerate() {
@@ -160,7 +167,7 @@ pub fn problems(text: &str) -> Vec<String> {
             Columns {
                 block_lifetimes,
                 block_accesses,
-                restarted,
+                carried,
             },
             &mut problems,
             &mut totals,
@@ -233,9 +240,17 @@ struct Totals {
 struct Columns {
     block_lifetimes: bool,
     block_accesses: bool,
-    /// The counts were restarted, so a point's totals describe the window and
-    /// its live figures may include blocks from before it.
-    restarted: bool,
+    /// Present when the counts were restarted, so that a point's totals
+    /// describe the window and its live figures may include blocks from before
+    /// it, up to what the run carried.
+    carried: Option<Carried>,
+}
+
+/// What the run held at the restart, per `heapscope.reset`.
+#[derive(Debug, Clone, Copy, Default)]
+struct Carried {
+    bytes: u64,
+    blocks: u64,
 }
 
 fn check_point(
@@ -249,8 +264,10 @@ fn check_point(
     let Columns {
         block_lifetimes,
         block_accesses,
-        restarted,
+        carried,
     } = columns;
+    let restarted = carried.is_some();
+    let carried = carried.unwrap_or_default();
     if point.as_object().is_none() {
         problems.push(format!(
             "`pps[{at}]` is a {}, expected an object",
@@ -355,20 +372,19 @@ fn check_point(
             }
         }
     };
-    // Not after a restart: a point's peak starts from what it held then, which
-    // it allocated before the window its totals count.
-    if !restarted {
-        ordered(
-            total_bytes,
-            max_bytes,
-            "more bytes were live at once than were ever allocated",
-        );
-        ordered(
-            total_blocks,
-            max_blocks,
-            "more blocks were live at once than were ever allocated",
-        );
-    }
+    // After a restart, a point's peak starts from what it held then, which it
+    // allocated before the window its totals count. It held no more than the
+    // run carried, which is zero where there was no restart.
+    ordered(
+        total_bytes.map(|bytes| bytes + carried.bytes),
+        max_bytes,
+        "more bytes were live at once than were allocated and carried across a restart",
+    );
+    ordered(
+        total_blocks.map(|blocks| blocks + carried.blocks),
+        max_blocks,
+        "more blocks were live at once than were allocated and carried across a restart",
+    );
     ordered(
         max_bytes,
         at_gmax_bytes,

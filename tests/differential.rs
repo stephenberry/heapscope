@@ -952,76 +952,168 @@ fn concurrent_traces_preserve_the_summation_invariants() {
     }
 }
 
+/// Whether every row and point of `engine` sums to its run, read at a quiet
+/// point, naming the first figure that does not.
+///
+/// What a restart that raced a recording thread breaks for good: the restart
+/// zeroes the run's totals and each point's and row's, and a thread caught
+/// between its update of one and of the other leaves them apart, by an amount
+/// nothing after it ever takes back out.
+fn sums_agree(engine: &Engine) -> Result<heapscope::internals::engine::GlobalStats, String> {
+    let mut points = Counters::default();
+    let (mut thread_bytes, mut thread_blocks, mut thread_live) = (0u64, 0u64, 0u64);
+    let mut over_peak = 0usize;
+    let flush = engine.flush_and_visit(
+        Engine::FLUSH_TIMEOUT,
+        |_id, _frames, counters| {
+            points.total_bytes += counters.total_bytes;
+            points.total_blocks += counters.total_blocks;
+            points.curr_bytes += counters.curr_bytes;
+            points.curr_blocks += counters.curr_blocks;
+            points.at_gmax_bytes += counters.at_gmax_bytes;
+            points.at_gmax_blocks += counters.at_gmax_blocks;
+            if counters.curr_bytes > counters.max_bytes {
+                over_peak += 1;
+            }
+        },
+        |thread| {
+            thread_bytes += thread.counts.total_bytes;
+            thread_blocks += thread.counts.total_blocks;
+            thread_live += thread.counts.curr_bytes;
+        },
+        |_| {},
+    );
+    if !flush.exclusive {
+        return Err(String::from("the flush could not reach a quiet point"));
+    }
+    let stats = flush.stats;
+    let figures = [
+        ("points' bytes", points.total_bytes, stats.total_bytes),
+        ("points' blocks", points.total_blocks, stats.total_blocks),
+        ("points' live bytes", points.curr_bytes, stats.curr_bytes),
+        ("points' live blocks", points.curr_blocks, stats.curr_blocks),
+        (
+            "points' bytes at the peak",
+            points.at_gmax_bytes,
+            stats.max_bytes,
+        ),
+        (
+            "points' blocks at the peak",
+            points.at_gmax_blocks,
+            stats.max_blocks,
+        ),
+        ("threads' bytes", thread_bytes, stats.total_bytes),
+        ("threads' blocks", thread_blocks, stats.total_blocks),
+        ("threads' live bytes", thread_live, stats.curr_bytes),
+    ];
+    for (what, parts, whole) in figures {
+        if parts != whole {
+            return Err(format!("{what} sum to {parts}, and the run says {whole}"));
+        }
+    }
+    if over_peak > 0 {
+        return Err(format!(
+            "{over_peak} point(s) hold more than their own peak"
+        ));
+    }
+    if stats.max_bytes < stats.curr_bytes {
+        return Err(String::from("the peak is below what is live"));
+    }
+    Ok(stats)
+}
+
 /// A restart lands wherever another thread happens to be, so it has to leave
 /// the counters as coherent as it found them whatever was in flight.
 ///
 /// This is the test the restart's locking exists for. Workers allocate and free
 /// for real, on the shared path and the exclusive one, while another thread
-/// restarts the counts as often as it can get the gate. Nothing about the
-/// result is fixed by the schedule except what must hold under every schedule:
+/// restarts the counts over and over, and checks after every restart that the
+/// parts still sum to the whole ([`sums_agree`]). Nothing else about the result
+/// is fixed by the schedule, and what is checked at the end is what must hold
+/// under every schedule: the sums again, the live figures equal to what the
+/// workers still hold (which a restart that touched a live counter, or a free
+/// of a carried block that went negative, would break), nothing poisoned, and
+/// every restart accepted.
 ///
-/// - the parts sum to the whole, and the at-peak columns to the peak, which a
-///   restart that reset the global figures and the points at different
-///   instants would break;
-/// - the live figures are exactly what the workers still hold, which a restart
-///   that touched a live counter, or a free of a carried block that went
-///   negative, would break;
-/// - nothing poisoned and every restart was accepted, because the gate's
-///   deadline is far longer than anything here holds it.
+/// # Why after every restart, and why the workers outlive them
+///
+/// The first version of this stopped the workers and then reset once more, so
+/// the one window it checked began at a quiet point and ended with nothing in
+/// it: every total was zero, the epoch had not moved since the restart, and
+/// every sum compared zero with zero. A restart that skipped the peak gate
+/// passed it. Each restart wipes the totals the one before it got wrong, so a
+/// check at the end sees only the last; checking after each one gives every
+/// restart its own chance to be caught. And the workers run until the
+/// restarting thread is done and then for a tail more, so every restart lands
+/// on running threads and the last window has allocations, frees and peaks of
+/// its own.
+///
+/// **Measured:** with the peak gate taken out of `Engine::reset`, this fails
+/// in 20 runs of 20, where checking only at the end failed 2 of 20.
 #[test]
 fn restarts_racing_with_allocating_threads_keep_the_counters_coherent() {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Mutex;
 
     #[cfg(miri)]
-    const ROUNDS: usize = 20;
+    const RESETS: usize = 3;
     #[cfg(not(miri))]
-    const ROUNDS: usize = 3_000;
+    const RESETS: usize = 300;
+    #[cfg(miri)]
+    const TAIL: usize = 12;
+    #[cfg(not(miri))]
+    const TAIL: usize = 2_000;
     const THREADS: usize = 6;
+    /// The most a worker keeps live while the restarts land, so that the table
+    /// a restart sweeps stays the size it is however long they take.
+    const HELD: usize = 64;
     // A restart sweeps every slot of both tables, which is nothing natively and
     // most of the run under Miri. So there the tables are as small as the
-    // workload allows and the restarts are few, and natively they are neither.
+    // workload allows.
     #[cfg(miri)]
     const LIMITS: (usize, usize) = (1 << 10, 1 << 12);
     #[cfg(not(miri))]
     const LIMITS: (usize, usize) = (1 << 14, 1 << 18);
-    const MAX_RESETS: Option<usize> = if cfg!(miri) { Some(4) } else { None };
 
     let engine = Engine::with_limits(LIMITS.0, LIMITS.1);
     assert!(engine.start(TimeSource::Events, || {}));
-    let working = AtomicUsize::new(THREADS);
-    let started = AtomicBool::new(false);
-    let resets = AtomicUsize::new(0);
+    let started = AtomicUsize::new(0);
+    let restarting = AtomicBool::new(true);
+    let raced = AtomicUsize::new(0);
+    let violation: Mutex<Option<String>> = Mutex::new(None);
 
     let held: Vec<Vec<(usize, usize)>> = std::thread::scope(|s| {
-        let (engine, working, started, resets) = (&engine, &working, &started, &resets);
+        let (engine, started, restarting) = (&engine, &started, &restarting);
+        let (raced, violation) = (&raced, &violation);
         s.spawn(move || {
-            // Until every worker is done, and at least once after the first one
-            // starts, so that the run is restarted with blocks live.
-            while !started.load(Ordering::Acquire) {
+            // Not before every worker is running, so that even the first
+            // restart lands on threads that are recording.
+            while started.load(Ordering::Acquire) < THREADS {
                 std::thread::yield_now();
             }
-            loop {
+            for restart in 1..=RESETS {
                 let guard = heapscope::internals::guard::enter()
                     .expect("the restarting thread is not inside the profiler");
                 engine
                     .reset(&guard)
                     .expect("a running engine restarts its counts");
                 drop(guard);
-                let done = resets.fetch_add(1, Ordering::Relaxed) + 1;
-                if working.load(Ordering::Acquire) == 0 || MAX_RESETS.is_some_and(|max| done >= max)
-                {
+                if let Err(difference) = sums_agree(engine) {
+                    *violation.lock().unwrap() =
+                        Some(format!("after restart {restart}: {difference}"));
                     break;
                 }
-                std::thread::yield_now();
             }
+            restarting.store(false, Ordering::Release);
         });
 
         let workers: Vec<_> = (0..THREADS)
             .map(|t| {
                 s.spawn(move || {
                     let base = 0x5_0000_0000usize + t * 0x1000_0000;
-                    let mut live = Vec::new();
-                    for i in 0..ROUNDS {
+                    let mut live: std::collections::VecDeque<(usize, usize)> =
+                        std::collections::VecDeque::new();
+                    let mut round = |i: usize, capped: bool| {
                         let address = base + i * 128;
                         let size = 32 + (i * 7 + t) % 512;
                         guarded_alloc(
@@ -1030,24 +1122,36 @@ fn restarts_racing_with_allocating_threads_keep_the_counters_coherent() {
                             Shape::of(size),
                             &frames_for((i + t) % SITES),
                         );
-                        live.push((address, size));
-                        started.store(true, Ordering::Release);
-
+                        live.push_back((address, size));
                         // Frees of blocks old and new, so that blocks carried
                         // across a restart are freed after it as well as ones
                         // the window allocated.
-                        if i % 3 == 0 {
-                            if let Some((address, size)) = live.pop() {
+                        if i.is_multiple_of(3) {
+                            if let Some((address, size)) = live.pop_back() {
                                 engine.record_free(address, size);
                             }
                         }
-                        if i % 11 == 0 && !live.is_empty() {
-                            let (address, size) = live.remove(0);
-                            engine.record_free(address, size);
+                        if i.is_multiple_of(11) || (capped && live.len() > HELD) {
+                            if let Some((address, size)) = live.pop_front() {
+                                engine.record_free(address, size);
+                            }
                         }
+                    };
+
+                    started.fetch_add(1, Ordering::Release);
+                    let mut i = 0;
+                    while restarting.load(Ordering::Acquire) {
+                        round(i, true);
+                        raced.fetch_add(1, Ordering::Relaxed);
+                        i += 1;
                     }
-                    working.fetch_sub(1, Ordering::AcqRel);
-                    live
+                    // The tail: uncapped, so the heap grows past where the last
+                    // restart left the peak and the window has peaks of its own.
+                    for _ in 0..TAIL {
+                        round(i, false);
+                        i += 1;
+                    }
+                    live.into_iter().collect()
                 })
             })
             .collect();
@@ -1057,58 +1161,43 @@ fn restarts_racing_with_allocating_threads_keep_the_counters_coherent() {
             .collect()
     });
 
-    let resets = resets.load(Ordering::Relaxed) as u64;
-    assert!(resets > 0, "the run never restarted");
+    if let Some(difference) = violation.lock().unwrap().take() {
+        panic!("a restart racing with allocations left the counters apart {difference}");
+    }
     assert!(
         !heapscope::internals::diagnostic::is_poisoned(),
         "a restart racing with allocations poisoned the profiler"
     );
-    assert_eq!(engine.resets(), resets);
-
-    let mut summed = Counters::default();
-    let flush = engine.flush_and_visit(
-        Engine::FLUSH_TIMEOUT,
-        |_id, _frames, counters| {
-            summed.total_bytes += counters.total_bytes;
-            summed.total_blocks += counters.total_blocks;
-            summed.curr_bytes += counters.curr_bytes;
-            summed.curr_blocks += counters.curr_blocks;
-            summed.at_gmax_bytes += counters.at_gmax_bytes;
-            summed.at_gmax_blocks += counters.at_gmax_blocks;
-            assert!(
-                counters.curr_bytes <= counters.max_bytes,
-                "a point holds more than its own peak"
-            );
-        },
-        |_| {},
-        |_| {},
+    assert_eq!(engine.resets(), RESETS as u64);
+    assert!(
+        raced.load(Ordering::Relaxed) >= RESETS,
+        "only {} rounds ran while {RESETS} restarts landed, so the restarts \
+         barely raced anything",
+        raced.load(Ordering::Relaxed)
     );
-    assert!(flush.exclusive);
-    let stats = flush.stats;
+
+    let stats = sums_agree(&engine).unwrap_or_else(|difference| panic!("at the end: {difference}"));
+    let reset = engine.last_reset().expect("the run was restarted");
+    assert_eq!(reset.count, RESETS as u64);
+
+    // The last window is not empty, or the sums above compare zero with zero.
+    assert!(
+        stats.total_blocks > 0,
+        "nothing was allocated after the last restart"
+    );
+    assert!(
+        stats.epoch > reset.epoch,
+        "the heap never peaked after the last restart"
+    );
+    assert!(
+        stats.time_at_max >= reset.at,
+        "the window's peak is before the restart that opened it"
+    );
 
     let live_bytes: u64 = held.iter().flatten().map(|&(_, size)| size as u64).sum();
     let live_blocks = held.iter().map(Vec::len).sum::<usize>() as u64;
     assert_eq!(stats.curr_bytes, live_bytes, "live bytes");
     assert_eq!(stats.curr_blocks, live_blocks, "live blocks");
-    assert_eq!(summed.curr_bytes, stats.curr_bytes, "points' live bytes");
-    assert_eq!(summed.curr_blocks, stats.curr_blocks, "points' live blocks");
-    assert_eq!(summed.total_bytes, stats.total_bytes, "cumulative bytes");
-    assert_eq!(summed.total_blocks, stats.total_blocks, "cumulative blocks");
-    assert_eq!(
-        summed.at_gmax_bytes, stats.max_bytes,
-        "per-point at-peak bytes did not sum to the global peak"
-    );
-    assert_eq!(
-        summed.at_gmax_blocks, stats.max_blocks,
-        "per-point at-peak blocks did not sum to the blocks at the peak"
-    );
-    assert!(stats.max_bytes >= stats.curr_bytes);
-    let reset = engine.last_reset().expect("the run was restarted");
-    assert_eq!(reset.count, resets);
-    assert!(
-        stats.time_at_max >= reset.at,
-        "the window's peak is before the restart that opened it"
-    );
 }
 
 /// The peak a run reached must be the peak it recorded, when the threads

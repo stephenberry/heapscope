@@ -717,12 +717,13 @@ The unix half is unchanged and has its own numbers (§9.1). On aarch64-apple-dar
 **10.9 Restarting the counts — RESOLVED: an explicit `Profiler::reset`, not a second run.** A stopped run still does not start again; a warm-up is left out by restarting the counts of the running one. The decisions it needed:
 
 - **Peaks restart from what is live, through the epoch.** The reset sets the global maximum to live bytes and moves the epoch, and sets every point's own maximum and at-peak figures to what it holds. The lazy scheme's invariant, one epoch per peak, holds across it.
-- **Lifetimes: a block live across the reset contributes none.** It is in none of the window's block counts, so its lifetime has no denominator to be averaged over. Marked by a sentinel birth that saturates the subtraction the free path already does, so the hot path is unchanged.
+- **Lifetimes: a block live across the reset contributes none.** It is in none of the window's allocation counts (`totalBlocks`/`tbk`, the denominator of an average lifetime), only in its live and at-peak ones, so its lifetime has nothing to be averaged over. Marked by a sentinel birth that saturates the subtraction the free path already does, so the hot path is unchanged.
 - **Time is not reset.** One axis for every instant in the profile; the reset's own instant is recorded on it.
 - **The native format moves to version 2 only for a restarted run.** The window's totals beside the run's live figures change what existing fields mean, which is what the version is for; a run never restarted means what version 1 meant and still says 1. DHAT has no version to move, so the restart goes in `heapscope.reset` and in `cmd`, the free text `dh_view.html` shows.
 - **Kept over the whole run:** blocks the live table turned away (they may still be live), region entry counts (entered and left outside the gate, so a restart cannot reconcile them with `active`), and the profiler's own overhead and capture counters.
 - **Locks:** every live-table shard, then the gate exclusively with the flush timeout, the same order `fork` takes. No recording path holds a shard while waiting for the gate, so this cannot deadlock against one; a gate that cannot be had in time refuses rather than waits.
-- **Marks carry their window.** `HeapStats::resets` is public, and every `since: mark` assertion refuses a mark from another window.
+- **Marks carry their window.** `HeapStats::resets` and `EventStats::resets` are public, and read with the counters through a sequence lock around the reset, so a reading is of one window however a reset on another thread lands, and the reading stays lock-free. A `since: mark` check that subtracts totals (`assert_alloc_count!(since:)`) refuses a mark from another window; `assert_no_leaks!(since:)` accepts one, because the live figures it compares carry across a reset unchanged.
+- **The wait is bounded.** The live-table shards are polled for against the same deadline as the gate, so a thread stopped while holding one costs the reset `Busy` rather than a hang.
 
 ---
 

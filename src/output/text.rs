@@ -106,9 +106,16 @@ pub(super) fn write<W: Write>(
         } else {
             String::new()
         };
+        // A run without block lifetimes has no peak and no lifetimes to
+        // restart, and naming them would say it had.
+        let covered = if lifetimes {
+            "totals, peaks and lifetimes cover"
+        } else {
+            "totals cover"
+        };
         writeln!(
             out,
-            "  restarted  at {} {}{times}; totals, peaks and lifetimes cover what followed",
+            "  restarted  at {} {}{times}; {covered} what followed",
             count(reset.at),
             snapshot.time_source.unit_long()
         )?;
@@ -238,7 +245,14 @@ pub(super) fn write<W: Write>(
                 amount(counters.at_gmax_bytes),
                 amount(counters.curr_bytes),
                 amount(counters.max_bytes),
-                count(average(point.total_lifetime(), counters.total_blocks)),
+                // A point that allocated nothing in the window, and is here for
+                // what it carried into it, has no blocks to average over, and
+                // an average of zero would read as blocks that died at once.
+                if counters.total_blocks == 0 {
+                    String::from("—")
+                } else {
+                    count(average(point.total_lifetime(), counters.total_blocks))
+                },
             )?;
         }
         for frame in stack {
@@ -789,10 +803,47 @@ mod tests {
             .find("  allocated")
             .unwrap_or_else(|| panic!("no totals in:\n{text}"));
         assert!(restart < carried && carried < first, "{text}");
+        assert!(
+            text.contains("totals, peaks and lifetimes cover what followed"),
+            "{text}"
+        );
 
         let text = render(&snapshot(vec![point(&[0x10], 4_096)]), 10);
         assert!(!text.contains("restarted"), "{text}");
         assert!(!text.contains("carried"), "{text}");
+    }
+
+    /// A point that allocated nothing since a restart is still listed for what
+    /// it holds, and has no blocks to average a lifetime over, so it says so
+    /// rather than reporting blocks that died at once.
+    #[test]
+    fn a_point_holding_only_what_it_carried_has_no_average_lifetime() {
+        let mut carried_only = point(&[0x20], 0);
+        carried_only.counters.total_blocks = 0;
+        carried_only.counters.total_lifetime = 0;
+        let mut restarted = snapshot(vec![point(&[0x10], 4_096), carried_only]);
+        restarted.reset = Some(crate::output::Reset {
+            count: 1,
+            ..crate::output::Reset::default()
+        });
+        let text = render(&restarted, 10);
+        assert!(text.contains("avg lifetime —"), "{text}");
+        assert!(text.contains("avg lifetime 100"), "{text}");
+    }
+
+    /// An event run has no peak and no lifetimes, so its restart line names
+    /// only what it restarted.
+    #[test]
+    fn an_event_run_restarts_only_its_totals() {
+        let mut restarted = snapshot(vec![point(&[0x10], 4_096)]);
+        restarted.settings.mode = crate::internals::engine::Mode::AdHoc;
+        restarted.reset = Some(crate::output::Reset {
+            count: 1,
+            ..crate::output::Reset::default()
+        });
+        let text = render(&restarted, 10);
+        assert!(text.contains("; totals cover what followed"), "{text}");
+        assert!(!text.contains("lifetimes cover"), "{text}");
     }
 
     /// This output goes straight to a terminal, which acts on what it is sent.

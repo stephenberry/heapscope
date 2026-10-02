@@ -83,7 +83,8 @@ pub enum FoldedMetric {
     /// one to draw when the cost being chased is the number of calls rather
     /// than the size of them.
     TotalBlocks,
-    /// Bytes each site held at the instant the whole heap was largest.
+    /// Bytes each site held at the instant the whole heap was largest,
+    /// since the run started or its counts were last restarted.
     ///
     /// What the peak was *made of*. Available only in a mode with block
     /// lifetimes — see [`FoldedMetric::needs_block_lifetimes`].

@@ -53,9 +53,13 @@ pub enum StartError {
     /// silently discard them, and neither is a profile anyone asked for. Run the
     /// program again.
     ///
-    /// To leave a warm-up out of a profile, keep the one profiler and call
-    /// [`Profiler::reset`] when the warm-up is done. That restarts the counts
-    /// explicitly, and the profile says it did.
+    /// The commonest way here is a second `#[test]` in one test binary, each
+    /// starting its own profiler: the first one's run has stopped, and nothing
+    /// is recording. The remedy there is one `#[test]` per binary, as the
+    /// [testing documentation](crate::stats) explains. The other way here is a
+    /// program that wanted to leave a warm-up out and stopped its profiler to
+    /// do it; it should keep the one profiler and call [`Profiler::reset`] when
+    /// the warm-up is done, which restarts the counts explicitly.
     AlreadyRecorded,
     /// Backtraces cannot be captured in this build.
     ///
@@ -96,8 +100,10 @@ impl fmt::Display for StartError {
             StartError::AlreadyRecorded => write!(
                 f,
                 "this process has already recorded a heapscope profile, and a \
-                 stopped run does not start again; to leave a warm-up out of a \
-                 profile, call Profiler::reset on the running profiler instead"
+                 stopped run does not start again; in a test binary, give each \
+                 profiled #[test] a binary of its own, and to leave a warm-up \
+                 out of a profile, keep one profiler and call Profiler::reset \
+                 on it instead"
             ),
             StartError::NoBacktraces(failure) => write!(f, "{failure}"),
             StartError::NotInstalled => write!(
@@ -339,26 +345,31 @@ impl Profiler {
     ///   peak, at that level, until the heap grows past it. The bytes each call
     ///   site held at the peak, and each one's own maximum, start there too.
     /// - **Lifetimes** count only blocks allocated after the reset. A block
-    ///   live across it is in no block count the profile reports, so its
-    ///   lifetime is in none of the totals either, rather than inflating the
-    ///   average at the site that allocated it.
+    ///   live across it is in none of the allocation counts (`totalBlocks`,
+    ///   DHAT's `tbk`) an average lifetime is taken over, so its lifetime is in
+    ///   none of the lifetime totals either, rather than inflating the average
+    ///   at the site that allocated it. It is in the live and at-peak block
+    ///   counts, because it is live.
     /// - **Time** is not reset. Every instant in the profile stays on one axis,
     ///   and the profile records when the reset happened on it.
     ///
-    /// Every profile written afterwards says that a reset happened, when, and
-    /// what was live then. A run may be reset as often as it likes; the
-    /// profile describes the window since the last one.
+    /// The native, DHAT, HTML and text outputs written afterwards say that a
+    /// reset happened, when, and what was live then. Folded stacks cannot: the
+    /// format is a stack and a number per line, with nowhere to say anything
+    /// else, so a flame graph of a reset run is a flame graph of the window
+    /// with nothing on it to say so. A run may be reset as often as it likes;
+    /// every output describes the window since the last one.
     ///
     /// # What a reading taken before a reset is good for
     ///
     /// [`HeapStats::get`](crate::HeapStats::get) reports the restarted figures
     /// afterwards, and a reading taken before is from another window: its
-    /// totals and its peak are not comparable with any taken since. The
-    /// `since: mark` assertions refuse such a mark rather than subtract it,
-    /// and [`HeapStats::resets`](crate::HeapStats::resets) is how other code
-    /// can tell. A bare [`assert_max_bytes!`](crate::assert_max_bytes)
-    /// afterwards measures the peak since the reset, which is usually the
-    /// budget that was meant.
+    /// totals and its peak are not comparable with any taken since, and
+    /// [`HeapStats::resets`](crate::HeapStats::resets) is how code subtracting
+    /// them can tell. Its live figures are, because they carry across, so
+    /// `assert_no_leaks!(since: mark)` with such a mark still answers. A bare
+    /// [`assert_max_bytes!`](crate::assert_max_bytes) afterwards measures the
+    /// peak since the reset, which is usually the budget that was meant.
     ///
     /// # Errors
     ///
@@ -370,18 +381,22 @@ impl Profiler {
     ///
     /// # Other threads
     ///
-    /// Safe to call while they allocate: the reset waits for a moment at which
-    /// no counter is midway through moving and applies itself in one step
-    /// there. What it cannot place exactly is an allocation in flight at that
-    /// moment, which may count toward the window with no lifetime, or bring a
-    /// lifetime from before it. Reset where the program is quiet for an exact
-    /// profile.
+    /// Called from the thread that owns the profiler, because `Profiler` is
+    /// neither `Send` nor `Sync`. Other threads go on allocating meanwhile, and
+    /// that is safe: the reset waits for a moment at which no counter is
+    /// midway through moving and applies itself in one step there. What it
+    /// cannot place exactly is an allocation in flight at that moment, which
+    /// may count toward the window with no lifetime, or bring a lifetime from
+    /// before it, and whose size and alignment may land in the window's
+    /// histograms while its block does not, or the reverse. Reset where the
+    /// program is quiet for an exact profile.
     pub fn reset(&self) -> Result<(), ResetError> {
         // `None` means this thread is already inside the profiler, where the
         // locks a reset takes may be held by the very allocation it
-        // interrupted. See `Engine::reset` on why the proof is required.
+        // interrupted, or that it has no slot to enter with. See
+        // `Engine::reset` on why the proof is required.
         let Some(entered) = crate::internals::guard::enter() else {
-            return Err(ResetError::Reentrant);
+            return Err(ResetError::CannotEnter);
         };
         crate::engine().reset(&entered)
     }
@@ -524,6 +539,10 @@ impl Output {
     /// refuses to write:
     /// [`FoldedMetric::PeakBytes`] and [`FoldedMetric::LiveBytes`] are not
     /// measurements a run without block lifetimes took.
+    ///
+    /// The one output that cannot say a run's counts were
+    /// [restarted](Profiler::reset): it has nowhere to. Pair it with another
+    /// output where that matters.
     pub fn folded(path: impl Into<PathBuf>, metric: FoldedMetric) -> Self {
         Self {
             kind: Kind::Folded(path.into(), metric),

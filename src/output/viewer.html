@@ -530,11 +530,16 @@ const HEAPSCOPE = (function () {
         ? " " + formatBytes(reset.carriedBytes) + " in " + formatCount(reset.carriedBlocks)
           + " blocks were live then; they count as live and toward the peak, and not as allocated."
         : "";
+      // The same test the header makes: a run with no live blocks has no peak
+      // and no lifetimes, and naming them would say it had.
+      const covered = profile.totals && profile.totals.maxBytes !== undefined
+        ? "totals, peaks and lifetimes cover"
+        : "totals cover";
       out.push({
         title: "Counts were restarted partway through the run.",
         body: "Profiler::reset restarted them at " + formatCount(reset.at) + unit
           + (reset.count > 1 ? ", the last of " + formatCount(reset.count) + " restarts" : "")
-          + ", so totals, peaks and lifetimes cover only what followed." + carried,
+          + ", so " + covered + " only what followed." + carried,
       });
     }
     if (interval) {
