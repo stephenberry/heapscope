@@ -614,9 +614,11 @@ impl<'a> Printer<'a, '_> {
         // Decoded a character at a time so an invalid sequence is caught here
         // rather than producing a `String` that lies about its contents.
         let mut bytes: Vec<u8> = Vec::with_capacity(digits / 2);
-        for pair in hex.as_bytes().chunks_exact(2) {
-            let high = hex_value(pair[0]).ok_or(Invalid)?;
-            let low = hex_value(pair[1]).ok_or(Invalid)?;
+        // The odd-length check above leaves no remainder to discard.
+        let (pairs, _) = hex.as_bytes().as_chunks::<2>();
+        for &[high, low] in pairs {
+            let high = hex_value(high).ok_or(Invalid)?;
+            let low = hex_value(low).ok_or(Invalid)?;
             bytes.push((high << 4) | low);
         }
         let text = core::str::from_utf8(&bytes).map_err(|_| Invalid)?;
