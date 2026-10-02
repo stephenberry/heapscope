@@ -7,17 +7,23 @@
 //! because the three formats have nothing in common:
 //!
 //! ```text
-//! llvm-symbolizer   name              addr2line   name        atos   name (in image) (file:line)
-//!                   file:line:column              file:line
-//!                   <blank>
+//! llvm-symbolizer   name              addr2line   0x<address>   atos   name (in image) (file:line)
+//!                   file:line:column              name
+//!                   <blank>                       file:line
 //! ```
 //!
-//! Only `llvm-symbolizer` separates one address's answer from the next. The
-//! other two are positional: `addr2line` emits exactly two lines per address and
-//! `atos` exactly one, so a parser that loses count attributes every remaining
-//! frame to the wrong function — silently, and in a way that looks like a
-//! profile rather than like a bug. Each parser below therefore returns a slot
-//! per address asked about, and the caller checks the length.
+//! `llvm-symbolizer` ends each address's answer with a blank line, and
+//! `addr2line -a` begins each with the address it is about. `atos` is
+//! positional, exactly one line per address, so a parser that loses count
+//! attributes every remaining frame to the wrong function — silently, and in a
+//! way that looks like a profile rather than like a bug. Each parser below
+//! therefore returns a slot per address asked about, and the caller checks the
+//! length.
+//!
+//! With inlined frames, `llvm-symbolizer` and `addr2line` repeat the name and
+//! location pair once per function, innermost first, so how many lines one
+//! address produces is not known in advance. That is why both are asked for a
+//! delimiter, and why neither may be read by counting lines.
 //!
 //! # Mangled on purpose
 //!
@@ -100,10 +106,13 @@ impl Tool {
     /// mapped from the dyld shared cache — almost everything under `/usr/lib` —
     /// where the recorded offset is an address in the cache rather than in the
     /// file on disk, so `llvm-symbolizer` resolves it to nothing even though the
-    /// file exists and its UUID matches. Elsewhere `llvm-symbolizer` leads
-    /// because it reports inlined frames, which `addr2line` can only do by
-    /// emitting a variable number of lines per address and thereby losing the
-    /// one thing its output format offers: a fixed size.
+    /// file exists and its UUID matches. Elsewhere `llvm-symbolizer` leads, as
+    /// the reader maintained alongside the backend rustc compiles with, and
+    /// `addr2line` is the fallback binutils provides on a Linux machine with no
+    /// LLVM installed. That is the ordinary case rather than the rare one: it
+    /// is what both GitHub Ubuntu runners have **\[measured\]**, so `addr2line`
+    /// is held to the same standard, inlined frames included.
+    ///
     /// On Windows `addr2line` is not among them. `Module::bias` there is the
     /// image base, so a recorded file address is a relative virtual address;
     /// `llvm-symbolizer` takes one with `--relative-address`, and `addr2line`
@@ -164,14 +173,29 @@ impl Tool {
                 }
                 arguments
             }
-            Tool::Addr2Line => vec![String::from("-f"), String::from("-e"), String::from(image)],
+            Tool::Addr2Line => vec![
+                String::from("-f"),
+                // Inlined callers, as `--inlines` asks of `llvm-symbolizer`, and
+                // for the same reason. Without it the answer is the innermost
+                // inlined function alone, which is the most specific name and
+                // the wrong one to trim by: `RawVec::with_capacity_in`
+                // inlined into `Vec::with_capacity` is the program's frame, and
+                // reads as the allocation path.
+                String::from("-i"),
+                // The address before each answer. `-i` makes an answer any
+                // number of lines long, so this is what says where the next one
+                // begins; see `parse_addr2line`.
+                String::from("-a"),
+                String::from("-e"),
+                String::from(image),
+            ],
         }
     }
 
-    fn parse_output(self, text: &str, asked: usize) -> Vec<Option<Resolution>> {
+    fn parse_output(self, text: &str, asked: &[u64]) -> Vec<Option<Resolution>> {
         match self {
-            Tool::Atos => parse_atos(text, asked),
-            Tool::LlvmSymbolizer => parse_llvm(text, asked),
+            Tool::Atos => parse_atos(text, asked.len()),
+            Tool::LlvmSymbolizer => parse_llvm(text, asked.len()),
             Tool::Addr2Line => parse_addr2line(text, asked),
         }
     }
@@ -249,7 +273,7 @@ pub fn resolve(
         });
     }
 
-    let resolved = tool.parse_output(&output, addresses.len());
+    let resolved = tool.parse_output(&output, addresses);
     if resolved.len() != addresses.len() {
         return Err(format!(
             "{} answered about {} addresses out of {}, so nothing it said can be \
@@ -378,21 +402,56 @@ fn parse_llvm(text: &str, asked: usize) -> Vec<Option<Resolution>> {
     answers
 }
 
-/// `addr2line -f`: exactly two lines per address, and no separator at all.
+/// `addr2line -f -i -a`: the address, then a name and location per frame.
 ///
-/// Positional, so a short final pair is dropped rather than guessed at: half an
-/// answer paired with the next address's name is how every frame after a
-/// hiccup ends up attributed to the wrong function.
-fn parse_addr2line(text: &str, asked: usize) -> Vec<Option<Resolution>> {
-    let lines: Vec<&str> = text.lines().collect();
-    let mut answers = Vec::with_capacity(asked);
-    for pair in lines.chunks(2) {
-        if pair.len() < 2 {
+/// Each answer is matched against the address it was asked about rather than
+/// merely counted, and reading stops at the first that disagrees. The echoed
+/// address is the only thing in the output that says which address an answer
+/// belongs to, so an answer that claims to be about some other address — or a
+/// line that is not one at all where a header should be — is the moment the
+/// output stopped meaning what this reads it as. Stopping leaves the caller a
+/// short list, which it refuses; carrying on would attribute every frame after
+/// it to the wrong function.
+///
+/// A header cannot be confused with a name. It is `0x` and hex digits only, and
+/// a name is a mangled symbol, `??`, or a C identifier, none of which can begin
+/// with a digit.
+fn parse_addr2line(text: &str, asked: &[u64]) -> Vec<Option<Resolution>> {
+    let mut answers = Vec::with_capacity(asked.len());
+    let mut lines = text.lines().peekable();
+    for &address in asked {
+        let Some(header) = lines.next() else {
+            break;
+        };
+        if address_header(header) != Some(address) {
             break;
         }
-        answers.push(alternating(pair));
+        let mut body = Vec::new();
+        while let Some(&line) = lines.peek() {
+            if address_header(line).is_some() {
+                break;
+            }
+            body.push(line);
+            lines.next();
+        }
+        // An odd count is half an answer: a name whose location never came.
+        // Dropped rather than completed, as `alternating` would otherwise do.
+        if body.is_empty() || body.len() % 2 != 0 {
+            break;
+        }
+        answers.push(alternating(&body));
     }
     answers
+}
+
+/// The address `addr2line -a` writes before an answer, or `None` for any other
+/// line.
+fn address_header(line: &str) -> Option<u64> {
+    let digits = line.trim().strip_prefix("0x")?;
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    u64::from_str_radix(digits, 16).ok()
 }
 
 /// `atos`: one line per address, and the address itself where it failed.
@@ -489,21 +548,50 @@ _ZN17profile_a_program5parse17hfedcba9876543210E
         assert_eq!(frames[1].line, Some(42));
     }
 
+    /// The shape of `addr2line -f -i -a`: an address, then one name and
+    /// location per frame, so one answer here is three frames long and the
+    /// next is one.
     #[test]
-    fn addr2line_output_is_read_two_lines_at_a_time() {
+    fn addr2line_output_is_read_one_answer_per_address() {
         let text = "\
+0x0000000000012340
+_ZN5alloc5alloc7realloc17h0123456789abcdefE
+/rustc/library/alloc/src/alloc.rs:140
+_ZN5alloc7raw_vec11finish_grow17h0123456789abcdefE
+/rustc/library/alloc/src/raw_vec/mod.rs:780
+_ZN17profile_a_program4grow17h0123456789abcdefE
+/src/main.rs:12
+0x0000000000012350
 _ZN17profile_a_program5churn17h0123456789abcdefE
 /src/main.rs:129
+0x0000000000012360
 ??
 ??:0
 ";
-        let answers = parse_addr2line(text, 2);
-        assert_eq!(answers.len(), 2);
+        let answers = parse_addr2line(text, &[0x12340, 0x12350, 0x12360]);
+        assert_eq!(answers.len(), 3, "{answers:#?}");
+
+        let inlined = &answers[0].as_ref().expect("frames").frames;
+        let names: Vec<&str> = inlined
+            .iter()
+            .map(|frame| frame.function.as_str())
+            .collect();
         assert_eq!(
-            answers[0].as_ref().expect("a name").frames[0].function,
+            names,
+            [
+                "alloc::alloc::realloc",
+                "alloc::raw_vec::finish_grow",
+                "profile_a_program::grow"
+            ],
+            "innermost first"
+        );
+        assert_eq!(inlined[2].line, Some(12));
+
+        assert_eq!(
+            answers[1].as_ref().expect("a name").frames[0].function,
             "profile_a_program::churn"
         );
-        assert_eq!(answers[1], None);
+        assert_eq!(answers[2], None);
     }
 
     /// A truncated final answer is dropped rather than paired with whatever
@@ -511,8 +599,24 @@ _ZN17profile_a_program5churn17h0123456789abcdefE
     /// list is the one thing it cannot detect.
     #[test]
     fn a_half_answer_from_addr2line_is_not_completed_by_guessing() {
-        let answers = parse_addr2line("_ZN1a1bE\n/src/a.rs:1\n_ZN1c1dE\n", 2);
+        let answers = parse_addr2line(
+            "0x10\n_ZN1a1bE\n/src/a.rs:1\n0x20\n_ZN1c1dE\n",
+            &[0x10, 0x20],
+        );
         assert_eq!(answers.len(), 1, "{answers:#?}");
+    }
+
+    /// The echoed address is what ties an answer to a question, so an answer
+    /// about some other address ends the reading rather than being taken as the
+    /// answer to this one.
+    #[test]
+    fn an_addr2line_answer_about_another_address_is_not_believed() {
+        let text = "0x10\n_ZN1a1bE\n/src/a.rs:1\n0x30\n_ZN1c1dE\n/src/c.rs:3\n";
+        assert_eq!(parse_addr2line(text, &[0x10, 0x20]).len(), 1);
+
+        // And output with no headers at all — `addr2line` run without `-a` — is
+        // not read positionally as though it had them.
+        assert!(parse_addr2line("_ZN1a1bE\n/src/a.rs:1\n", &[0x10]).is_empty());
     }
 
     #[test]
@@ -578,7 +682,7 @@ _malloc (in libsystem_malloc.dylib) + 32
     /// keeping even though the name is not.
     #[test]
     fn a_location_with_no_name_is_still_an_answer() {
-        let answers = parse_addr2line("??\n/src/main.rs:77\n", 1);
+        let answers = parse_addr2line("0x4d\n??\n/src/main.rs:77\n", &[0x4d]);
         let frame = &answers[0].as_ref().expect("a location").frames[0];
         assert_eq!(frame.function, "???");
         assert_eq!(frame.line, Some(77));
