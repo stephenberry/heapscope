@@ -99,7 +99,7 @@ pub fn problems(text: &str) -> Vec<String> {
         .and_then(Value::as_bool)
         .unwrap_or(false);
     check_threads(root, lifetimes, exclusive, &totals, &mut problems);
-    check_regions(root, lifetimes, &totals, &mut problems);
+    check_regions(root, lifetimes, exclusive, &totals, &mut problems);
     let modules = check_modules(root, &mut problems);
     let frames = check_frames(root, modules, &mut problems);
     check_points(root, lifetimes, &totals, frames, &mut problems);
@@ -678,19 +678,26 @@ fn check_threads(
     }
 }
 
-/// What for.
+/// What for, and what was recorded outside every region.
 ///
-/// Unlike the thread rows these do **not** sum to the totals: an allocation
-/// made outside every region belongs to no row, which is where most
-/// allocations in most programs happen. What they must not do is exceed them.
-fn check_regions(root: &Value, lifetimes: bool, totals: &Totals, problems: &mut Vec<String>) {
+/// The rows alone do **not** sum to the totals: an allocation made outside
+/// every region belongs to none of them, which is where most allocations in
+/// most programs happen. `outsideRegions` is that remainder, and with it the
+/// additive columns sum to the totals on exactly the terms the thread rows do.
+fn check_regions(
+    root: &Value,
+    lifetimes: bool,
+    exclusive: bool,
+    totals: &Totals,
+    problems: &mut Vec<String>,
+) {
     let Some(regions) = root.get("regions").and_then(Value::as_array) else {
         problems.push(String::from("missing array `regions`"));
         return;
     };
 
     let mut seen = Vec::new();
-    let (mut bytes, mut blocks) = (0u64, 0u64);
+    let (mut bytes, mut blocks, mut live) = (0u64, 0u64, 0u64);
     for region in regions {
         check_row_id(region, "regions[]", &mut seen, problems);
         check_first_seen(region, "regions[]", problems);
@@ -709,6 +716,7 @@ fn check_regions(root: &Value, lifetimes: bool, totals: &Totals, problems: &mut 
         let counts = check_tally(region, "regions[]", lifetimes, totals, problems);
         bytes += counts.0;
         blocks += counts.1;
+        live += counts.2;
     }
 
     if bytes > totals.total_bytes || blocks > totals.total_blocks {
@@ -718,6 +726,82 @@ fn check_regions(root: &Value, lifetimes: bool, totals: &Totals, problems: &mut 
              attributed to the innermost one only, so the rows cannot overlap",
             totals.total_bytes, totals.total_blocks
         ));
+    }
+
+    // Required in every file, including one from a run with no regions, where
+    // it is the whole run: the writer emits it unconditionally so that its
+    // absence can mean only a file from before it existed, and this validator
+    // checks files this writer produced.
+    let Some(outside) = root.get("outsideRegions") else {
+        problems.push(String::from("missing object `outsideRegions`"));
+        return;
+    };
+    if outside.as_object().is_none() {
+        problems.push(format!(
+            "`outsideRegions` is a {}, not an object",
+            outside.kind()
+        ));
+        return;
+    }
+    let path = "outsideRegions";
+    let outside_bytes = integer(outside, path, "totalBytes", problems).unwrap_or(0);
+    let outside_blocks = integer(outside, path, "totalBlocks", problems).unwrap_or(0);
+    // Never a peak: this is the totals less the regions, and a peak is the one
+    // figure a subtraction cannot give. A `maxBytes` here would be a number
+    // the profiler never measured.
+    for field in ["maxBytes", "maxBlocks"] {
+        if outside.get(field).is_some() {
+            problems.push(format!(
+                "`{path}` carries `{field}`, which nothing measured: the row is \
+                 a remainder, not a row the profiler kept"
+            ));
+        }
+    }
+    let outside_live = if lifetimes {
+        integer(outside, path, "currBlocks", problems);
+        integer(outside, path, "currBytes", problems).unwrap_or(0)
+    } else {
+        for field in ["currBytes", "currBlocks"] {
+            if outside.get(field).is_some() {
+                problems.push(format!(
+                    "`{path}` carries `{field}` in a mode with no live blocks"
+                ));
+            }
+        }
+        0
+    };
+
+    // The same accounting, and the same reason, as for the thread rows: a row
+    // that did not fit is missing from the sum, and the file says so.
+    if totals.rows_dropped != 0 {
+        return;
+    }
+    let tolerance = if exclusive { 0 } else { 1_000 };
+    sums_match(
+        "region rows and `outsideRegions`",
+        "totalBytes",
+        bytes.saturating_add(outside_bytes),
+        totals.total_bytes,
+        tolerance,
+        problems,
+    );
+    sums_match(
+        "region rows and `outsideRegions`",
+        "totalBlocks",
+        blocks.saturating_add(outside_blocks),
+        totals.total_blocks,
+        tolerance,
+        problems,
+    );
+    if lifetimes {
+        sums_match(
+            "region rows and `outsideRegions`",
+            "currBytes",
+            live.saturating_add(outside_live),
+            totals.curr_bytes,
+            tolerance,
+            problems,
+        );
     }
 }
 

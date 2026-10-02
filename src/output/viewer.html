@@ -159,6 +159,7 @@
   th { color: var(--dim); font-weight: 600; font-size: .78rem; white-space: nowrap; }
   th:first-child, td:first-child { text-align: left; }
   tbody tr:hover { background: var(--panel); }
+  tfoot td { border-top: 2px solid var(--rule); }
   caption { caption-side: top; text-align: left; color: var(--dim); font-size: .82rem; padding-bottom: .5rem; }
 
   .empty { color: var(--dim); font-style: italic; padding: 1rem 0; }
@@ -798,7 +799,10 @@ if (typeof document !== "undefined") {
 
     // ---- tables ----
 
-    function table(container, caption, columns, rows) {
+    // `footer`, if given, is rows that are not entries of the table but complete
+    // it: the region table's row for what no region covered, which is shown
+    // apart and styled as synthetic so it cannot be read as a region of that name.
+    function table(container, caption, columns, rows, footer) {
       const node = document.createElement("table");
       if (caption) {
         const captionNode = element("caption", null, caption);
@@ -816,6 +820,15 @@ if (typeof document !== "undefined") {
         body.appendChild(tr);
       });
       node.appendChild(body);
+      if (footer && footer.length > 0) {
+        const foot = document.createElement("tfoot");
+        footer.forEach(function (row) {
+          const tr = element("tr", "synthetic");
+          row.forEach(function (cell) { tr.appendChild(element("td", null, cell)); });
+          foot.appendChild(tr);
+        });
+        node.appendChild(foot);
+      }
       container.appendChild(node);
     }
 
@@ -863,20 +876,45 @@ if (typeof document !== "undefined") {
     // Regions.
     const regionsPanel = document.getElementById("panel-regions");
     regionsPanel.appendChild(element("h2", null, "Regions"));
+    // What was recorded with no region open. Its own key rather than an entry
+    // of `regions`, because it is not a region: it has no name, no entries and
+    // no peak. A profile from before the key existed simply lacks it, and the
+    // table is then the regions alone, as it always was.
+    const outside = profile.outsideRegions;
     regionsPanel.appendChild(element("p", "note",
-      "Phases of the run, marked by the program itself. These do not sum to the totals:"
-      + " an allocation made outside every region belongs to no row, which is where most allocations in most programs happen."));
+      "Phases of the run, marked by the program itself. An allocation belongs to the innermost region open on the thread that made it, and only to that one."
+      + (outside
+        ? (lifetimes
+          ? " The last row is what was allocated with no region open, so the totals, the block counts and what was live at the end each sum to the run's own."
+            + " Peaks do not: each region's is its own, reached at its own moment, and the last row has none because it is the remainder rather than a row the profiler kept."
+          : " The last row is what was recorded with no region open, so the totals and the counts each sum to the run's own.")
+        : " These do not sum to the totals: an allocation made outside every region belongs to no row.")));
     const regions = profile.regions || [];
     if (regions.length === 0) {
       regionsPanel.appendChild(element("div", "empty", "This run used no regions."));
     } else {
+      const footer = [];
+      if (outside) {
+        const cells = [
+          amount(outside.totalBytes || 0),
+          HEAPSCOPE.formatCount(outside.totalBlocks || 0),
+        ];
+        if (lifetimes) {
+          cells.push(
+            "—",
+            amount(outside.currBytes || 0),
+            HEAPSCOPE.formatCount(outside.currBlocks || 0)
+          );
+        }
+        footer.push(["(no region)", "—", "—"].concat(cells));
+      }
       table(regionsPanel, null, ["Region", "Entries", "Still open"].concat(TALLY_COLUMNS), regions.map(function (region) {
         return [
           region.name ? region.name + " (#" + region.id + ")" : "#" + region.id,
           HEAPSCOPE.formatCount(region.entries || 0),
           HEAPSCOPE.formatCount(region.active || 0),
         ].concat(tally(region));
-      }));
+      }), footer);
     }
 
     // Shapes.

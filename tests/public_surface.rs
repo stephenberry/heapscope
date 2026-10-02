@@ -330,13 +330,33 @@ fn join_until(lines: &[&str], i: &mut usize, done: impl Fn(&str) -> bool) -> Str
 /// Only a line that actually opens a brace is followed to a closing one. A
 /// scanner that guessed here would swallow the rest of the file and report a
 /// surface of nothing, which every snapshot would then agree with.
+///
+/// A `use` is the exception, because its brace is a list and not a body: one
+/// rustfmt has broken over several lines closes with `};`, never with a `}`
+/// alone, so following it as a block walked on to the *next* item's closing
+/// brace and dropped everything between from the surface. That is how a
+/// private `use super::site::{` in `engine.rs` once made `Mode` and all its
+/// variants vanish from the snapshot. A `use` ends at its semicolon.
 fn skip_item(lines: &[&str], i: &mut usize) {
     let line = lines[*i].trim_end();
-    if line.ends_with('{') {
+    if is_use(line) {
+        join_until(lines, i, |l| l.trim_end().ends_with(';'));
+    } else if line.ends_with('{') {
         skip_block(lines, i);
     } else {
         *i += 1;
     }
+}
+
+/// Whether `line` begins a `use`, private or restricted.
+///
+/// `pub use` never reaches [`skip_item`]: it is surface, and read as such.
+fn is_use(line: &str) -> bool {
+    let rest = match line.strip_prefix("pub(") {
+        Some(restricted) => restricted.split_once(") ").map_or("", |(_, rest)| rest),
+        None => line,
+    };
+    rest.starts_with("use ")
 }
 
 /// Advances past a braced block whose closing `}` is at column zero.

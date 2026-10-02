@@ -48,6 +48,14 @@
 //! [`max_live_blocks`](crate::ProfilerBuilder::max_live_blocks) and the numbers
 //! become assertable again.
 //!
+//! [`RegionBreakdown::get`] refuses on the same terms, with two differences
+//! that follow from what it reads. It answers in every mode, because a region
+//! row means the same thing in each — what was recorded while that region was
+//! innermost — and the reading says which mode it came from. And it has one
+//! refusal of its own, [`StatsError::NoQuietPoint`]: its row outside every
+//! region is a difference between the totals and the region rows, which is
+//! only a measurement when both are read at one instant.
+//!
 //! # The condition this table did not list
 //!
 //! A program whose `#[global_allocator]` is not [`Alloc`](crate::Alloc) records
@@ -127,7 +135,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::internals::engine::{Engine, Mode, State};
-use crate::output::{count, Ranking, Snapshot};
+use crate::output::{count, OutsideRegions, Ranking, RegionStats, Snapshot};
 
 /// What a heap run has recorded, as of now.
 ///
@@ -228,6 +236,157 @@ pub struct EventStats {
     pub refused_events: u64,
 }
 
+/// Every region's row, and what was recorded outside all of them, as of now.
+///
+/// The cheap way to report a phase-structured program by phase. Compare
+/// [`Snapshot::capture`], which carries the same rows and also copies out
+/// every program point and every thread the run has; this reads the region
+/// table, a few hundred rows at most, and nothing else.
+///
+/// ```no_run
+/// # fn parse() {}
+/// # fn emit() {}
+/// let _profiler = heapscope::Profiler::builder().no_output().build().unwrap();
+/// {
+///     let _region = heapscope::region("parsing");
+///     parse();
+/// }
+/// {
+///     let _region = heapscope::region("emitting");
+///     emit();
+/// }
+/// let breakdown = heapscope::RegionBreakdown::get().unwrap();
+/// for region in &breakdown.regions {
+///     println!("{:?}: {} allocations", region.name, region.counts.total_blocks);
+/// }
+/// println!("(no region): {} allocations", breakdown.outside.total_blocks);
+/// ```
+///
+/// # What adds up
+///
+/// For each of `total_bytes`, `total_blocks`, `curr_bytes` and `curr_blocks`,
+/// the rows in [`regions`](RegionBreakdown::regions) — the shared overflow row
+/// among them — plus [`outside`](RegionBreakdown::outside) equal the run's own
+/// total at the instant of the reading, exactly. The peaks do not add up and
+/// are not meant to: each region's is its own, reached at its own moment.
+///
+/// Unlike [`HeapStats`], this is one consistent instant even while other
+/// threads are recording. The row outside every region is a subtraction, and a
+/// subtraction across two instants can report something that never happened,
+/// so the region rows and the totals are read together with the profiler's peak
+/// gate held: every recording thread waits for as long as it takes to copy a
+/// few hundred rows. In a run that has stopped there is nothing to wait for.
+///
+/// # Reading it does not change it
+///
+/// The reading allocates, for the rows and their names, and none of that is
+/// recorded: the calling thread is inside the profiler for the duration, so a
+/// reading taken inside a region is not charged to that region.
+///
+/// `#[non_exhaustive]`, as the other readings are.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RegionBreakdown {
+    /// Which mode produced these, and therefore what the columns count.
+    ///
+    /// In [`Mode::Heap`], bytes and blocks. In an event mode, `total_bytes` is
+    /// summed weight and `total_blocks` is events, and the live and peak
+    /// columns are zero because an event is never live — read them only in a
+    /// heap run.
+    pub mode: Mode,
+    /// One row per region name the program entered, in the order it first
+    /// entered them, with the shared row for names past the table's capacity
+    /// last if anything reached it. Empty if the program has entered no region.
+    pub regions: Vec<RegionStats>,
+    /// What was recorded while no region was open on the recording thread.
+    ///
+    /// In a run that has entered no region, the whole run.
+    pub outside: OutsideRegions,
+}
+
+impl RegionBreakdown {
+    /// The region rows of the run recording in this process, and what was
+    /// recorded outside them.
+    ///
+    /// # Errors
+    ///
+    /// [`StatsError::NotRecording`], [`StatsError::ForkedChild`],
+    /// [`StatsError::Poisoned`] and [`StatsError::Sampled`], for the reasons
+    /// [`HeapStats::get`] gives: each is a run whose numbers would be zeros, a
+    /// parent's, incomplete, or estimates. Not the two mode errors, because
+    /// region rows exist in every mode and [`RegionBreakdown::mode`] says which
+    /// one these came from.
+    ///
+    /// [`StatsError::NoQuietPoint`] if the region rows and the totals could not
+    /// be read at one instant, which takes a thread stuck inside the profiler —
+    /// stopped by a debugger, or this one, calling from a signal handler that
+    /// interrupted it. Asking again from ordinary code is the remedy.
+    pub fn get() -> Result<RegionBreakdown, StatsError> {
+        Self::of(crate::engine())
+    }
+
+    /// Reads a specific engine. Testing hook.
+    pub(crate) fn of(engine: &Engine) -> Result<RegionBreakdown, StatsError> {
+        recording(engine)?;
+        // Before the read, as in `HeapStats::of`: sampling is fixed for the
+        // life of a run, so there is nothing to wait for.
+        if engine.is_sampled() {
+            return Err(StatsError::Sampled);
+        }
+
+        // Taken before anything allocates, so that this reading's own rows
+        // and names are not recorded into the run it is reading — and, for a
+        // caller inside a region, not charged to that region.
+        let _quiet = crate::internals::guard::enter();
+
+        // Room for every row the table can ever hold, reserved before the gate
+        // is taken because the visitor may not allocate under it. The table
+        // is bounded, so this is a few dozen kilobytes at worst — and it means
+        // no row can arrive during the read and fail to fit, which would leave
+        // the rows short of the totals with nothing here to say so.
+        let mut rows = Vec::with_capacity(engine.regions().capacity() + 1);
+        let outside = engine
+            .visit_regions(Engine::FLUSH_TIMEOUT, |row| {
+                // Checked anyway, because a push past capacity would allocate
+                // under the gate, and that is a deadlock rather than a wrong
+                // number. Not an assertion, for the same reason: a panic
+                // allocates too.
+                if rows.len() < rows.capacity() {
+                    rows.push(row);
+                }
+            })
+            .ok_or(StatsError::NoQuietPoint)?;
+
+        // After the read, as in `HeapStats::of`, and for more than the usual
+        // reason: a region table that accounts for more than the run recorded
+        // poisons the engine during the read, so this is where that refusal
+        // surfaces rather than as a row that was quietly clamped to zero.
+        unpoisoned()?;
+        Ok(RegionBreakdown {
+            mode: engine.mode(),
+            regions: rows.iter().map(RegionStats::of_view).collect(),
+            outside,
+        })
+    }
+
+    /// The row for the region named `name`, if the program has entered it.
+    ///
+    /// `name` is cut to the length the profiler keeps, exactly as
+    /// [`region`](fn@crate::region) cuts it, so the name a program entered
+    /// finds its row however long it was. `None` means the program never
+    /// entered that name, or entered it only after the table was full — its
+    /// figures are then in the shared overflow row, which this never returns
+    /// because it is not that region alone.
+    pub fn region(&self, name: &str) -> Option<&RegionStats> {
+        let kept = crate::internals::site::Name::of(name);
+        self.regions.iter().find(|row| {
+            // An empty name is kept as `None` on the row, because a row's name
+            // is optional for the overflow row's sake.
+            !row.overflow && row.name.as_deref().unwrap_or("").as_bytes() == kept.as_bytes()
+        })
+    }
+}
+
 /// Why there are no statistics to read.
 ///
 /// Every variant is a case where returning numbers would mean returning zeros,
@@ -271,6 +430,17 @@ pub enum StatsError {
     /// refusal is where the number is read because there it needs no declaration
     /// and cannot be bypassed.
     Sampled,
+    /// The reading needed every recording thread held still for an instant,
+    /// and they could not be.
+    ///
+    /// Only [`RegionBreakdown::get`] returns this. Its row outside every region
+    /// is the totals less the region rows, so it reads both with the
+    /// profiler's peak gate held, and it waits a bounded time for that rather
+    /// than forever. A thread holding the gate that long is stuck — stopped by
+    /// a debugger, or the calling thread itself, interrupted by the signal
+    /// handler that is asking. Not a fault in the program under test, and
+    /// asking again from ordinary code is the remedy.
+    NoQuietPoint,
 }
 
 impl fmt::Display for StatsError {
@@ -314,6 +484,13 @@ impl fmt::Display for StatsError {
                 "this run samples allocations, so its counters are estimates \
                  and not a budget worth asserting against; build the profiler \
                  without sampling(..) for a test that asserts"
+            ),
+            StatsError::NoQuietPoint => write!(
+                f,
+                "the profiler could not hold every recording thread still long \
+                 enough to read the regions and the totals at one instant; a \
+                 thread is stuck inside the profiler, so ask again from \
+                 ordinary code"
             ),
         }
     }
@@ -2289,6 +2466,185 @@ mod tests {
             Err(StatsError::NotAnEventRun),
             "the mode check must still win on a run that does not sample"
         );
+    }
+
+    /// Records `size` bytes at `address` with `name` the innermost region on
+    /// this thread, the way `crate::region` would arrange it.
+    fn record_in(engine: &Engine, name: &str, address: usize, size: usize) {
+        let id = engine.intern_region(name);
+        let held = crate::internals::guard::enter().expect("not inside the profiler");
+        let previous = crate::internals::guard::enter_region(&held, id);
+        drop(held);
+        engine.regions().enter(id);
+        record(engine, address, size);
+        crate::internals::guard::leave_region(previous);
+        engine.regions().leave(id);
+    }
+
+    /// The breakdown is the region rows a snapshot would carry, plus the
+    /// remainder, and the two together are the run.
+    ///
+    /// Built on `distinct_figures`, so the remainder's live and total columns
+    /// differ from each other and from the region's: an accessor that read the
+    /// wrong counter into the wrong field cannot land on the right answer.
+    #[test]
+    fn a_region_breakdown_adds_up_to_the_run() {
+        let _serial = serialized();
+        let engine = distinct_figures();
+        record_in(&engine, "parsing", 0x500, 1_000);
+        record_in(&engine, "parsing", 0x600, 24);
+        engine.record_free(0x600, 24);
+
+        let breakdown = RegionBreakdown::of(&engine).expect("a running heap engine has regions");
+        assert_eq!(breakdown.mode, Mode::Heap);
+        assert_eq!(breakdown.regions.len(), 1);
+        let parsing = breakdown.region("parsing").expect("the program entered it");
+        assert_eq!(parsing.entries, 2);
+        assert_eq!(parsing.counts.total_bytes, 1_024);
+        assert_eq!(parsing.counts.curr_bytes, 1_000);
+
+        // Everything `distinct_figures` recorded happened outside every region.
+        assert_eq!(breakdown.outside.total_bytes, 464);
+        assert_eq!(breakdown.outside.total_blocks, 4);
+        assert_eq!(breakdown.outside.curr_bytes, 80);
+        assert_eq!(breakdown.outside.curr_blocks, 2);
+
+        let stats = HeapStats::of(&engine).expect("heap stats");
+        assert_eq!(
+            parsing.counts.total_bytes + breakdown.outside.total_bytes,
+            stats.total_bytes
+        );
+        assert_eq!(
+            parsing.counts.curr_blocks + breakdown.outside.curr_blocks,
+            stats.curr_blocks
+        );
+    }
+
+    /// The same rows a snapshot carries, not a parallel reading of them: a field
+    /// copied differently in one place is a disagreement between two answers to
+    /// one question.
+    #[test]
+    fn a_region_breakdown_agrees_with_a_snapshot() {
+        let _serial = serialized();
+        let engine = distinct_figures();
+        record_in(&engine, "parsing", 0x500, 1_000);
+        record_in(&engine, "emitting", 0x600, 24);
+
+        let breakdown = RegionBreakdown::of(&engine).expect("regions");
+        let snapshot = Snapshot::of(&engine);
+        assert_eq!(breakdown.regions, snapshot.regions);
+        assert_eq!(breakdown.outside, snapshot.outside_regions);
+    }
+
+    /// A name is found the way the program entered it, however long it was:
+    /// `region` keeps 64 bytes, and a lookup that did not cut the same way would
+    /// report a region the program plainly entered as never entered.
+    #[test]
+    fn a_region_is_found_by_the_name_the_program_gave_it() {
+        let _serial = serialized();
+        let engine = engine(Mode::Heap);
+        let long = "a phase name long enough to be cut by the profiler, and then some more";
+        assert!(long.len() > crate::internals::site::MAX_NAME);
+        record_in(&engine, long, 0x100, 64);
+        record_in(&engine, "", 0x200, 32);
+
+        let breakdown = RegionBreakdown::of(&engine).expect("regions");
+        assert_eq!(
+            breakdown.region(long).map(|row| row.counts.total_bytes),
+            Some(64)
+        );
+        assert_eq!(
+            breakdown.region("").map(|row| row.counts.total_bytes),
+            Some(32),
+            "a region named with the empty string is still a region"
+        );
+        assert!(breakdown.region("never entered").is_none());
+    }
+
+    /// With no region entered, the remainder is the whole run, which is the
+    /// true answer rather than a missing one.
+    #[test]
+    fn a_run_with_no_regions_is_entirely_outside_them() {
+        let _serial = serialized();
+        let engine = distinct_figures();
+        let breakdown = RegionBreakdown::of(&engine).expect("regions");
+        assert!(breakdown.regions.is_empty());
+        let stats = HeapStats::of(&engine).expect("heap stats");
+        assert_eq!(breakdown.outside.total_bytes, stats.total_bytes);
+        assert_eq!(breakdown.outside.curr_bytes, stats.curr_bytes);
+    }
+
+    /// Region rows mean the same thing in every mode, so an event run has a
+    /// breakdown too, and says it is one.
+    #[test]
+    fn an_event_run_has_a_region_breakdown_in_its_own_units() {
+        let _serial = serialized();
+        let engine = engine(Mode::AdHoc);
+        let id = engine.intern_region("retrying");
+        let held = crate::internals::guard::enter().expect("not inside the profiler");
+        engine.record_event(&held, 700, &[0x1000]);
+        let previous = crate::internals::guard::enter_region(&held, id);
+        engine.regions().enter(id);
+        engine.record_event(&held, 30, &[0x1000]);
+        crate::internals::guard::leave_region(previous);
+        engine.regions().leave(id);
+        drop(held);
+
+        let breakdown = RegionBreakdown::of(&engine).expect("an event run has regions");
+        assert_eq!(breakdown.mode, Mode::AdHoc);
+        assert_eq!(breakdown.outside.total_bytes, 700);
+        assert_eq!(breakdown.outside.total_blocks, 1);
+        assert_eq!(
+            breakdown
+                .region("retrying")
+                .map(|row| row.counts.total_bytes),
+            Some(30)
+        );
+    }
+
+    /// Every refusal that is about the run rather than about the reading's
+    /// mode, on the same terms as `HeapStats::of`. A breakdown of zeros from a
+    /// profiler nobody started would say every phase allocated nothing.
+    #[test]
+    fn a_region_breakdown_refuses_what_the_other_readings_refuse() {
+        let _serial = serialized();
+        assert_eq!(RegionBreakdown::of(&idle()), Err(StatsError::NotRecording));
+
+        let sampled = configured(Settings {
+            sampling: NonZeroU64::new(4_096),
+            ..Settings::default()
+        });
+        assert_eq!(RegionBreakdown::of(&sampled), Err(StatsError::Sampled));
+
+        let forked = engine(Mode::Heap);
+        record_in(&forked, "parsing", 0x100, 64);
+        forked.disown_for_testing();
+        assert_eq!(RegionBreakdown::of(&forked), Err(StatsError::ForkedChild));
+
+        let finished = engine(Mode::Heap);
+        record_in(&finished, "parsing", 0x100, 64);
+        finished.stop(crate::output::Shutdown::Explicit);
+        assert!(
+            RegionBreakdown::of(&finished).is_ok(),
+            "a stopped run still has final numbers"
+        );
+    }
+
+    /// As for the other readings, a poisoned run is refused rather than read.
+    /// A copy of a checked path is not itself a checked path, which is why this
+    /// is its own test rather than an assumption.
+    #[test]
+    fn a_poisoned_profiler_has_no_region_breakdown() {
+        let _serial = serialized();
+        let _clear = ClearPoison;
+
+        let heap = engine(Mode::Heap);
+        record_in(&heap, "parsing", 0x100, 64);
+        crate::internals::diagnostic::set_quiet(true);
+        assert!(RegionBreakdown::of(&heap).is_ok());
+
+        crate::internals::diagnostic::poison("test: the breakdown must refuse this");
+        assert_eq!(RegionBreakdown::of(&heap), Err(StatsError::Poisoned));
     }
 
     /// A run with nothing to describe writes no profile, and a finished one

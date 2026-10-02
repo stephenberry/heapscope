@@ -199,12 +199,17 @@ fn snapshot(borrowed: &Borrowed) -> Snapshot {
         },
     }];
     // One region, holding the first point's share and nothing else. Unlike the
-    // thread row this need not sum to the totals — an allocation made outside
-    // every region belongs to no row — and the validator asks only that it not
-    // exceed them. Its peak is what that point held at the run's peak, for the
-    // same reason the totals' is, which is also what keeps it under them for any
-    // point list rather than just this one.
+    // thread row it does not sum to the totals on its own — an allocation made
+    // outside every region belongs to no row — so the remainder is the rest of
+    // the run, derived from the same figures rather than written out. Its peak
+    // is what that point held at the run's peak, for the same reason the
+    // totals' is, which is also what keeps it under them for any point list
+    // rather than just this one.
     let first = snapshot.points[0].counters;
+    snapshot.outside_regions.total_bytes = stats.total_bytes - first.total_bytes;
+    snapshot.outside_regions.total_blocks = stats.total_blocks - first.total_blocks;
+    snapshot.outside_regions.curr_bytes = stats.curr_bytes - first.curr_bytes;
+    snapshot.outside_regions.curr_blocks = stats.curr_blocks - first.curr_blocks;
     snapshot.regions = vec![RegionStats {
         id: 0,
         overflow: false,

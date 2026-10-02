@@ -168,7 +168,7 @@ pub use internals::engine::Mode;
 pub use output::{FoldedMetric, Snapshot};
 pub use profiler::{Output, Profiler, ProfilerBuilder, StartError, DEFAULT_OUTPUT_PATH};
 pub use region::{region, Region};
-pub use stats::{EventStats, HeapStats, StatsError};
+pub use stats::{EventStats, HeapStats, RegionBreakdown, StatsError};
 pub use symbol::demangle;
 
 // The bodies of the assertion macros. `#[macro_export]` puts a macro at the
