@@ -84,11 +84,13 @@ let breakdown = heapscope::RegionBreakdown::get()?;
 for region in &breakdown.regions {
     println!("{:?}: {} allocations", region.name, region.counts.total_blocks);
 }
-println!("(no region): {} allocations", breakdown.outside.total_blocks);
+println!("(no region): {} allocations", breakdown.outside_regions.total_blocks);
 let lexing = breakdown.region("parsing/lexing");
 ```
 
-It refuses rather than returning zeros in the cases `HeapStats::get()` does: nothing recording, a poisoned profiler, a `fork` child, a sampled run. It answers in every mode, saying which, because a region row means the same thing in each. Because the remainder is a subtraction, it reads the region rows and the totals at one instant, holding every recording thread still for as long as copying a few hundred rows takes; if it cannot, it refuses with `StatsError::NoQuietPoint` rather than subtracting across two moments.
+It refuses rather than returning zeros in the cases `HeapStats::get()` does: nothing recording, a poisoned profiler, a `fork` child, a sampled run (whose rows are estimates, like everything else in it). It answers in every mode, saying which, because a region row means the same thing in each, and it carries `dropped_blocks` and `refused_events` from the same reading: the rows still add up when the live-block table overflows, but they undercount, and those say by how much.
+
+Because the remainder is a subtraction, it reads the region rows and the totals at one instant, holding every recording thread still for as long as copying a few hundred rows takes. If something else holds the profiler that long, it refuses with `StatsError::NoQuietPoint` rather than subtracting across two moments. It allocates, so it is not for a signal handler, and a thread already inside the profiler is refused at once with `StatsError::InsideTheProfiler` rather than left to stall every other thread while it waits.
 
 ## What else is in there
 

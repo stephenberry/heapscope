@@ -481,7 +481,7 @@ fn check_tally(
     lifetimes: bool,
     totals: &Totals,
     problems: &mut Vec<String>,
-) -> (u64, u64, u64) {
+) -> Sums {
     let total_bytes = integer(row, path, "totalBytes", problems).unwrap_or(0);
     let total_blocks = integer(row, path, "totalBlocks", problems).unwrap_or(0);
 
@@ -495,7 +495,11 @@ fn check_tally(
                 ));
             }
         }
-        return (total_bytes, total_blocks, 0);
+        return Sums {
+            total_bytes,
+            total_blocks,
+            ..Sums::default()
+        };
     }
 
     let curr_bytes = integer(row, path, "currBytes", problems).unwrap_or(0);
@@ -539,7 +543,56 @@ fn check_tally(
         ));
     }
 
-    (total_bytes, total_blocks, curr_bytes)
+    Sums {
+        total_bytes,
+        total_blocks,
+        curr_bytes,
+        curr_blocks,
+    }
+}
+
+/// The four columns a row has that add up across rows.
+///
+/// Every one of them, not a convenient three: a set of rows that summed on
+/// bytes and drifted on blocks would be a set of rows whose block counter was
+/// moving without its byte counter, and that is the defect the sums are for.
+#[derive(Clone, Copy, Default)]
+struct Sums {
+    total_bytes: u64,
+    total_blocks: u64,
+    curr_bytes: u64,
+    curr_blocks: u64,
+}
+
+impl Sums {
+    fn add(&mut self, row: Sums) {
+        self.total_bytes = self.total_bytes.saturating_add(row.total_bytes);
+        self.total_blocks = self.total_blocks.saturating_add(row.total_blocks);
+        self.curr_bytes = self.curr_bytes.saturating_add(row.curr_bytes);
+        self.curr_blocks = self.curr_blocks.saturating_add(row.curr_blocks);
+    }
+
+    /// Holds these against the run's totals, on every column the mode has.
+    fn against(
+        self,
+        what: &str,
+        totals: &Totals,
+        lifetimes: bool,
+        tolerance: u64,
+        problems: &mut Vec<String>,
+    ) {
+        let mut columns = vec![
+            ("totalBytes", self.total_bytes, totals.total_bytes),
+            ("totalBlocks", self.total_blocks, totals.total_blocks),
+        ];
+        if lifetimes {
+            columns.push(("currBytes", self.curr_bytes, totals.curr_bytes));
+            columns.push(("currBlocks", self.curr_blocks, totals.curr_blocks));
+        }
+        for (field, rows, run) in columns {
+            sums_match(what, field, rows, run, tolerance, problems);
+        }
+    }
 }
 
 /// Reads a row's `id`, holding it to being unique within its table.
@@ -609,14 +662,17 @@ fn check_threads(
     };
 
     let mut seen = Vec::new();
-    let (mut bytes, mut blocks, mut live) = (0u64, 0u64, 0u64);
+    let mut sums = Sums::default();
     for thread in threads {
         check_row_id(thread, "threads[]", &mut seen, problems);
         check_first_seen(thread, "threads[]", problems);
-        let counts = check_tally(thread, "threads[]", lifetimes, totals, problems);
-        bytes += counts.0;
-        blocks += counts.1;
-        live += counts.2;
+        sums.add(check_tally(
+            thread,
+            "threads[]",
+            lifetimes,
+            totals,
+            problems,
+        ));
     }
 
     // A run that recorded anything was recorded *by* something. Without this,
@@ -641,7 +697,8 @@ fn check_threads(
     // ordinary run: the rows move in the same critical section as the counters
     // they are checked against, so there is no window for them to differ in.
     // Measured across three concurrent-shutdown runs of 34,000 events apiece:
-    // exact every time, on all three fields.
+    // exact every time, on all three fields then checked; `currBlocks`, the
+    // fourth, moves in the same critical section as the other three.
     //
     // This rule was a bound at one part in a thousand first, and it should not
     // have been. It passed while the rows were 9% adrift from the totals under
@@ -650,32 +707,7 @@ fn check_threads(
     // tolerance survives only where the file itself says exclusion was not
     // reached, which is what `exact: false` exists to declare.
     let tolerance = if exclusive { 0 } else { 1_000 };
-    sums_match(
-        "thread rows",
-        "totalBytes",
-        bytes,
-        totals.total_bytes,
-        tolerance,
-        problems,
-    );
-    sums_match(
-        "thread rows",
-        "totalBlocks",
-        blocks,
-        totals.total_blocks,
-        tolerance,
-        problems,
-    );
-    if lifetimes {
-        sums_match(
-            "thread rows",
-            "currBytes",
-            live,
-            totals.curr_bytes,
-            tolerance,
-            problems,
-        );
-    }
+    sums.against("thread rows", totals, lifetimes, tolerance, problems);
 }
 
 /// What for, and what was recorded outside every region.
@@ -697,7 +729,7 @@ fn check_regions(
     };
 
     let mut seen = Vec::new();
-    let (mut bytes, mut blocks, mut live) = (0u64, 0u64, 0u64);
+    let mut sums = Sums::default();
     for region in regions {
         check_row_id(region, "regions[]", &mut seen, problems);
         check_first_seen(region, "regions[]", problems);
@@ -713,12 +745,16 @@ fn check_regions(
                 "a region row was written for a name that was never entered",
             ));
         }
-        let counts = check_tally(region, "regions[]", lifetimes, totals, problems);
-        bytes += counts.0;
-        blocks += counts.1;
-        live += counts.2;
+        sums.add(check_tally(
+            region,
+            "regions[]",
+            lifetimes,
+            totals,
+            problems,
+        ));
     }
 
+    let (bytes, blocks) = (sums.total_bytes, sums.total_blocks);
     if bytes > totals.total_bytes || blocks > totals.total_blocks {
         problems.push(format!(
             "the regions account for {bytes} bytes in {blocks} blocks, more than \
@@ -744,8 +780,11 @@ fn check_regions(
         return;
     }
     let path = "outsideRegions";
-    let outside_bytes = integer(outside, path, "totalBytes", problems).unwrap_or(0);
-    let outside_blocks = integer(outside, path, "totalBlocks", problems).unwrap_or(0);
+    let mut remainder = Sums {
+        total_bytes: integer(outside, path, "totalBytes", problems).unwrap_or(0),
+        total_blocks: integer(outside, path, "totalBlocks", problems).unwrap_or(0),
+        ..Sums::default()
+    };
     // Never a peak: this is the totals less the regions, and a peak is the one
     // figure a subtraction cannot give. A `maxBytes` here would be a number
     // the profiler never measured.
@@ -757,9 +796,9 @@ fn check_regions(
             ));
         }
     }
-    let outside_live = if lifetimes {
-        integer(outside, path, "currBlocks", problems);
-        integer(outside, path, "currBytes", problems).unwrap_or(0)
+    if lifetimes {
+        remainder.curr_bytes = integer(outside, path, "currBytes", problems).unwrap_or(0);
+        remainder.curr_blocks = integer(outside, path, "currBlocks", problems).unwrap_or(0);
     } else {
         for field in ["currBytes", "currBlocks"] {
             if outside.get(field).is_some() {
@@ -768,8 +807,7 @@ fn check_regions(
                 ));
             }
         }
-        0
-    };
+    }
 
     // The same accounting, and the same reason, as for the thread rows: a row
     // that did not fit is missing from the sum, and the file says so.
@@ -777,32 +815,14 @@ fn check_regions(
         return;
     }
     let tolerance = if exclusive { 0 } else { 1_000 };
-    sums_match(
+    sums.add(remainder);
+    sums.against(
         "region rows and `outsideRegions`",
-        "totalBytes",
-        bytes.saturating_add(outside_bytes),
-        totals.total_bytes,
+        totals,
+        lifetimes,
         tolerance,
         problems,
     );
-    sums_match(
-        "region rows and `outsideRegions`",
-        "totalBlocks",
-        blocks.saturating_add(outside_blocks),
-        totals.total_blocks,
-        tolerance,
-        problems,
-    );
-    if lifetimes {
-        sums_match(
-            "region rows and `outsideRegions`",
-            "currBytes",
-            live.saturating_add(outside_live),
-            totals.curr_bytes,
-            tolerance,
-            problems,
-        );
-    }
 }
 
 /// Holds `rows` against `run`, to within one part in `tolerance`.

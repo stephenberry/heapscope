@@ -822,6 +822,42 @@ fn the_validator_rejects_rows_that_do_not_sum_on_every_field() {
         }),
         "`totalBlocks` but the run recorded",
     );
+    // The fourth column, which the rule once read and never summed.
+    rejects(
+        &damaged_by(&text, |t| {
+            replacing(
+                t,
+                r#""currBytes":320,"currBlocks":1"#,
+                r#""currBytes":320,"currBlocks":0"#,
+            )
+        }),
+        "thread rows account for 0 `currBlocks`",
+    );
+    // And on the region side, through the remainder, which is where a fourth
+    // column left unsummed would go unnoticed longest.
+    let live_blocks = parse(&text)
+        .get("outsideRegions")
+        .and_then(|outside| outside.get("currBlocks"))
+        .and_then(Value::as_u64)
+        .expect("the remainder carries its live blocks");
+    let at = text.find(r#""outsideRegions":"#).expect("outsideRegions");
+    let (before, after) = text.split_at(at);
+    let damaged = format!(
+        "{before}{}",
+        replacing(
+            after,
+            &format!(r#""currBlocks":{live_blocks}}}"#),
+            &format!(r#""currBlocks":{}}}"#, live_blocks + 1),
+        )
+    );
+    // The fixture's region holds nothing live, so the sum is the remainder's.
+    rejects(
+        &native::problems(&damaged),
+        &format!(
+            "region rows and `outsideRegions` account for {} `currBlocks`",
+            live_blocks + 1
+        ),
+    );
 }
 
 /// A row's peak is a share of the run's, not a quantity beside it. This is the

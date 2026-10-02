@@ -461,6 +461,43 @@ const HEAPSCOPE = (function () {
     return { observed: observed, estimated: estimated, error: (estimated - observed) / observed };
   }
 
+  /// What the Regions tab says, decided here rather than while drawing it so
+  /// the headless check can read the decision: the note above the table, and
+  /// the row for what no region covered, or `null` where there is none.
+  ///
+  /// That row is its own key in the profile, `outsideRegions`, rather than an
+  /// entry of `regions`, because it is not a region: it has no name, no
+  /// entries and no peak. It is written in every run, so whether to show it
+  /// is decided by whether there are regions for it to complete — a run that
+  /// used none gets neither the row nor a sentence about it. A profile from
+  /// before the key existed lacks it, and the table is the regions alone, as
+  /// it always was.
+  ///
+  /// Mode-neutral wording, because an ad hoc or copy run records events, not
+  /// allocations, and has no live column to promise a sum for.
+  function regionSummary(profile) {
+    const regions = profile.regions || [];
+    const outside = profile.outsideRegions || null;
+    const lifetimes = Boolean(profile.totals && profile.totals.maxBytes !== undefined);
+    let note = "Phases of the run, marked by the program itself."
+      + " What a thread records belongs to the innermost region open on it at the time, and only to that one.";
+    if (regions.length === 0) {
+      return { note: note, remainder: null };
+    }
+    if (!outside) {
+      note += " These rows do not sum to the totals: what was recorded outside every region belongs to none of them.";
+      return { note: note, remainder: null };
+    }
+    note += " The last row is what was recorded with no region open, so the Total and Blocks columns"
+      + (lifetimes ? ", and the two at-end columns," : "")
+      + " each sum to the run's own, unless a banner above says otherwise.";
+    if (lifetimes) {
+      note += " Peaks do not: each region's is its own, reached at its own moment,"
+        + " and the last row has none because it is the remainder rather than a row the profiler kept.";
+    }
+    return { note: note, remainder: outside };
+  }
+
   /// Everything the run wants a reader warned about, in the order a reader
   /// should care. Each is a fact the profile states about itself; none is
   /// inferred.
@@ -540,6 +577,7 @@ const HEAPSCOPE = (function () {
     formatCount: formatCount,
     makeAmountFormatter: makeAmountFormatter,
     pointTotals: pointTotals,
+    regionSummary: regionSummary,
     samplingAccuracy: samplingAccuracy,
     shortenNames: shortenNames,
     sortTree: sortTree,
@@ -876,24 +914,14 @@ if (typeof document !== "undefined") {
     // Regions.
     const regionsPanel = document.getElementById("panel-regions");
     regionsPanel.appendChild(element("h2", null, "Regions"));
-    // What was recorded with no region open. Its own key rather than an entry
-    // of `regions`, because it is not a region: it has no name, no entries and
-    // no peak. A profile from before the key existed simply lacks it, and the
-    // table is then the regions alone, as it always was.
-    const outside = profile.outsideRegions;
-    regionsPanel.appendChild(element("p", "note",
-      "Phases of the run, marked by the program itself. An allocation belongs to the innermost region open on the thread that made it, and only to that one."
-      + (outside
-        ? (lifetimes
-          ? " The last row is what was allocated with no region open, so the totals, the block counts and what was live at the end each sum to the run's own."
-            + " Peaks do not: each region's is its own, reached at its own moment, and the last row has none because it is the remainder rather than a row the profiler kept."
-          : " The last row is what was recorded with no region open, so the totals and the counts each sum to the run's own.")
-        : " These do not sum to the totals: an allocation made outside every region belongs to no row.")));
+    const regionView = HEAPSCOPE.regionSummary(profile);
+    regionsPanel.appendChild(element("p", "note", regionView.note));
     const regions = profile.regions || [];
     if (regions.length === 0) {
       regionsPanel.appendChild(element("div", "empty", "This run used no regions."));
     } else {
       const footer = [];
+      const outside = regionView.remainder;
       if (outside) {
         const cells = [
           amount(outside.totalBytes || 0),
