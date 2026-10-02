@@ -1225,3 +1225,47 @@ fn concurrent_threads_agree_with_the_reference_tracker() {
         "the engine and the model disagree on how many program points exist"
     );
 }
+
+/// A program's allocator keeps handing out addresses it has not used before,
+/// for as long as the program runs, and the live table has to keep tracking
+/// them with no more than a few live at once.
+///
+/// This is the shape that once stopped a run being recorded. A removal left a
+/// tombstone, which only an insertion landing on it reclaimed, while every
+/// insertion that landed on an empty slot used one up; so the empty slots only
+/// ever decreased, and a table at its ceiling, unable to clear its tombstones
+/// by growing, refused every new block with a handful live. On a loaded CI
+/// runner, a test whose workers churned a few million distinct addresses saw
+/// about 2.2 million blocks dropped with a few hundred live. A table sized for
+/// 1,024 blocks makes the same thing happen within a few thousand.
+///
+/// Through the engine rather than the table alone, because what a program
+/// sees is the engine's counters: a refused block is missing from the live
+/// figures and the totals, and counted in `dropped_blocks`.
+#[test]
+fn churning_distinct_addresses_never_fills_the_live_table() {
+    #[cfg(miri)]
+    const ALLOCATIONS: usize = 3_000;
+    #[cfg(not(miri))]
+    const ALLOCATIONS: usize = 200_000;
+    /// Blocks live at any time. Far below the 1,024 the table is sized for.
+    const LIVE: usize = 8;
+    const SIZE: usize = 48;
+
+    let engine = Engine::with_limits(1 << 14, 1 << 10);
+    assert!(engine.start(TimeSource::Events, || {}));
+    let frames = frames_for(0);
+    let address = |i: usize| 0x7_0000_0000usize + i * 64;
+    for i in 0..ALLOCATIONS {
+        guarded_alloc(&engine, address(i), Shape::of(SIZE), &frames);
+        if i >= LIVE {
+            engine.record_free(address(i - LIVE), SIZE);
+        }
+    }
+
+    let stats = engine.stats();
+    assert_eq!(stats.dropped_blocks, 0, "the live table refused blocks");
+    assert_eq!(stats.total_blocks, ALLOCATIONS as u64);
+    assert_eq!(stats.curr_blocks, LIVE as u64);
+    assert_eq!(stats.curr_bytes, (LIVE * SIZE) as u64);
+}

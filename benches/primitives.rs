@@ -25,7 +25,10 @@
 use std::time::Duration;
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use heapscope::internals::arena::Arena;
+use heapscope::internals::live::{LiveBlock, LiveBlocks};
 use heapscope::internals::lock::RawLock;
+use heapscope::internals::pp::PpId;
 
 /// Uncontended acquire/release.
 ///
@@ -58,5 +61,39 @@ fn uncontended_lock(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, uncontended_lock);
+/// One free and one allocation against the live-block table, at a steady
+/// population: the pair a program that churns pays for every allocation.
+///
+/// Addresses are recycled from a ring twice the live population, as an
+/// allocator recycles freed blocks, so the table settles at a fixed size and a
+/// run of any length measures the same thing. With addresses that never
+/// repeat, a table that leaked capacity on removal would reach its ceiling
+/// partway through and start refusing inserts, which is cheaper than
+/// accepting them and would read as a speed-up.
+fn live_table_churn(c: &mut Criterion) {
+    const LIVE: usize = 4_096;
+    const RING: usize = 2 * LIVE;
+    let address = |i: usize| 0x6000_0000_0000 + (i % RING) * 48;
+    let block = LiveBlock::unattributed(0, PpId::OVERFLOW);
+
+    let mut group = c.benchmark_group("live_table");
+    group.measurement_time(Duration::from_secs(3));
+
+    let arena = Arena::new();
+    let table = LiveBlocks::new();
+    for i in 0..LIVE {
+        assert!(table.insert(&arena, address(i), block));
+    }
+    let mut next = LIVE;
+    group.bench_function("remove_then_insert_steady", |b| {
+        b.iter(|| {
+            black_box(table.remove(address(next - LIVE)));
+            black_box(table.insert(&arena, address(next), block));
+            next += 1;
+        });
+    });
+    group.finish();
+}
+
+criterion_group!(benches, uncontended_lock, live_table_churn);
 criterion_main!(benches);
