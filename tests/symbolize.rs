@@ -32,6 +32,11 @@ static ALLOC: heapscope::Alloc = heapscope::Alloc::system();
 /// The binary under test, as Cargo built it.
 const SYMBOLIZE: &str = env!("CARGO_BIN_EXE_heapscope-symbolize");
 
+/// How many blocks the function below allocates, and how large each is. Named
+/// so that the folded check can find the stack these blocks are charged to.
+const BLOCKS: usize = 64;
+const BLOCK_SIZE: usize = 4096;
+
 /// The function whose name has to come back. `#[inline(never)]` so that it is a
 /// frame at all, and named distinctly enough that finding it in the output is
 /// not an accident.
@@ -39,8 +44,8 @@ const SYMBOLIZE: &str = env!("CARGO_BIN_EXE_heapscope-symbolize");
 fn allocate_from_a_function_with_a_findable_name(count: usize) -> Vec<Vec<u8>> {
     let mut kept = Vec::with_capacity(count);
     for _ in 0..count {
-        let mut block: Vec<u8> = Vec::with_capacity(4096);
-        block.resize(4096, 0x5A);
+        let mut block: Vec<u8> = Vec::with_capacity(BLOCK_SIZE);
+        block.resize(BLOCK_SIZE, 0x5A);
         kept.push(black_box(block));
     }
     kept
@@ -97,8 +102,8 @@ fn a_recorded_profile_resolves_to_the_function_that_allocated() {
             .trim_frames(false)
             .build()
             .expect("the profiler starts");
-        let kept = allocate_from_a_function_with_a_findable_name(64);
-        assert_eq!(kept.len(), 64);
+        let kept = allocate_from_a_function_with_a_findable_name(BLOCKS);
+        assert_eq!(kept.len(), BLOCKS);
         drop(profiler);
     }
 
@@ -224,6 +229,24 @@ fn a_folded_rendering_carries_the_resolved_names(recorded: &Path) {
         "the folded output does not name the function that allocated:\n{folded}"
     );
 
+    // And it names it on the stack the blocks are charged to, not merely
+    // somewhere. Trimming and naming a frame by an inlined function can each
+    // remove a program's own frame from a stack while the name survives on
+    // another one, which the check above cannot tell apart.
+    let blocks = (BLOCKS * BLOCK_SIZE).to_string();
+    let charged = folded
+        .lines()
+        .find(|line| {
+            line.rsplit_once(' ')
+                .is_some_and(|(_, count)| count == blocks)
+        })
+        .unwrap_or_else(|| panic!("no stack carries the {blocks} bytes of blocks:\n{folded}"));
+    assert!(
+        charged.contains("allocate_from_a_function_with_a_findable_name"),
+        "the stack the blocks are charged to does not name the function that \
+         allocated them: {charged}"
+    );
+
     // Trimming reads names, so it can only happen once they exist. That is the
     // gain this tool buys on a platform where nothing is named at record time,
     // and it is checked two ways because a single one would pass vacuously.
@@ -232,6 +255,17 @@ fn a_folded_rendering_carries_the_resolved_names(recorded: &Path) {
     // is where a program decided to allocate and stays; the `RawVec`,
     // `alloc::alloc` and `__rust_alloc` frames beneath it are the same on every
     // stack in the process and go.
+    //
+    // Searched for anywhere in the frame rather than where its name starts, and
+    // that is deliberate. A frame resolved at the instruction *after* the
+    // allocator call names whatever the compiler inlined there, and then the
+    // machinery shows only in the generic arguments:
+    // `<core::result::Result<…>>::map_err::<…, <alloc::raw_vec::RawVecInner>::finish_grow::{closure#0}>`
+    // is what that looked like **[measured, Linux]**. The one spelling exempted
+    // is Windows': its debug information names an inlined function with the
+    // default allocator written out as a generic argument,
+    // `alloc::vec::Vec<u8,alloc::alloc::Global>::with_capacity_in`, so every
+    // inlined `Vec` method mentions the path it is not on **[measured]**.
     for line in folded.lines() {
         let innermost = line
             .rsplit_once(' ')
@@ -240,10 +274,17 @@ fn a_folded_rendering_carries_the_resolved_names(recorded: &Path) {
             .rsplit(';')
             .next()
             .expect("a frame");
-        for machinery in ["__rust_alloc", "alloc::alloc::", "alloc::raw_vec"] {
+        let without_allocator_argument = innermost.replace(",alloc::alloc::Global", "");
+        for machinery in [
+            "__rust_alloc",
+            "__rust_realloc",
+            "alloc::alloc::",
+            "alloc::raw_vec",
+        ] {
             assert!(
-                !innermost.contains(machinery),
-                "a stack still ends in the allocation path: {innermost}"
+                !without_allocator_argument.contains(machinery),
+                "a stack still ends in the allocation path: {innermost}\n\
+                 the whole stack, outermost first: {line}"
             );
         }
     }

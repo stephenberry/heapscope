@@ -18,6 +18,19 @@
 //! against a build with symbols, on any machine. In-process `dladdr` arrives
 //! later as a convenience layer on top, not as the foundation.
 //!
+//! # Every lookup is at the call, not the return address
+//!
+//! A recorded frame is where execution would *resume*: the instruction after a
+//! call, which belongs to whatever the compiler placed next. Across inlining that
+//! is routinely another function, and at the end of a function that never
+//! returns it is the next function in the image. So everything that asks what a
+//! frame *is* — which image holds it, which symbol names it — asks about
+//! [`call_site`] instead, one byte earlier, inside the call itself. What is
+//! *written* is still the recorded number: a frame's address, its file address,
+//! and a symbol's offset are all measured from the return address, so the
+//! format's numbers mean exactly what they did and a reader resolving one by
+//! hand starts from what the stack walk saw.
+//!
 //! Once a frame has a name, [`trim`] can tell the frames that are about the
 //! program from the ones every stack has — the allocation path above and the
 //! runtime entry below — and leave the second kind out. That is downstream of
@@ -80,8 +93,97 @@ pub struct Resolved {
 /// 15 arm64, `dladdr((void *)-1)` returns success and names whichever symbol is
 /// last in the main executable, and `(void *)-1` is precisely what a bad stack
 /// walk produces.
+///
+/// Located and named at its [`call_site`]; see the [module
+/// documentation](self). The file address and the symbol offset are still
+/// those of `address` itself.
 pub fn resolve(modules: &[Module], address: usize) -> Resolved {
     resolve_with(modules, address, dynamic::lookup)
+}
+
+/// The address to look up for a recorded frame: one byte before it, inside the
+/// call instruction rather than after it.
+///
+/// Every frame a stack walk records is a return address — the frame-pointer
+/// walk, `backtrace`, and `RtlCaptureStackBackTrace` all report where execution
+/// will *resume* — and that instruction belongs to whatever the compiler placed
+/// after the call. Any byte of the call instruction would name the call, and
+/// the last is the one known without decoding anything, on every
+/// architecture. It is the adjustment the `backtrace` crate makes before
+/// symbolizing, and so `std`'s own backtraces.
+///
+/// Measured on why it matters. `std` ends `RawVecInner::finish_grow` by calling
+/// the allocator and then `map_err` on the result, so the return address lies
+/// in the inlined `map_err`, and offline the frame read as
+/// `<core::result::Result<…>>::map_err` — which trimming rightly does not
+/// recognise as the allocation path. One byte earlier the same frame is
+/// `alloc::alloc::alloc`, inlined through `Global::allocate` into
+/// `finish_grow`. Elsewhere in the same profile a thread's entry frame read as
+/// `core::mem::size_of_val_raw` and a `read_to_end` frame as `Vec::len`
+/// **\[measured, Linux x86_64, rustc 1.98, binutils 2.42\]**.
+///
+/// `heapscope-symbolize` applies the same rule to the profile's numbers, so a
+/// name found in-process and one found offline describe the same instruction.
+///
+/// # The one exception: a frame interrupted by a signal
+///
+/// An allocation made inside a signal handler has a stack that crosses the
+/// signal, and two of its frames are not return addresses. The frame the signal
+/// interrupted is recorded at its program counter, the instruction that had not
+/// yet run; one byte earlier is the instruction before it, and where the
+/// interrupted instruction was a function's first, the end of the previous
+/// function. And the kernel enters the signal trampoline — `__restore_rt` on
+/// glibc — by a return to its first byte, so one byte earlier names whatever
+/// precedes it in the image. The profile format records no marker for a signal
+/// frame, so neither can be told apart from a call; both are looked up as
+/// though they were one. Only stacks that cross a signal handler are affected,
+/// and allocating in one is not async-signal-safe to begin with.
+///
+/// `None` for zero, which no stack walk records as a return address.
+///
+/// <div class="warning">
+///
+/// `#[doc(hidden)]` and **not part of the supported surface**. It is public
+/// only so that `heapscope-symbolize` applies this rule rather than a copy of it.
+///
+/// </div>
+#[doc(hidden)]
+pub fn call_site(return_address: u64) -> Option<u64> {
+    return_address.checked_sub(1)
+}
+
+/// [`call_site`] for an address of this process.
+fn call_site_of(return_address: usize) -> Option<usize> {
+    // Lossless both ways: the result is no larger than the argument, which
+    // was a `usize`.
+    call_site(return_address as u64).map(|at| at as usize)
+}
+
+/// Which image a recorded frame is in, and its file address there.
+///
+/// The image is the one holding the [`call_site`]: a return address one past
+/// the end of an image's code belongs to that image, whose last instruction
+/// made the call, and one at an image's first byte does not. The file address
+/// is the return address's own, translated, because that is what the format
+/// records.
+fn locate(modules: &[Module], address: usize) -> Option<(usize, usize)> {
+    let call = call_site_of(address)?;
+    let at = modules::index_containing(modules, call)?;
+    let file_address = modules[at].file_address(call)? + (address - call);
+    Some((at, file_address))
+}
+
+/// Names the call a recorded frame made, with the offset of the frame itself.
+///
+/// The symbol is the one holding the [`call_site`]. The offset is measured from
+/// the return address, so a rendered `name+0x24` and a native `symbolOffset`
+/// still say how far the *recorded* address is past the symbol: the offset
+/// `lookup` reported, plus the byte stepped back.
+fn name_call(lookup: fn(usize) -> Option<Symbol>, address: usize) -> Option<Symbol> {
+    let call = call_site_of(address)?;
+    let mut symbol = lookup(call)?;
+    symbol.offset += address - call;
+    Some(symbol)
 }
 
 /// Resolves using `lookup` instead of asking the platform. Testing hook.
@@ -97,13 +199,13 @@ fn resolve_with(
     address: usize,
     lookup: fn(usize) -> Option<Symbol>,
 ) -> Resolved {
-    let Some(module) = modules::index_containing(modules, address) else {
+    let Some((module, file_address)) = locate(modules, address) else {
         return Resolved::default();
     };
     Resolved {
         module: Some(module),
-        file_address: modules[module].file_address(address),
-        symbol: lookup(address),
+        file_address: Some(file_address),
+        symbol: name_call(lookup, address),
     }
 }
 
@@ -140,25 +242,22 @@ impl<'a> ModuleOffsets<'a> {
 impl FrameFormat for ModuleOffsets<'_> {
     fn format(&self, address: usize, out: &mut String) {
         crate::output::RawAddresses.format(address, out);
-        push_image(modules::containing(self.modules, address), address, out);
+        push_image(self.modules, address, out);
     }
 }
 
-/// Appends ` (path+0xfileaddress)` for `module`, or nothing.
+/// Appends ` (path+0xfileaddress)` for the image `address` is in, or nothing.
 ///
 /// Shared by both renderers, because the part of a frame that says *which file
 /// to resolve against* is the part that has to be there whether or not a name
 /// was found — it is what makes the frame answerable later, by a different tool,
 /// on a different machine.
-fn push_image(module: Option<&Module>, address: usize, out: &mut String) {
-    let Some(module) = module else {
-        return;
-    };
-    let Some(file_address) = module.file_address(address) else {
+fn push_image(modules: &[Module], address: usize, out: &mut String) {
+    let Some((module, file_address)) = locate(modules, address) else {
         return;
     };
     out.push_str(" (");
-    out.push_str(&module.path);
+    out.push_str(&modules[module].path);
     out.push('+');
     crate::output::push_hex(out, file_address);
     out.push(')');
@@ -258,8 +357,7 @@ impl<'a> Symbolized<'a> {
         // named it. A profile with no module map cannot be resolved offline
         // either, so it is already the degraded case — and a special rule that
         // fires only in a degraded state is a rule nothing routinely exercises.
-        let module = modules::containing(self.modules, address);
-        let symbol = module.and_then(|_| (self.lookup)(address));
+        let symbol = locate(self.modules, address).and_then(|_| name_call(self.lookup, address));
 
         match symbol {
             Some(symbol) => {
@@ -292,7 +390,7 @@ impl<'a> Symbolized<'a> {
             None => out.push_str("???"),
         }
 
-        push_image(module, address, &mut out);
+        push_image(self.modules, address, &mut out);
         out.into_boxed_str()
     }
 }
@@ -354,11 +452,27 @@ mod tests {
     }
 
     #[test]
-    fn the_first_byte_of_an_image_has_a_zero_offset() {
+    fn a_lookup_is_at_the_call_rather_than_where_it_returns() {
+        assert_eq!(call_site(0x1c3ca0), Some(0x1c3c9f));
+        assert_eq!(call_site(0), None, "zero is no return address");
+    }
+
+    /// An image is chosen by the call a frame made, not by where it returns
+    /// to. A return address one past the end of an image's code is that image's
+    /// last instruction calling out, and one at its first byte is a call made
+    /// from whatever precedes it.
+    #[test]
+    fn a_frame_belongs_to_the_image_that_made_the_call() {
         let modules = vec![module("/bin/program", 0x1000, 0x1000)];
         assert_eq!(
-            render(&modules, 0x1000),
-            "0x1000: ??? (/bin/program+0x1000)"
+            render(&modules, 0x2000),
+            "0x2000: ??? (/bin/program+0x2000)"
+        );
+        assert_eq!(render(&modules, 0x1000), "0x1000: ???");
+        // The file address is the recorded one's, not the call's.
+        assert_eq!(
+            render(&modules, 0x1001),
+            "0x1001: ??? (/bin/program+0x1001)"
         );
     }
 
@@ -396,24 +510,19 @@ mod tests {
     // and no set at all on a stripped one; `dynamic.rs` tests the platform call
     // itself.
 
-    /// Names two addresses and refuses everything else, so that one renderer
-    /// covers the found and not-found paths in the same profile.
+    /// A symbol table of two functions, `core::fmt::write` at `0x1000` and a
+    /// C function at `0x1020`, and nothing from `0x1028` on, so that one
+    /// renderer covers the found and not-found paths in the same profile.
     fn fake_lookup(address: usize) -> Option<Symbol> {
-        match address {
-            0x1000 => Some(Symbol {
-                name: String::from("_ZN4core3fmt5write17hb1f9a4a7f2f1a0c9E"),
-                offset: 0,
-            }),
-            0x1010 => Some(Symbol {
-                name: String::from("_ZN4core3fmt5write17hb1f9a4a7f2f1a0c9E"),
-                offset: 0x10,
-            }),
-            0x1020 => Some(Symbol {
-                name: String::from("a_c_function_no_demangler_will_touch"),
-                offset: 4,
-            }),
-            _ => None,
-        }
+        let (name, start) = match address {
+            0x1000..0x1020 => ("_ZN4core3fmt5write17hb1f9a4a7f2f1a0c9E", 0x1000),
+            0x1020..0x1028 => ("a_c_function_no_demangler_will_touch", 0x1020),
+            _ => return None,
+        };
+        Some(Symbol {
+            name: String::from(name),
+            offset: address - start,
+        })
     }
 
     fn symbolize(modules: &[Module], address: usize) -> String {
@@ -426,8 +535,20 @@ mod tests {
     fn a_named_address_is_rendered_with_the_demangled_name() {
         let modules = vec![module("/bin/program", 0x1000, 0x1000)];
         assert_eq!(
-            symbolize(&modules, 0x1000),
-            "0x1000: core::fmt::write (/bin/program+0x1000)"
+            symbolize(&modules, 0x1004),
+            "0x1004: core::fmt::write+0x4 (/bin/program+0x1004)"
+        );
+    }
+
+    /// Named by the call, so a call that is the last instruction of one
+    /// function is not credited to the next one, which is where it returns to.
+    /// The offset is still the recorded address's.
+    #[test]
+    fn a_frame_is_named_by_the_function_that_made_the_call() {
+        let modules = vec![module("/bin/program", 0x1000, 0x1000)];
+        assert_eq!(
+            symbolize(&modules, 0x1020),
+            "0x1020: core::fmt::write+0x20 (/bin/program+0x1020)"
         );
     }
 
@@ -448,8 +569,8 @@ mod tests {
     fn a_name_no_demangler_understands_is_printed_as_the_linker_wrote_it() {
         let modules = vec![module("/bin/program", 0x1000, 0x1000)];
         assert_eq!(
-            symbolize(&modules, 0x1020),
-            "0x1020: a_c_function_no_demangler_will_touch+0x4 (/bin/program+0x1020)"
+            symbolize(&modules, 0x1024),
+            "0x1024: a_c_function_no_demangler_will_touch+0x4 (/bin/program+0x1024)"
         );
     }
 
@@ -475,7 +596,7 @@ mod tests {
     #[test]
     fn the_image_and_file_offset_are_kept_whether_or_not_a_name_was_found() {
         let modules = vec![module("/bin/program", 0x1000, 0x1000)];
-        for address in [0x1000, 0x1010, 0x1020, 0x1030] {
+        for address in [0x1004, 0x1010, 0x1024, 0x1030] {
             let symbolized = symbolize(&modules, address);
             let bare = render(&modules, address);
             let (runtime_address, image) = bare
@@ -517,7 +638,7 @@ mod tests {
         let modules = vec![module("/bin/program", 0x1000, 0x1000)];
         let format = Symbolized::with_lookup(&modules, credulous_lookup);
 
-        for address in [0, 1, 0x999, 0x2000, usize::MAX] {
+        for address in [0, 1, 0x999, 0x1000, 0x2001, usize::MAX] {
             let mut out = String::new();
             format.format(address, &mut out);
             assert!(
@@ -535,7 +656,7 @@ mod tests {
         format.format(0x1500, &mut inside);
         assert_eq!(
             inside,
-            "0x1500: a_name_for_0x1500+0x20 (/bin/program+0x1500)"
+            "0x1500: a_name_for_0x14ff+0x21 (/bin/program+0x1500)"
         );
     }
 
@@ -551,7 +672,7 @@ mod tests {
     fn resolving_an_address_outside_every_image_asks_the_platform_nothing() {
         let modules = vec![module("/bin/program", 0x1000, 0x1000)];
 
-        for address in [0, 1, 0x999, 0x2000, usize::MAX] {
+        for address in [0, 1, 0x999, 0x1000, 0x2001, usize::MAX] {
             let resolved = resolve_with(&modules, address, credulous_lookup);
             assert_eq!(
                 resolved,
@@ -566,8 +687,12 @@ mod tests {
         assert_eq!(inside.module, Some(0));
         assert_eq!(inside.file_address, Some(0x1500));
         assert_eq!(
-            inside.symbol.map(|symbol| symbol.name),
-            Some(String::from("a_name_for_0x1500"))
+            inside.symbol,
+            Some(Symbol {
+                name: String::from("a_name_for_0x14ff"),
+                offset: 0x21,
+            }),
+            "named at the call, with the offset of the recorded address"
         );
     }
 
@@ -611,10 +736,10 @@ mod tests {
         let format = Symbolized::with_lookup(&modules, counting_lookup);
 
         let mut first = String::new();
-        format.format(0x1000, &mut first);
+        format.format(0x1004, &mut first);
         for _ in 0..32 {
             let mut again = String::new();
-            format.format(0x1000, &mut again);
+            format.format(0x1004, &mut again);
             assert_eq!(again, first);
         }
         // The address that resolves to nothing is worth caching too: it is the
@@ -638,14 +763,14 @@ mod tests {
         let modules = vec![module("/bin/program", 0x1000, 0x1000)];
         let format = Symbolized::with_lookup(&modules, fake_lookup);
         let mut out = String::from("before ");
-        format.format(0x1000, &mut out);
+        format.format(0x1004, &mut out);
         // Twice, because the second call takes the cached path, which is a
         // different line of code and just as able to get this wrong.
-        format.format(0x1000, &mut out);
+        format.format(0x1004, &mut out);
         assert_eq!(
             out,
-            "before 0x1000: core::fmt::write (/bin/program+0x1000)\
-             0x1000: core::fmt::write (/bin/program+0x1000)"
+            "before 0x1004: core::fmt::write+0x4 (/bin/program+0x1004)\
+             0x1004: core::fmt::write+0x4 (/bin/program+0x1004)"
         );
     }
 }
