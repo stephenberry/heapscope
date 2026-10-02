@@ -12,14 +12,19 @@ use std::collections::BTreeMap;
 use crate::json::{self, Value};
 use crate::tool::Resolution;
 
-/// The format this tool reads, and the only version of it that exists.
+/// The format this tool reads, and the versions of it this tool knows.
 ///
 /// Refused rather than attempted on anything else, which is the second half of
 /// the compatibility rule every profile states about itself: *ignore unknown
 /// fields; refuse an unknown `formatVersion`*. A tool that tried anyway would be
 /// writing frame indices into a file whose frame table may mean something else.
+///
+/// Version 2 is a run whose counts were restarted, which changes what its
+/// totals cover and nothing about its frames, modules or addresses: the only
+/// parts of the file this tool reads or writes. So it is known here, and read
+/// exactly as version 1 is.
 const FORMAT: &str = "heapscope-profile";
-const FORMAT_VERSION: u64 = 1;
+const FORMAT_VERSIONS: std::ops::RangeInclusive<u64> = 1..=2;
 
 /// One image, as the module map recorded it.
 #[derive(Clone, Debug)]
@@ -73,11 +78,13 @@ impl Profile {
         }
 
         match root.get("formatVersion").and_then(Value::as_u64) {
-            Some(FORMAT_VERSION) => {}
+            Some(version) if FORMAT_VERSIONS.contains(&version) => {}
             Some(other) => {
                 return Err(format!(
-                    "formatVersion {other}, and this tool knows version {FORMAT_VERSION}. \
-                     A profile says a reader must refuse a version it does not know"
+                    "formatVersion {other}, and this tool knows versions {} to {}. \
+                     A profile says a reader must refuse a version it does not know",
+                    FORMAT_VERSIONS.start(),
+                    FORMAT_VERSIONS.end()
                 ))
             }
             None => return Err(String::from("no `formatVersion`")),
@@ -694,6 +701,21 @@ mod tests {
         let error = Profile::parse(r#"{"format":"heapscope-profile","formatVersion":99}"#)
             .expect_err("refused");
         assert!(error.contains("99"), "{error}");
+    }
+
+    /// Version 2 is a restarted run, and nothing this tool does depends on what
+    /// the totals cover, so it is read like version 1 rather than refused.
+    #[test]
+    fn a_restarted_run_is_read_like_any_other() {
+        let restarted = a_profile().replace(r#""formatVersion":1"#, r#""formatVersion":2"#);
+        assert_ne!(
+            restarted,
+            a_profile(),
+            "the fixture has a version to change"
+        );
+        let mut profile = Profile::parse(&restarted).expect("a version 2 profile");
+        profile.resolve_frame(0, &resolution("program::churn"));
+        assert!(profile.to_json().contains(r#""formatVersion":2"#));
     }
 
     /// **The property.** Everything this tool did not set is still there, in

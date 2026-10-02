@@ -48,4 +48,17 @@ The file is a handful of `key value` lines, recorded by running with `HEAPSCOPE_
 
 One constraint worth knowing before you write the second such test: there is one profiler per process, and it measures the whole process for as long as it is alive. `cargo test` runs a binary's tests concurrently, so budgets belong in an integration test of their own containing one `#[test]`.
 
+**A budget for the steady state, without the warm-up.** `Profiler::reset` restarts the counts and keeps what is live, so a bare `assert_max_bytes!` after it measures the peak *since the reset*: how high the work climbed on top of what setup left behind, with setup's own transient peak forgotten. That is usually the budget that was meant, and it needs no mark:
+
+```rust
+let profiler = heapscope::Profiler::builder().no_output().build().unwrap();
+let cache = build_cache();          // setup, left out of the budget
+profiler.reset().unwrap();
+
+serve(REQUESTS);
+heapscope::assert_max_bytes!(cache_bytes + 64 * 1024);
+```
+
+The peak starts again from what is live, so the budget includes what the warm-up left live. A mark read before the reset is from another window, with totals and a peak that nothing read afterwards can be compared with, so every `since: mark` assertion refuses one rather than subtracting it, and says to read the mark after the reset. `HeapStats::resets` counts the resets a reading has seen, for code doing its own arithmetic between two readings.
+
 Sampled runs are refused here rather than accommodated. [Every figure a sampled run produces is an estimate](performance.md#paying-less-on-purpose), including the peak, and comparing a budget against a draw from a distribution is a flaky test wearing a threshold.

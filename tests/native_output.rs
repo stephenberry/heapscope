@@ -23,7 +23,7 @@ mod support;
 
 use heapscope::internals::shape::{Shape, Shapes};
 use heapscope::output::{
-    PointKind, ProgramPoint, RegionStats, Snapshot, TableUsage, TallyStats, ThreadStats,
+    PointKind, ProgramPoint, RegionStats, Reset, Snapshot, TableUsage, TallyStats, ThreadStats,
 };
 use heapscope::symbol::modules::Module;
 use heapscope::Mode;
@@ -868,6 +868,95 @@ fn the_validator_rejects_points_that_do_not_sum_to_the_totals() {
             )
         }),
         "the totals say",
+    );
+}
+
+/// A point that peaked on blocks it allocated before a restart, which is the
+/// shape a restart gives a point that holds a warm-up's cache.
+fn restarted(at: u64) -> Snapshot {
+    let mut snapshot = snapshot(vec![point(&[0x1500], 4096, 8), point(&[0x4500], 512, 1)]);
+    snapshot.points[0].counters.max_bytes = 3 * 4096;
+    let mut reset = Reset::default();
+    reset.count = 1;
+    reset.at = at;
+    reset.carried_bytes = 2 * 4096;
+    reset.carried_blocks = 2;
+    snapshot.reset = Some(reset);
+    snapshot
+}
+
+/// After a restart a point can have held more than it allocated, because the
+/// window's totals leave out what it carried into the window. The file says so,
+/// and saying so is the only thing that makes the shape acceptable.
+#[test]
+fn a_restarted_profile_may_hold_what_its_window_did_not_allocate() {
+    let text = emit(&restarted(0));
+    native::assert_valid(&text);
+    assert!(text.contains(r#""formatVersion":2"#), "{text}");
+
+    rejects(
+        &damaged_by(&text, |t| {
+            let undeclared = replacing(t, r#""formatVersion":2"#, r#""formatVersion":1"#);
+            // From the comma before the key to the brace that closes it, so
+            // the object it leaves behind is still JSON.
+            let key = undeclared
+                .find(r#""reset":{"#)
+                .expect("the restart is declared");
+            let start = undeclared[..key].rfind(',').expect("after another field");
+            let end = key + undeclared[key..].find('}').expect("and closed") + 1;
+            format!("{}{}", &undeclared[..start], &undeclared[end..])
+        }),
+        "having only ever allocated",
+    );
+}
+
+/// The version and the declaration travel together, both ways: a reader that
+/// predates restarts must refuse exactly the files it would misread.
+#[test]
+fn the_validator_rejects_a_version_that_disagrees_with_the_restart() {
+    let text = emit(&restarted(0));
+    rejects(
+        &damaged_by(&text, |t| {
+            replacing(t, r#""formatVersion":2"#, r#""formatVersion":1"#)
+        }),
+        "the file says version 1",
+    );
+
+    let never = emit(&snapshot(vec![point(&[0x1500], 4096, 8)]));
+    rejects(
+        &damaged_by(&never, |t| {
+            replacing(t, r#""formatVersion":1"#, r#""formatVersion":2"#)
+        }),
+        "declares no restart",
+    );
+}
+
+/// The restart is an instant on the run's time axis, and the window it opens
+/// is where the peak was found.
+#[test]
+fn the_validator_rejects_a_restart_outside_the_window_it_opens() {
+    let snapshot = restarted(0);
+    let text = emit(&snapshot);
+    let after_end = format!(r#""reset":{{"count":1,"at":{}"#, snapshot.time_at_end + 1);
+    rejects(
+        &damaged_by(&text, |t| {
+            replacing(t, r#""reset":{"count":1,"at":0"#, &after_end)
+        }),
+        "after the run ended",
+    );
+    rejects(
+        &damaged_by(&text, |t| {
+            replacing(t, r#""reset":{"count":1,"#, r#""reset":{"count":0,"#)
+        }),
+        "counts no restart",
+    );
+    let peak = snapshot.stats.time_at_max;
+    let after_peak = format!(r#""reset":{{"count":1,"at":{}"#, peak + 1);
+    rejects(
+        &damaged_by(&text, |t| {
+            replacing(t, r#""reset":{"count":1,"at":0"#, &after_peak)
+        }),
+        "before the restart",
     );
 }
 

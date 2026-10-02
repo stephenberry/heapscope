@@ -40,4 +40,11 @@ for mode in heap ad-hoc copy; do
   pages+=("tmp/viewer-check/$mode.html")
 done
 
+# And one whose counts were restarted, which is version 2 of the format and
+# carries a warning the others must not.
+echo "recording a restarted heap profile"
+cargo run --locked --release --quiet --example profile_a_program \
+  "tmp/viewer-check/restarted.json" heap restart > /dev/null
+pages+=("tmp/viewer-check/restarted.html")
+
 node ci/check-bundled-viewer.mjs "${pages[@]}"

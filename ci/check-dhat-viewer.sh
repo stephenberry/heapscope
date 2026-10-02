@@ -74,3 +74,15 @@ for mode in heap ad-hoc copy; do
   echo "loading it in dh_view.js"
   node ci/dhat-viewer-check.mjs "$viewer" "$profile"
 done
+
+# A run whose counts were restarted: points that hold what they did not
+# allocate in the window, and a note in `cmd` that the viewer has to display.
+profile="tmp/viewer-check/restarted.json"
+echo "recording a restarted heap profile"
+cargo run --locked --release --quiet --example profile_a_program "$profile" heap restart > /dev/null
+if ! grep -q "counts restarted by Profiler::reset" "$profile"; then
+  echo "error: the restarted profile does not say it was restarted" >&2
+  exit 1
+fi
+echo "loading it in dh_view.js"
+node ci/dhat-viewer-check.mjs "$viewer" "$profile"

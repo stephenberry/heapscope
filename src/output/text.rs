@@ -97,6 +97,30 @@ pub(super) fn write<W: Write>(
             snapshot.time_source.unit_long()
         )?;
     }
+    // Before any figure, because it changes what every figure below means: the
+    // totals, the peak and the lifetimes are the window's, and the live figures
+    // still include what the window inherited.
+    if let Some(reset) = &snapshot.reset {
+        let times = if reset.count > 1 {
+            format!(", the last of {} restarts", count(reset.count))
+        } else {
+            String::new()
+        };
+        writeln!(
+            out,
+            "  restarted  at {} {}{times}; totals, peaks and lifetimes cover what followed",
+            count(reset.at),
+            snapshot.time_source.unit_long()
+        )?;
+        if lifetimes {
+            writeln!(
+                out,
+                "  carried    {} in {} {per_count} live at the restart, counted as live and not as {verb}",
+                amount(reset.carried_bytes),
+                count(reset.carried_blocks)
+            )?;
+        }
+    }
     writeln!(out)?;
     writeln!(
         out,
@@ -697,6 +721,41 @@ mod tests {
         write(snapshot, &RawAddresses, &mut buffer, top, ranking)
             .expect("writing to a Vec cannot fail");
         String::from_utf8(buffer).expect("valid UTF-8")
+    }
+
+    /// The restart comes before every figure, because it changes what each one
+    /// means, and a run never restarted does not mention one.
+    #[test]
+    fn a_restarted_run_says_so_before_any_figure() {
+        let mut restarted = snapshot(vec![point(&[0x10], 4_096)]);
+        restarted.reset = Some(crate::output::Reset {
+            count: 2,
+            at: 400,
+            carried_bytes: 512,
+            carried_blocks: 3,
+            dropped_blocks: 0,
+            epoch: 1,
+        });
+        let text = render(&restarted, 10);
+        let restart = text
+            .find("  restarted  at 400 ")
+            .unwrap_or_else(|| panic!("no restart line in:\n{text}"));
+        assert!(text.contains("the last of 2 restarts"), "{text}");
+        let carried = text
+            .find("  carried    ")
+            .unwrap_or_else(|| panic!("no carried line in:\n{text}"));
+        assert!(
+            text[carried..].contains("in 3 blocks live at the restart"),
+            "{text}"
+        );
+        let first = text
+            .find("  allocated")
+            .unwrap_or_else(|| panic!("no totals in:\n{text}"));
+        assert!(restart < carried && carried < first, "{text}");
+
+        let text = render(&snapshot(vec![point(&[0x10], 4_096)]), 10);
+        assert!(!text.contains("restarted"), "{text}");
+        assert!(!text.contains("carried"), "{text}");
     }
 
     /// This output goes straight to a terminal, which acts on what it is sent.

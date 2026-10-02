@@ -83,7 +83,14 @@ function checkPage(path) {
   check(typeof HEAPSCOPE.buildTree === "function", "the pure half is exported");
   if (typeof HEAPSCOPE.buildTree !== "function") return;
 
-  check(profile.formatVersion === 1, "the profile is a version this viewer knows");
+  // Version 2 exactly when the counts were restarted: the writer says the
+  // version the file needs, so a run never restarted stays readable by a
+  // reader that predates restarts.
+  const restarted = Boolean(profile.run && profile.run.reset);
+  check(
+    profile.formatVersion === (restarted ? 2 : 1),
+    `the profile is version ${profile.formatVersion}, which a ${restarted ? "restarted" : "never restarted"} run does not write`
+  );
   check(
     display.names.length === profile.frames.length,
     `a name per frame (${display.names.length} names, ${profile.frames.length} frames)`
@@ -225,6 +232,10 @@ function checkPage(path) {
   check(
     sampled === warnings.some(function (warning) { return warning.title.startsWith("Sampled run"); }),
     "a sampled run says so, and an unsampled one does not"
+  );
+  check(
+    restarted === warnings.some(function (warning) { return warning.title.startsWith("Counts were restarted"); }),
+    "a restarted run says so, and one never restarted does not"
   );
 
   // Shortening a label is exact: it removes the path the profile itself says

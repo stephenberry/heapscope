@@ -29,6 +29,18 @@
 //! running maximum instead, so our numbers legitimately differ from Valgrind's
 //! for the same program. The profile says so in its own `heapscope` section
 //! rather than leaving it to be discovered.
+//!
+//! # A restarted run, in a format with no version to move
+//!
+//! After [`Profiler::reset`](crate::Profiler::reset) a point's `tb`, `tbk`,
+//! `tl` and `mb` describe the window since the restart while `eb` and `gb` still
+//! count blocks allocated before it, so a point can hold more than it
+//! allocated, and one that allocated nothing in the window is still written
+//! when it holds something, or the `gb` and `eb` columns would stop summing to
+//! the run's. The native format bumps its version for that; this one cannot,
+//! because the viewer accepts exactly one. So the restart is stated twice:
+//! `heapscope.reset` for a tool, and a note appended to `cmd`, which is the one
+//! line of free text `dh_view.html` puts on screen.
 
 use std::collections::HashMap;
 use std::io::{self, Write};
@@ -506,6 +518,7 @@ pub(super) fn write<W: Write>(
     // screening the frame names get.
     let mut command = String::new();
     super::push_display(&mut command, &snapshot.command);
+    push_restart_note(&mut command, snapshot);
     json.field_str("cmd", &command)?;
     json.field_u64("pid", u64::from(snapshot.pid))?;
     json.field_u64("te", snapshot.time_at_end)?;
@@ -562,6 +575,7 @@ pub(super) fn write<W: Write>(
     // to know whether they are comparing like with like.
     json.field_str("unwinder", snapshot.unwinder.as_str())?;
     json.field_str("mbSemantics", "per-program-point running maximum")?;
+    write_reset(&mut json, snapshot)?;
     // What the program asked for, and what the profiler cost, written by the
     // native emitter's own functions rather than by copies of them. PLAN.md
     // section 6.7 says *every* profile carries the self-metrics, and two
@@ -665,6 +679,51 @@ pub(super) fn write<W: Write>(
     json.end_object()?;
     json.finish()?;
     Ok(())
+}
+
+/// Says, in `cmd`, that the counts were restarted.
+///
+/// `cmd` is the one free-text field `dh_view.html` shows, on the line headed
+/// "Command", and the viewer ignores the `heapscope` section entirely. A reader
+/// with only the viewer would otherwise take a restarted run's totals for the
+/// whole run's, and could not tell from the numbers: a site may hold more than
+/// it allocated, and nothing in the viewer says why. So the note goes where the
+/// reader is looking, bracketed and named, so that nobody mistakes it for an
+/// argument. The structured form is in `heapscope.reset`.
+fn push_restart_note(command: &mut String, snapshot: &Snapshot) {
+    use std::fmt::Write as _;
+
+    let Some(reset) = &snapshot.reset else {
+        return;
+    };
+    // Into a `String`, which cannot fail.
+    let _ = write!(
+        command,
+        " [heapscope: counts restarted by Profiler::reset at {} {}; totals, \
+         peaks and lifetimes cover only what followed]",
+        reset.at,
+        snapshot.time_source.unit()
+    );
+}
+
+/// The restart, structured, for tools that read the `heapscope` section.
+///
+/// The same fields the native profile carries in `run.reset`, under this
+/// section's spelling for blocks the table turned away.
+fn write_reset<W: Write>(json: &mut JsonWriter<W>, snapshot: &Snapshot) -> io::Result<()> {
+    let Some(reset) = &snapshot.reset else {
+        return Ok(());
+    };
+    json.key("reset")?;
+    json.begin_object(Layout::Inline)?;
+    json.field_u64("count", reset.count)?;
+    json.field_u64("at", reset.at)?;
+    if snapshot.settings.mode.block_lifetimes() {
+        json.field_u64("carriedBytes", reset.carried_bytes)?;
+        json.field_u64("carriedBlocks", reset.carried_blocks)?;
+    }
+    json.field_u64("droppedBlocks", reset.dropped_blocks)?;
+    json.end_object()
 }
 
 #[cfg(test)]
@@ -1156,6 +1215,42 @@ mod tests {
             assert!(json.contains(&format!("\"{field}\":")), "missing {field}");
         }
         assert!(json.contains("\"dhatFileVersion\":2"));
+    }
+
+    /// dh_view shows `cmd` and nothing of the `heapscope` section, so the
+    /// restart has to be in both: in words where a person reads the file, and
+    /// as fields where a tool does. A run never restarted carries neither.
+    #[test]
+    fn a_restarted_run_says_so_where_the_viewer_shows_it_and_where_a_tool_reads_it() {
+        let mut restarted = snapshot(vec![point(&[0x10], counters(64, 64))]);
+        restarted.reset = Some(crate::output::Reset {
+            count: 1,
+            at: 40,
+            carried_bytes: 512,
+            carried_blocks: 3,
+            dropped_blocks: 0,
+            epoch: 5,
+        });
+        let json = emit(&restarted, &RawAddresses);
+        assert!(
+            json.contains(
+                r#""cmd":"test [heapscope: counts restarted by Profiler::reset at 40 events; "#
+            ),
+            "{json}"
+        );
+        assert!(
+            json.contains(
+                r#""reset":{"count":1,"at":40,"carriedBytes":512,"carriedBlocks":3,"droppedBlocks":0}"#
+            ),
+            "{json}"
+        );
+
+        let json = emit(
+            &snapshot(vec![point(&[0x10], counters(64, 64))]),
+            &RawAddresses,
+        );
+        assert!(json.contains(r#""cmd":"test""#), "{json}");
+        assert!(!json.contains(r#""reset""#), "{json}");
     }
 
     // ---- what a renderer is allowed to hide ----
