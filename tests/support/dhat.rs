@@ -18,6 +18,11 @@
 //! fields required when `bklt` is true, `ftbl[0]` being the tree root, and the
 //! `data file contains a repeated location` error that a duplicated frame
 //! sequence triggers.
+//!
+//! A profile whose counts were restarted by `Profiler::reset` declares it in
+//! `heapscope.reset`, and only that declaration relaxes the rules a restart
+//! makes untrue: a point can hold, and peak on, blocks it allocated before the
+//! window its totals describe.
 
 #![allow(dead_code)]
 
@@ -140,6 +145,11 @@ pub fn problems(text: &str) -> Vec<String> {
         None => return problems,
     };
 
+    // Read before the points, because it changes what a point may say.
+    let restarted = root
+        .get("heapscope")
+        .and_then(|extension| extension.get("reset"))
+        .is_some();
     let mut sequences: Vec<&[Value]> = Vec::new();
     let mut totals = Totals::default();
     for (at, point) in points.iter().enumerate() {
@@ -147,8 +157,11 @@ pub fn problems(text: &str) -> Vec<String> {
             point,
             at,
             frames.len(),
-            block_lifetimes,
-            block_accesses,
+            Columns {
+                block_lifetimes,
+                block_accesses,
+                restarted,
+            },
             &mut problems,
             &mut totals,
         );
@@ -215,15 +228,29 @@ struct Totals {
     at_end_blocks: u64,
 }
 
+/// What the file as a whole says a point's columns mean.
+#[derive(Debug, Clone, Copy)]
+struct Columns {
+    block_lifetimes: bool,
+    block_accesses: bool,
+    /// The counts were restarted, so a point's totals describe the window and
+    /// its live figures may include blocks from before it.
+    restarted: bool,
+}
+
 fn check_point(
     point: &Value,
     at: usize,
     frame_count: usize,
-    block_lifetimes: bool,
-    block_accesses: bool,
+    columns: Columns,
     problems: &mut Vec<String>,
     totals: &mut Totals,
 ) {
+    let Columns {
+        block_lifetimes,
+        block_accesses,
+        restarted,
+    } = columns;
     if point.as_object().is_none() {
         problems.push(format!(
             "`pps[{at}]` is a {}, expected an object",
@@ -328,16 +355,20 @@ fn check_point(
             }
         }
     };
-    ordered(
-        total_bytes,
-        max_bytes,
-        "more bytes were live at once than were ever allocated",
-    );
-    ordered(
-        total_blocks,
-        max_blocks,
-        "more blocks were live at once than were ever allocated",
-    );
+    // Not after a restart: a point's peak starts from what it held then, which
+    // it allocated before the window its totals count.
+    if !restarted {
+        ordered(
+            total_bytes,
+            max_bytes,
+            "more bytes were live at once than were ever allocated",
+        );
+        ordered(
+            total_blocks,
+            max_blocks,
+            "more blocks were live at once than were ever allocated",
+        );
+    }
     ordered(
         max_bytes,
         at_gmax_bytes,
@@ -393,7 +424,12 @@ fn check_point(
         )),
     }
 
-    if total_blocks == Some(0) {
+    // After a restart, a point that allocated nothing in the window is still
+    // written while it holds something carried into it, or the `gb` and `eb`
+    // columns would no longer sum to the peak and the live total. It is the
+    // point that holds nothing and allocated nothing that is noise.
+    let carries = restarted && max_blocks.is_some_and(|blocks| blocks > 0);
+    if total_blocks == Some(0) && !carries {
         problems.push(format!(
             "`pps[{at}]` records no blocks at all and should not have been emitted"
         ));
@@ -658,6 +694,7 @@ fn check_extension(
     check_shutdown(extension, problems);
     check_unwinder(extension, problems);
     check_captures(extension, points, problems);
+    check_reset(root, extension, problems);
 
     let Some(globals) = extension.get("totals") else {
         problems.push(String::from("the `heapscope` section has no `totals`"));
@@ -689,6 +726,78 @@ fn check_extension(
     agrees("maxBlocks", totals.at_gmax_blocks, "`gbk` columns");
     agrees("currBytes", totals.at_end_bytes, "`eb` columns");
     agrees("currBlocks", totals.at_end_blocks, "`ebk` columns");
+}
+
+/// Checks the declaration of a restart, which is in two places because dh_view
+/// shows only one of them: `cmd` in words for a person, and `heapscope.reset`
+/// as fields for a tool. They must agree.
+fn check_reset(
+    root: &std::collections::BTreeMap<String, Value>,
+    extension: &Value,
+    problems: &mut Vec<String>,
+) {
+    let reset = extension.get("reset");
+    let said = root
+        .get("cmd")
+        .and_then(Value::as_str)
+        .is_some_and(|command| command.contains("counts restarted by Profiler::reset"));
+    match (reset, said) {
+        (Some(_), false) => problems.push(String::from(
+            "`heapscope.reset` declares a restart and `cmd` does not mention it, \
+             so the viewer shows the window's totals as the run's",
+        )),
+        (None, true) => problems.push(String::from(
+            "`cmd` says the counts were restarted and `heapscope.reset` does not",
+        )),
+        _ => {}
+    }
+    let Some(reset) = reset else {
+        return;
+    };
+    let field = |name: &str| reset.get(name).and_then(Value::as_u64);
+    match field("count") {
+        Some(0) => problems.push(String::from(
+            "`heapscope.reset` counts no restart; a run never restarted leaves it out",
+        )),
+        Some(_) => {}
+        None => problems.push(String::from("`heapscope.reset` has no integer `count`")),
+    }
+    let Some(at) = field("at") else {
+        problems.push(String::from("`heapscope.reset` has no integer `at`"));
+        return;
+    };
+    if field("droppedBlocks").is_none() {
+        problems.push(String::from(
+            "`heapscope.reset` has no integer `droppedBlocks`",
+        ));
+    }
+    if let Some(end) = root.get("te").and_then(Value::as_u64) {
+        if at > end {
+            problems.push(format!(
+                "the counts were restarted at {at}, after the run ended at {end}"
+            ));
+        }
+    }
+    // The restart is the window's first peak, so its greatest cannot be before.
+    if let Some(peak) = root.get("tg").and_then(Value::as_u64) {
+        if peak < at {
+            problems.push(format!(
+                "the peak is at {peak}, before the restart at {at} that began the \
+                 window it is the peak of"
+            ));
+        }
+    }
+    let lifetimes = root.get("bklt").and_then(Value::as_bool) == Some(true);
+    for name in ["carriedBytes", "carriedBlocks"] {
+        match (lifetimes, field(name)) {
+            (true, None) => problems.push(format!("`heapscope.reset` has no integer `{name}`")),
+            (false, _) if reset.get(name).is_some() => problems.push(format!(
+                "`heapscope.reset.{name}` is present with `bklt` false; it must \
+                 be omitted, not zeroed"
+            )),
+            _ => {}
+        }
+    }
 }
 
 /// Panics with every problem found, or returns quietly.

@@ -67,7 +67,8 @@ use super::{FrameFormat, PointKind, ProgramPoint, Snapshot};
 /// | [`LiveBytes`](FoldedMetric::LiveBytes) | `atEndBytes` | `totals.currBytes` |
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum FoldedMetric {
-    /// Bytes allocated over the whole run, whether or not they were freed.
+    /// Bytes allocated over the whole run, or since its counts were last
+    /// [restarted](crate::Profiler::reset), whether or not they were freed.
     ///
     /// The default, and the ordinary heap flame graph: where allocation
     /// *volume* went. A site that allocates and frees a megabyte a thousand
@@ -75,7 +76,8 @@ pub enum FoldedMetric {
     /// usually the answer someone chasing allocator time is looking for.
     #[default]
     TotalBytes,
-    /// Blocks allocated over the whole run.
+    /// Blocks allocated over the whole run, or since its counts were last
+    /// [restarted](crate::Profiler::reset).
     ///
     /// The same question counted per request rather than per byte, which is the
     /// one to draw when the cost being chased is the number of calls rather

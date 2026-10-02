@@ -99,6 +99,37 @@ pub struct LiveBlock {
 const _: () = assert!(std::mem::size_of::<LiveBlock>() == 16);
 
 impl LiveBlock {
+    /// The birth given to every block still live when a run's counts restart.
+    ///
+    /// [`Engine::reset`](super::engine::Engine::reset) excludes everything
+    /// allocated before it from the totals, so a block it finds live belongs to
+    /// no block count the profile will report. Its lifetime must therefore count
+    /// toward no lifetime total either: DHAT's average lifetime is `tl / tbk`,
+    /// and a block in the numerator but not the denominator inflates the one
+    /// column a reader uses to find short-lived churn. A warm-up's caches are
+    /// exactly the long-lived blocks that would do it.
+    ///
+    /// The largest value there is, so that the saturating difference
+    /// [`LiveBlock::lifetime_at`] takes is zero for it without a branch. The
+    /// free path pays nothing for a run that never resets.
+    pub const CARRIED: u64 = u64::MAX;
+
+    /// How long this block has lived as of `now`, as far as any lifetime total
+    /// counts it.
+    ///
+    /// Zero for a [carried](LiveBlock::CARRIED) block, and zero rather than a
+    /// wrapped value if `now` somehow precedes the birth: a lifetime summed into
+    /// `tl` is better short by one block than larger than the run.
+    #[inline(always)]
+    pub fn lifetime_at(&self, now: u64) -> u64 {
+        now.saturating_sub(self.birth)
+    }
+
+    /// Whether this block was live when the counts last restarted.
+    pub fn is_carried(&self) -> bool {
+        self.birth == Self::CARRIED
+    }
+
     /// A block whose thread and region are not known.
     ///
     /// For paths that record without a guard in hand, and for tests about
@@ -330,6 +361,37 @@ impl LiveBlocks {
         }
     }
 
+    /// Takes every shard's lock, for a caller that needs the whole table in one
+    /// state.
+    ///
+    /// Acquired in index order and held until the returned value drops, so no
+    /// block can be inserted or removed anywhere in the table meanwhile. That is
+    /// what [`Engine::reset`](super::engine::Engine::reset) needs: it marks
+    /// every live block as carried across a restart, and a block inserted into
+    /// a shard it had already walked would be counted in a window it was not
+    /// marked out of.
+    ///
+    /// Enters [`super::order`] once, for the whole family, rather than once per
+    /// shard: sixty-four locks of one level is a same-level reacquisition, which
+    /// the checker reports on the recording paths and which is the whole point
+    /// here. The level is still entered, so holding these and then taking
+    /// anything shallower is caught exactly as it would be for one shard.
+    ///
+    /// # Deadlock
+    ///
+    /// None against the recording paths. A path holding a live-block shard waits
+    /// for nothing but the arena, which is deeper in [`super::order`] and whose
+    /// holders wait on nothing at all, so every holder this waits on is about
+    /// to release.
+    pub fn lock_all(&self) -> AllShards<'_> {
+        let order = super::order::enter(super::order::Level::LiveBlockShard);
+        AllShards {
+            guards: std::array::from_fn(|index| self.shards[index].lock.lock()),
+            table: self,
+            _order: order,
+        }
+    }
+
     /// Forgets every tracked block, keeping the allocations.
     pub fn clear(&self) {
         for shard in &self.shards {
@@ -390,6 +452,42 @@ impl LiveBlocks {
 impl Default for LiveBlocks {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Every shard of a [`LiveBlocks`], locked. Releases them when dropped.
+///
+/// See [`LiveBlocks::lock_all`].
+pub struct AllShards<'a> {
+    /// Declared first so that the locks are released before the order checker
+    /// is told the level was left.
+    guards: [super::lock::RawGuard<'a>; SHARDS],
+    table: &'a LiveBlocks,
+    _order: super::order::Entered,
+}
+
+impl AllShards<'_> {
+    /// Visits every tracked block with leave to change what is remembered
+    /// about it.
+    ///
+    /// Order is unspecified. The address cannot change, for the reason
+    /// [`RawMap::for_each_mut`] gives.
+    pub fn for_each_mut(&mut self, mut visit: impl FnMut(usize, &mut LiveBlock)) {
+        for shard in &self.table.shards {
+            // SAFETY: `self.guards` holds every shard's lock, this one's
+            // included, for as long as `self` lives; and `&mut self` means no
+            // other borrow of the map can be live through this value.
+            let blocks = unsafe { &mut *shard.blocks.get() };
+            blocks.for_each_mut(|address, block| visit(address as usize, block));
+        }
+    }
+}
+
+impl fmt::Debug for AllShards<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AllShards")
+            .field("shards", &self.guards.len())
+            .finish_non_exhaustive()
     }
 }
 
@@ -625,6 +723,73 @@ mod tests {
         table.for_each(|_address, _block| seen += 1);
         assert_eq!(seen, table.len());
         assert_eq!(seen, count / 2, "half the blocks were removed");
+    }
+
+    /// Holding every shard is what lets a restart mark the whole table in one
+    /// state. What it marks has to be every live block, in every shard, and
+    /// only what it marks: the program point and the attribution are what a
+    /// later free needs, and losing either would move the wrong counters.
+    #[test]
+    fn every_shard_can_be_held_and_rewritten_at_once() {
+        let arena = Arena::new();
+        let table = LiveBlocks::with_capacity(1 << 16);
+
+        let base = 0x7000_0000_0000usize;
+        let count = miri_scale(2_000);
+        for i in 0..count {
+            table.insert(&arena, base + i * 64, block(i as u32 % 7, 10 + i as u64));
+        }
+        for i in (0..count).step_by(4) {
+            table.remove(base + i * 64);
+        }
+
+        let mut shards_seen = [false; SHARDS];
+        {
+            let mut all = table.lock_all();
+            all.for_each_mut(|address, block| {
+                shards_seen[LiveBlocks::shard_of(address)] = true;
+                block.birth = LiveBlock::CARRIED;
+            });
+        }
+        assert!(
+            shards_seen.iter().filter(|seen| **seen).count() > SHARDS / 2,
+            "the blocks landed in too few shards for this to say anything \
+             about walking all of them"
+        );
+
+        let mut carried = 0;
+        table.for_each(|address, block| {
+            let i = (address - base) / 64;
+            assert!(block.is_carried(), "block {i} was not marked");
+            assert_eq!(
+                block.pp,
+                PpId::from_raw(i as u32 % 7),
+                "block {i} moved point"
+            );
+            carried += 1;
+        });
+        assert_eq!(carried, count - count.div_ceil(4));
+
+        // Released on drop: the table is usable again from here.
+        assert!(table.insert(&arena, base - 64, block(1, 1)));
+    }
+
+    /// A carried block counts toward no lifetime, and the saturating difference
+    /// is what makes that free on the paths that compute one. Pinned here
+    /// because the free path relies on it without a branch, and a sentinel at
+    /// any other value would quietly hand a warm-up's blocks a lifetime.
+    #[test]
+    fn a_carried_block_has_no_lifetime() {
+        let carried = block(1, LiveBlock::CARRIED);
+        assert!(carried.is_carried());
+        for now in [0, 1, 1 << 40, u64::MAX - 1, u64::MAX] {
+            assert_eq!(carried.lifetime_at(now), 0, "at {now}");
+        }
+
+        let born = block(1, 100);
+        assert!(!born.is_carried());
+        assert_eq!(born.lifetime_at(150), 50);
+        assert_eq!(born.lifetime_at(50), 0, "a lifetime never wraps");
     }
 
     /// The hazard PLAN.md section 4.1 calls out: an address freed on one thread

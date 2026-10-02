@@ -737,6 +737,7 @@ mod tests {
             total_bytes: max_bytes * 2,
             total_blocks,
             dropped_blocks: 0,
+            resets: 0,
         }
     }
 

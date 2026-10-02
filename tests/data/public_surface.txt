@@ -5,12 +5,14 @@ attr heapscope::EventStats #[non_exhaustive]
 attr heapscope::HeapStats #[non_exhaustive]
 attr heapscope::RegionBreakdown #[non_exhaustive]
 attr heapscope::Regression #[non_exhaustive]
+attr heapscope::ResetError #[non_exhaustive]
 attr heapscope::Snapshot #[non_exhaustive]
 attr heapscope::StartError #[non_exhaustive]
 attr heapscope::StatsError #[non_exhaustive]
 attr heapscope::baseline::Baseline #[non_exhaustive]
 attr heapscope::baseline::Regression #[non_exhaustive]
 attr heapscope::output::OutsideRegions #[non_exhaustive]
+attr heapscope::output::Reset #[non_exhaustive]
 attr heapscope::output::SelfMetrics #[non_exhaustive]
 attr heapscope::output::Settings #[non_exhaustive]
 attr heapscope::output::Snapshot #[non_exhaustive]
@@ -26,6 +28,7 @@ const heapscope::output::ROW_SLACK
 const heapscope::stats::DUMP_VARIABLE
 const heapscope::symbol::dynamic::DISABLE_VARIABLE
 enum heapscope::Mode
+enum heapscope::ResetError
 enum heapscope::StartError
 enum heapscope::StatsError
 enum heapscope::TimeSource
@@ -49,6 +52,7 @@ field heapscope::HeapStats::curr_bytes
 field heapscope::HeapStats::dropped_blocks
 field heapscope::HeapStats::max_blocks
 field heapscope::HeapStats::max_bytes
+field heapscope::HeapStats::resets
 field heapscope::HeapStats::total_blocks
 field heapscope::HeapStats::total_bytes
 field heapscope::RegionBreakdown::dropped_blocks
@@ -71,6 +75,7 @@ field heapscope::Snapshot::points
 field heapscope::Snapshot::points_dropped
 field heapscope::Snapshot::poisoned
 field heapscope::Snapshot::regions
+field heapscope::Snapshot::reset
 field heapscope::Snapshot::rows_dropped
 field heapscope::Snapshot::settings
 field heapscope::Snapshot::shapes
@@ -130,6 +135,12 @@ field heapscope::output::RegionStats::first_seen
 field heapscope::output::RegionStats::id
 field heapscope::output::RegionStats::name
 field heapscope::output::RegionStats::overflow
+field heapscope::output::Reset::at
+field heapscope::output::Reset::carried_blocks
+field heapscope::output::Reset::carried_bytes
+field heapscope::output::Reset::count
+field heapscope::output::Reset::dropped_blocks
+field heapscope::output::Reset::epoch
 field heapscope::output::SelfMetrics::arena
 field heapscope::output::SelfMetrics::capture_cost
 field heapscope::output::SelfMetrics::live_blocks
@@ -165,6 +176,7 @@ field heapscope::output::Snapshot::points
 field heapscope::output::Snapshot::points_dropped
 field heapscope::output::Snapshot::poisoned
 field heapscope::output::Snapshot::regions
+field heapscope::output::Snapshot::reset
 field heapscope::output::Snapshot::rows_dropped
 field heapscope::output::Snapshot::settings
 field heapscope::output::Snapshot::shapes
@@ -198,6 +210,7 @@ field heapscope::stats::HeapStats::curr_bytes
 field heapscope::stats::HeapStats::dropped_blocks
 field heapscope::stats::HeapStats::max_blocks
 field heapscope::stats::HeapStats::max_bytes
+field heapscope::stats::HeapStats::resets
 field heapscope::stats::HeapStats::total_blocks
 field heapscope::stats::HeapStats::total_bytes
 field heapscope::stats::RegionBreakdown::dropped_blocks
@@ -242,6 +255,7 @@ fn heapscope::Output::text_summary_to_stderr
 fn heapscope::Profiler::builder
 fn heapscope::Profiler::new
 fn heapscope::Profiler::print_summary
+fn heapscope::Profiler::reset
 fn heapscope::Profiler::save_dhat_v2
 fn heapscope::Profiler::save_html
 fn heapscope::Profiler::save_native
@@ -388,6 +402,13 @@ impl heapscope::Regression: Debug (derived)
 impl heapscope::Regression: Eq (derived)
 impl heapscope::Regression: PartialEq (derived)
 impl heapscope::Regression: fmt::Display
+impl heapscope::ResetError: Clone (derived)
+impl heapscope::ResetError: Copy (derived)
+impl heapscope::ResetError: Debug (derived)
+impl heapscope::ResetError: Eq (derived)
+impl heapscope::ResetError: PartialEq (derived)
+impl heapscope::ResetError: fmt::Display
+impl heapscope::ResetError: std::error::Error
 impl heapscope::Snapshot: Clone (derived)
 impl heapscope::Snapshot: Debug (derived)
 impl heapscope::Snapshot: Default
@@ -484,6 +505,12 @@ impl heapscope::output::RegionStats: Clone (derived)
 impl heapscope::output::RegionStats: Debug (derived)
 impl heapscope::output::RegionStats: Eq (derived)
 impl heapscope::output::RegionStats: PartialEq (derived)
+impl heapscope::output::Reset: Clone (derived)
+impl heapscope::output::Reset: Copy (derived)
+impl heapscope::output::Reset: Debug (derived)
+impl heapscope::output::Reset: Default (derived)
+impl heapscope::output::Reset: Eq (derived)
+impl heapscope::output::Reset: PartialEq (derived)
 impl heapscope::output::SelfMetrics: Clone (derived)
 impl heapscope::output::SelfMetrics: Copy (derived)
 impl heapscope::output::SelfMetrics: Debug (derived)
@@ -621,6 +648,7 @@ struct heapscope::output::ProgramPoint
 struct heapscope::output::RawAddresses
 struct heapscope::output::Realloc
 struct heapscope::output::RegionStats
+struct heapscope::output::Reset
 struct heapscope::output::SelfMetrics
 struct heapscope::output::Settings
 struct heapscope::output::Shape
@@ -655,6 +683,7 @@ use heapscope::ProfilerBuilder = profiler::ProfilerBuilder
 use heapscope::Region = region::Region
 use heapscope::RegionBreakdown = stats::RegionBreakdown
 use heapscope::Regression = baseline::Regression
+use heapscope::ResetError = internals::engine::ResetError
 use heapscope::Snapshot = output::Snapshot
 use heapscope::StartError = profiler::StartError
 use heapscope::StatsError = stats::StatsError
@@ -671,6 +700,7 @@ use heapscope::output::GlobalStats = crate::internals::engine::GlobalStats
 use heapscope::output::OutsideRegions = crate::internals::site::OutsideRegions
 use heapscope::output::RawAddresses = dhat_v2::RawAddresses
 use heapscope::output::Realloc = crate::internals::shape::Realloc
+use heapscope::output::Reset = crate::internals::engine::Reset
 use heapscope::output::Settings = crate::internals::engine::Settings
 use heapscope::output::Shape = crate::internals::shape::Shape
 use heapscope::output::ShapeStats = crate::internals::shape::ShapeStats
@@ -683,6 +713,11 @@ use heapscope::symbol::demangle = demangle::demangle
 variant heapscope::Mode::AdHoc
 variant heapscope::Mode::Copy
 variant heapscope::Mode::Heap
+variant heapscope::ResetError::Busy
+variant heapscope::ResetError::ForkedChild
+variant heapscope::ResetError::NotRunning
+variant heapscope::ResetError::Poisoned
+variant heapscope::ResetError::Reentrant
 variant heapscope::StartError::AlreadyRecorded
 variant heapscope::StartError::AlreadyRunning
 variant heapscope::StartError::NoBacktraces

@@ -313,6 +313,32 @@ impl<V: Copy> RawMap<V> {
         }
     }
 
+    /// Visits every live entry with leave to change its value in place.
+    ///
+    /// The key is passed by value and cannot change: moving an entry would mean
+    /// rehashing it, and the one caller (a run restarting its counts, which
+    /// rewrites what it knows about each live block) has no reason to.
+    pub fn for_each_mut(&mut self, mut f: impl FnMut(u64, &mut V)) {
+        for index in 0..self.capacity {
+            // The key first, for the reason `for_each` gives: a value is only
+            // initialized in a slot whose key says it is live.
+            //
+            // SAFETY: `index < capacity`, and `grow` initialized the `key`
+            // field of every slot in that range.
+            let key = unsafe { std::ptr::addr_of!((*self.slot(index)).key).read() };
+            if key != EMPTY {
+                // SAFETY: a live key means `insert` wrote `value` in this slot,
+                // and `&mut self` means nothing else is reading it.
+                unsafe {
+                    let value = std::ptr::addr_of_mut!((*self.slot(index)).value);
+                    let mut updated = value.read();
+                    f(key, &mut updated);
+                    value.write(updated);
+                }
+            }
+        }
+    }
+
     /// Empties the map, keeping its allocation.
     pub fn clear(&mut self) {
         for index in 0..self.capacity {
@@ -904,6 +930,38 @@ mod tests {
         seen.sort_unstable();
         for (key, value) in seen {
             assert_eq!(m.get(key), Some(value));
+        }
+    }
+
+    /// Rewriting in place has to reach every live entry, touch no removed one,
+    /// and leave the keys where lookups expect them. Removals are mixed in on
+    /// purpose: a walk that wrote a value into an emptied slot would resurrect
+    /// nothing visible, and would leave a value where `grow` assumes there is
+    /// none.
+    #[test]
+    fn for_each_mut_rewrites_exactly_the_live_entries() {
+        let (arena, mut m) = map(1 << 14);
+        let count = miri_scale(3000) as u64;
+        for i in 0..count {
+            m.insert(&arena, i + 1, i as u32);
+        }
+        for i in (0..count).step_by(3) {
+            m.remove(i + 1);
+        }
+        let live = m.len();
+
+        let mut visited = 0;
+        m.for_each_mut(|key, value| {
+            assert_eq!(u64::from(*value) + 1, key, "the value is not this key's");
+            *value += 1_000_000;
+            visited += 1;
+        });
+
+        assert_eq!(visited, live);
+        assert_eq!(m.len(), live, "rewriting values changed the entry count");
+        for i in 0..count {
+            let expected = (i % 3 != 0).then_some(i as u32 + 1_000_000);
+            assert_eq!(m.get(i + 1), expected, "key {}", i + 1);
         }
     }
 

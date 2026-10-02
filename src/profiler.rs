@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use crate::internals::clock::TimeSource;
-use crate::internals::engine::{GlobalStats, Mode, Settings, Shutdown, State};
+use crate::internals::engine::{GlobalStats, Mode, ResetError, Settings, Shutdown, State};
 use crate::internals::{diagnostic, fork};
 use crate::output::{FoldedMetric, Snapshot};
 use crate::unwind::{self, ProbeFailure, Strategy};
@@ -48,9 +48,14 @@ pub enum StartError {
     AlreadyRunning,
     /// This process has already recorded a profile.
     ///
-    /// The engine records once per process and does not restart: a second run
-    /// would either continue the first one's counters or silently discard them,
-    /// and neither is a profile anyone asked for. Run the program again.
+    /// The engine records once per process and a stopped run does not start
+    /// again: a second run would either continue the first one's counters or
+    /// silently discard them, and neither is a profile anyone asked for. Run the
+    /// program again.
+    ///
+    /// To leave a warm-up out of a profile, keep the one profiler and call
+    /// [`Profiler::reset`] when the warm-up is done. That restarts the counts
+    /// explicitly, and the profile says it did.
     AlreadyRecorded,
     /// Backtraces cannot be captured in this build.
     ///
@@ -90,8 +95,9 @@ impl fmt::Display for StartError {
             }
             StartError::AlreadyRecorded => write!(
                 f,
-                "this process has already recorded a heapscope profile; \
-                 the engine does not restart"
+                "this process has already recorded a heapscope profile, and a \
+                 stopped run does not start again; to leave a warm-up out of a \
+                 profile, call Profiler::reset on the running profiler instead"
             ),
             StartError::NoBacktraces(failure) => write!(f, "{failure}"),
             StartError::NotInstalled => write!(
@@ -293,6 +299,91 @@ impl Profiler {
     /// The global counters as they stand.
     pub fn stats(&self) -> GlobalStats {
         crate::engine().stats()
+    }
+
+    /// Restarts the run's counts, keeping what is live, so that what came
+    /// before stays out of the profile.
+    ///
+    /// The way to leave a warm-up out: start the profiler, run the warm-up,
+    /// reset, run the part worth profiling, and write the profile.
+    ///
+    /// ```
+    /// # #[global_allocator]
+    /// # static ALLOC: heapscope::Alloc = heapscope::Alloc::system();
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let profiler = heapscope::Profiler::builder().no_output().build()?;
+    ///
+    /// let cache = vec![0u8; 1 << 20]; // one-time setup that stays live
+    /// profiler.reset()?;
+    /// let work = vec![0u8; 4096];     // the part being measured
+    ///
+    /// let stats = heapscope::HeapStats::get()?;
+    /// assert!(stats.total_bytes < 1 << 20, "the warm-up's allocation was counted");
+    /// assert!(stats.curr_bytes >= (1 << 20) + 4096, "the cache is still live");
+    /// assert!(stats.max_bytes >= stats.curr_bytes, "the peak starts from what is live");
+    /// # drop((cache, work));
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// What happened before the reset is forgotten, and what *is* at the reset
+    /// is kept:
+    ///
+    /// - **Totals** start again from zero: bytes and blocks allocated,
+    ///   globally, per call site, per thread and per region, and the
+    ///   distribution of sizes and alignments.
+    /// - **Live state** is kept. A block allocated before the reset and still
+    ///   live is still counted as live everywhere it was, so freeing it later
+    ///   brings every figure down correctly, and a leak check still sees it.
+    /// - **Peaks** start again from what is live: the reset is itself the
+    ///   peak, at that level, until the heap grows past it. The bytes each call
+    ///   site held at the peak, and each one's own maximum, start there too.
+    /// - **Lifetimes** count only blocks allocated after the reset. A block
+    ///   live across it is in no block count the profile reports, so its
+    ///   lifetime is in none of the totals either, rather than inflating the
+    ///   average at the site that allocated it.
+    /// - **Time** is not reset. Every instant in the profile stays on one axis,
+    ///   and the profile records when the reset happened on it.
+    ///
+    /// Every profile written afterwards says that a reset happened, when, and
+    /// what was live then. A run may be reset as often as it likes; the
+    /// profile describes the window since the last one.
+    ///
+    /// # What a reading taken before a reset is good for
+    ///
+    /// [`HeapStats::get`](crate::HeapStats::get) reports the restarted figures
+    /// afterwards, and a reading taken before is from another window: its
+    /// totals and its peak are not comparable with any taken since. The
+    /// `since: mark` assertions refuse such a mark rather than subtract it,
+    /// and [`HeapStats::resets`](crate::HeapStats::resets) is how other code
+    /// can tell. A bare [`assert_max_bytes!`](crate::assert_max_bytes)
+    /// afterwards measures the peak since the reset, which is usually the
+    /// budget that was meant.
+    ///
+    /// # Errors
+    ///
+    /// Refuses rather than doing nothing, and every refusal leaves the counts
+    /// exactly as they were. See [`ResetError`] for each case: a stopped run, a
+    /// `fork` child, a poisoned profiler, a call from inside the profiler
+    /// itself, and other threads holding the profiler busy for longer than a
+    /// shutdown waits.
+    ///
+    /// # Other threads
+    ///
+    /// Safe to call while they allocate: the reset waits for a moment at which
+    /// no counter is midway through moving and applies itself in one step
+    /// there. What it cannot place exactly is an allocation in flight at that
+    /// moment, which may count toward the window with no lifetime, or bring a
+    /// lifetime from before it. Reset where the program is quiet for an exact
+    /// profile.
+    pub fn reset(&self) -> Result<(), ResetError> {
+        // `None` means this thread is already inside the profiler, where the
+        // locks a reset takes may be held by the very allocation it
+        // interrupted. See `Engine::reset` on why the proof is required.
+        let Some(entered) = crate::internals::guard::enter() else {
+            return Err(ResetError::Reentrant);
+        };
+        crate::engine().reset(&entered)
     }
 
     /// Reads everything recorded so far into a [`Snapshot`].

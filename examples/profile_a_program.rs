@@ -1,7 +1,7 @@
 //! Records a small workload and writes a profile.
 //!
 //! ```text
-//! cargo run --release --example profile_a_program [output.json] [heap|ad-hoc|copy]
+//! cargo run --release --example profile_a_program [output.json] [heap|ad-hoc|copy] [restart]
 //! ```
 //!
 //! The result opens in Valgrind's `dh_view.html`. Frames carry the name the
@@ -23,6 +23,12 @@
 //! shape through the real viewer. A `bklt: false` profile omits seven per-point
 //! fields and two top-level ones, so it is a different file for the viewer to
 //! accept, not the same file with different numbers.
+//!
+//! `restart` calls [`Profiler::reset`](heapscope::Profiler::reset) once the
+//! index is built, which is the shape of a warm-up left out: the index stays
+//! live and counted as live, and every total, peak and lifetime in the profile
+//! covers only what came after. The CI scripts record one such profile beside
+//! the others, because a restarted run is a file with fields the others lack.
 
 use std::collections::HashMap;
 use std::hint::black_box;
@@ -56,6 +62,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some("copy") => heapscope::Mode::Copy,
         Some(other) => return Err(format!("unknown mode {other:?}").into()),
     };
+    let restart = match std::env::args().nth(3).as_deref() {
+        None => false,
+        Some("restart") => true,
+        Some(other) => return Err(format!("unknown option {other:?}").into()),
+    };
     let profiler = builder.mode(mode).build()?;
 
     // Three shapes of allocation behaviour, so the profile has something to
@@ -63,6 +74,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // In a non-heap mode none of it is recorded — the shim is a pass-through —
     // and the profile is made of the reports below instead.
     let held = build_index(2_000);
+    if restart {
+        profiler.reset()?;
+    }
     churn(20_000);
     let grown = grow_by_pushing(50_000);
 

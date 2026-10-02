@@ -92,9 +92,23 @@ It refuses rather than returning zeros in the cases `HeapStats::get()` does: not
 
 Because the remainder is a subtraction, it reads the region rows and the totals at one instant, holding every recording thread still for as long as copying a few hundred rows takes. If something else holds the profiler that long, it refuses with `StatsError::NoQuietPoint` rather than subtracting across two moments. It allocates, so it is not for a signal handler, and a thread already inside the profiler is refused at once with `StatsError::InsideTheProfiler` rather than left to stall every other thread while it waits.
 
+## A profile whose counts were restarted
+
+A program that called `Profiler::reset` says so before any figure, because the restart changes what every figure means:
+
+```text
+  restarted  at 6,001 observed events; totals, peaks and lifetimes cover what followed
+  carried    258.5 KiB in 4,001 blocks live at the restart, counted as live and not as allocated
+```
+
+That is `profile_a_program heap restart`, which restarts once its index is built. The totals, the peak and the lifetimes are the window's. The live figures are not: the index is still live, still counted at the call site that built it, and part of the window's peak. So a call site can hold more than it allocated, and one that allocated nothing since the restart still appears, with zero allocations and the bytes it carried. Its average lifetime counts only blocks it allocated in the window, because a block carried across has no lifetime the window saw begin.
+
+Run-wide counters that qualify the live figures are not restarted: blocks the live-block table turned away may still be live, so that count stays over the whole run, and the profile records how much of it came before the window.
+
 ## What else is in there
 
 - [`heapscope.overhead`](performance.md#what-the-profiler-cost) — this run's own memory and stack-walking cost, measured rather than estimated.
 - [`heapscope.captures`](stack-capture.md) — how many stack walks came back whole, which is how much to trust the call sites.
 - [`heapscope.shutdown`](lifecycle.md) — which path wrote the file, which two profiles of the same program can legitimately differ by.
+- [`heapscope.reset`](lifecycle.md#leaving-a-warm-up-out) — present only when the counts were restarted: how many times, when the last one happened, and what was live then.
 - `heapscope.settings` — the settings that were actually in force, after clamping.
