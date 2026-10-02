@@ -7,8 +7,9 @@
 //!
 //! # Shape
 //!
-//! Open addressing with linear probing, power-of-two capacity, and tombstones
-//! for deletion. Linear probing rather than anything cleverer because the keys
+//! Open addressing with linear probing and power-of-two capacity. A removal
+//! closes its gap by shifting entries back rather than leaving a tombstone;
+//! [`RawMap::remove`] says why. Linear probing rather than anything cleverer because the keys
 //! are already well-distributed — pointers are hashed, and program-point keys
 //! are hashes to begin with — so the cache locality of a linear scan wins.
 //!
@@ -25,14 +26,8 @@ use std::ptr::NonNull;
 
 use super::arena::Arena;
 
-/// A key value reserved to mean "this slot has never been used".
+/// A key value reserved to mean "this slot holds no entry".
 const EMPTY: u64 = 0;
-
-/// A key value reserved to mean "this slot held an entry that was removed".
-///
-/// Probing must continue through a tombstone, because an entry that collided
-/// with the removed one may lie beyond it.
-const TOMBSTONE: u64 = u64::MAX;
 
 /// Load factor, as a fraction of capacity, at which the table grows.
 ///
@@ -49,8 +44,7 @@ const MIN_CAPACITY: usize = 1024;
 /// # Partial initialization
 ///
 /// `key` is initialized for every slot as soon as the table is allocated;
-/// `value` is initialized **only** in slots whose key is neither [`EMPTY`] nor
-/// [`TOMBSTONE`]. Every read must therefore examine `key` first and reach
+/// `value` is initialized **only** in slots whose key is not [`EMPTY`]. Every read must therefore examine `key` first and reach
 /// `value` only through a live key. Reading a whole `Entry` — even to discard
 /// it — constructs a `V` from uninitialized memory, which is undefined
 /// behaviour for any type with validity constraints, and is not hypothetical:
@@ -82,28 +76,52 @@ pub enum Insert {
 ///
 /// Not thread-safe on its own. Callers hold the appropriate shard lock.
 ///
-/// # Reserved keys
+/// # A removal moves entries, so nothing may look while one runs
 ///
-/// `0` and `u64::MAX` mark empty and removed slots, so they cannot be stored.
-/// An earlier version of this type quietly folded both onto `1`, which is a
-/// worse answer than it looks: folding is not injective, so a genuine key of
-/// `1` and a key of `0` became *the same entry*, and the map returned one
-/// caller's value to another with nothing to indicate it had happened. Silent
-/// data corruption is not an acceptable price for a convenience.
+/// [`RawMap::remove`] shifts later entries of a cluster back into the gap it
+/// leaves, which a tombstone never did: a lookup racing it could miss an entry
+/// that is between slots, or meet one twice. Nothing races it, and the reason
+/// is the callers', so it is set down here where a new caller will read it.
+///
+/// - `remove` takes `&mut self`, and `&self` grants only reads, so within the
+///   type a shift and a lookup cannot overlap. The callers reach a map through
+///   an `UnsafeCell`, which is where that could be undone.
+/// - The live-block table, [`LiveBlocks`](super::live::LiveBlocks), reaches a
+///   shard's map only while holding that shard's lock: to insert, remove, get,
+///   count, measure, walk, clear, and change the ceiling. It has no lock-free
+///   lookup. A snapshot walks the table shard by shard under each lock in
+///   turn, and an entry never moves between shards, whose index comes from the
+///   key, so the walk meets each entry of a shard exactly once.
+/// - The program-point intern table never removes, so its entries never move.
+/// - `fork` copies a map as it stands. The prepare handler,
+///   [`Engine::fork_prepare`](super::engine::Engine::fork_prepare), takes every
+///   live-block shard lock first, without a deadline, so a child normally
+///   inherits no shift in progress. If it then gives up waiting for the peak
+///   gate, it releases them, and says the child's inherited tables may be
+///   mid-update. A map the child inherits mid-shift holds one entry twice, or
+///   the removed one still, so a snapshot taken in that child can count one
+///   block twice. That case already allowed a map inherited mid-growth, which
+///   is missing every entry not yet rehashed, and is no worse for this.
+///
+/// # The reserved key
+///
+/// `0` marks an empty slot, so it cannot be stored. An earlier version of this
+/// type quietly folded it onto `1`, which is a worse answer than it looks:
+/// folding is not injective, so a genuine key of `1` and a key of `0` became
+/// *the same entry*, and the map returned one caller's value to another with
+/// nothing to indicate it had happened. Silent data corruption is not an
+/// acceptable price for a convenience.
 ///
 /// Both real callers satisfy the constraint by construction — heap pointers are
-/// never null and never `u64::MAX` — and anything hashed should be passed
-/// through [`RawMap::usable_key`] first.
+/// never null — and anything hashed should be passed through
+/// [`RawMap::usable_key`] first.
 pub struct RawMap<V: Copy> {
     /// `capacity` entries, or dangling when `capacity == 0`.
     entries: NonNull<Entry<V>>,
     /// Always a power of two, or zero before the first allocation.
     capacity: usize,
-    /// Live entries.
+    /// Live entries, and so occupied slots: nothing else occupies one.
     len: usize,
-    /// Slots holding tombstones. Counted toward the load factor because they
-    /// lengthen probe sequences exactly as live entries do.
-    tombstones: usize,
     /// Ceiling on `capacity`, in slots.
     max_capacity: usize,
 }
@@ -124,7 +142,6 @@ impl<V: Copy> RawMap<V> {
             entries: NonNull::dangling(),
             capacity: 0,
             len: 0,
-            tombstones: 0,
             max_capacity,
         }
     }
@@ -203,20 +220,65 @@ impl<V: Copy> RawMap<V> {
     }
 
     /// Removes `key`, returning its value.
+    ///
+    /// # Why the gap is closed rather than marked
+    ///
+    /// Emptying the slot outright would cut off every entry that probed past
+    /// it, so something has to keep their probe sequences whole. This type
+    /// used to leave a tombstone, a slot that probes walk through and an
+    /// insertion may reuse, and that was a slow leak. A tombstone was reclaimed
+    /// only when an insertion happened to land on it, while every insertion
+    /// that landed on an empty slot used one up, so under churn the empty
+    /// slots only ever decreased, and the load factor filled with entries that
+    /// were not there. Below the ceiling that cost a doubling the table did
+    /// not need; at it, where growing was the only way tombstones were ever
+    /// cleared, every new key was refused for good. A program that allocated
+    /// and freed long enough stopped being recorded with a few hundred blocks
+    /// live, in a table sized for hundreds of thousands.
+    ///
+    /// So the gap is closed instead (Knuth's Algorithm R): each later entry of
+    /// the cluster whose probe sequence passes through the gap moves back into
+    /// it, which opens a gap where that entry was, until the cluster ends. The
+    /// table is then exactly what it would be had the key never been inserted,
+    /// and holds nothing but live entries, so the load factor counts nothing
+    /// else. The cost is a walk to the end of the cluster, which at the load
+    /// factor kept here is a few slots.
     pub fn remove(&mut self, key: u64) -> Option<V> {
         if is_reserved(key) {
             return None;
         }
-        let index = self.find(key)?;
+        let mut gap = self.find(key)?;
         // SAFETY: `find` returned a live slot below `capacity`.
-        let value = unsafe {
-            let slot = self.slot(index);
-            let value = std::ptr::addr_of!((*slot).value).read();
-            std::ptr::addr_of_mut!((*slot).key).write(TOMBSTONE);
-            value
-        };
+        let value = unsafe { std::ptr::addr_of!((*self.slot(gap)).value).read() };
         self.len -= 1;
-        self.tombstones += 1;
+
+        let mask = self.capacity - 1;
+        let mut index = gap;
+        // Bounded by capacity for the reason `find` gives: the table always
+        // has an empty slot, which ends the cluster.
+        for _ in 0..self.capacity {
+            index = (index + 1) & mask;
+            // SAFETY: `index <= mask < capacity`, and every key is initialized.
+            let next = unsafe { std::ptr::addr_of!((*self.slot(index)).key).read() };
+            if next == EMPTY {
+                break;
+            }
+            // The entry at `index` was placed by a probe from `home` that
+            // walked every slot from there to `index`. That walk passed through
+            // the gap if the gap is no further back from `index` than `home`
+            // is, and only then may the entry move into it: anywhere else it
+            // would sit before its own home, where no probe for it starts.
+            let home = mix(next) as usize & mask;
+            if index.wrapping_sub(home) & mask >= index.wrapping_sub(gap) & mask {
+                // SAFETY: both indices are below `capacity` and distinct, and
+                // the key at `index` is live, so the whole entry there is
+                // initialized and may be read as one.
+                unsafe { self.slot(gap).write(self.slot(index).read()) };
+                gap = index;
+            }
+        }
+        // SAFETY: `gap < capacity`.
+        unsafe { std::ptr::addr_of_mut!((*self.slot(gap)).key).write(EMPTY) };
         Some(value)
     }
 
@@ -235,7 +297,7 @@ impl<V: Copy> RawMap<V> {
             // SAFETY: `index < capacity`, and `grow` initialized the `key`
             // field of every slot in that range.
             let key = unsafe { std::ptr::addr_of!((*self.slot(index)).key).read() };
-            if key != EMPTY && key != TOMBSTONE {
+            if key != EMPTY {
                 // SAFETY: a live key means `insert` wrote `value` in this slot.
                 let value = unsafe { std::ptr::addr_of!((*self.slot(index)).value).read() };
                 f(key, value);
@@ -250,7 +312,6 @@ impl<V: Copy> RawMap<V> {
             unsafe { std::ptr::addr_of_mut!((*self.slot(index)).key).write(EMPTY) };
         }
         self.len = 0;
-        self.tombstones = 0;
     }
 
     #[inline(always)]
@@ -303,19 +364,14 @@ impl<V: Copy> RawMap<V> {
 
     #[inline]
     fn needs_growth(&self) -> bool {
-        // Tombstones count: they cost probe length exactly as live entries do,
-        // so a table that is half tombstones is as slow as one that is half
-        // full, and rehashing is what clears them.
-        (self.len + self.tombstones + 1) * MAX_LOAD_DEN > self.capacity * MAX_LOAD_NUM
+        // `len` is every occupied slot, because a removal leaves no marker.
+        (self.len + 1) * MAX_LOAD_DEN > self.capacity * MAX_LOAD_NUM
     }
 
     fn insert_no_grow(&mut self, key: u64, value: V) -> Insert {
         debug_assert!(self.capacity > 0);
         let mask = self.capacity - 1;
         let mut index = mix(key) as usize & mask;
-        // The first tombstone seen, which can be reused if the key turns out to
-        // be absent. Probing must still continue past it to find a live match.
-        let mut reusable: Option<usize> = None;
 
         for _ in 0..self.capacity {
             // SAFETY: `index <= mask < capacity`.
@@ -326,16 +382,9 @@ impl<V: Copy> RawMap<V> {
                 unsafe { std::ptr::addr_of_mut!((*self.slot(index)).value).write(value) };
                 return Insert::Replaced;
             }
-            if slot_key == TOMBSTONE {
-                reusable.get_or_insert(index);
-            } else if slot_key == EMPTY {
-                let target = reusable.unwrap_or(index);
-                if reusable.is_some() {
-                    self.tombstones -= 1;
-                }
-                // SAFETY: `target` is an index this probe visited, so it is
-                // below `capacity`.
-                unsafe { self.slot(target).write(Entry { key, value }) };
+            if slot_key == EMPTY {
+                // SAFETY: as above.
+                unsafe { self.slot(index).write(Entry { key, value }) };
                 self.len += 1;
                 return Insert::Added;
             }
@@ -393,7 +442,6 @@ impl<V: Copy> RawMap<V> {
         self.entries = entries;
         self.capacity = new_capacity;
         self.len = 0;
-        self.tombstones = 0;
 
         for index in 0..old_capacity {
             // Read `key` alone first; see `for_each` for why reading a whole
@@ -405,7 +453,7 @@ impl<V: Copy> RawMap<V> {
             // SAFETY: `slot` is within the old block and its `key` was
             // initialized when that block was created.
             let key = unsafe { std::ptr::addr_of!((*slot).key).read() };
-            if key != EMPTY && key != TOMBSTONE {
+            if key != EMPTY {
                 // SAFETY: a live key means `value` was written in this slot.
                 let value = unsafe { std::ptr::addr_of!((*slot).value).read() };
                 self.insert_no_grow(key, value);
@@ -421,7 +469,6 @@ impl<V: Copy> fmt::Debug for RawMap<V> {
         f.debug_struct("RawMap")
             .field("len", &self.len)
             .field("capacity", &self.capacity)
-            .field("tombstones", &self.tombstones)
             .field("max_capacity", &self.max_capacity)
             .finish()
     }
@@ -430,21 +477,21 @@ impl<V: Copy> fmt::Debug for RawMap<V> {
 impl<V: Copy> RawMap<V> {
     /// Maps an arbitrary `u64` into the range this map can store.
     ///
-    /// Sets the low bit and clears the high bit, so the result is never `0` and
-    /// never `u64::MAX`. That costs two bits of a 64-bit hash, which changes
-    /// the collision rate by nothing that could ever be measured, and unlike
-    /// folding onto a fixed value it never maps two *distinct* useful hashes
-    /// together any more often than hashing already does.
+    /// Sets the low bit, so the result is never `0`. That costs one bit of a
+    /// 64-bit hash, which changes the collision rate by nothing that could ever
+    /// be measured, and unlike folding onto a fixed value it never maps two
+    /// *distinct* useful hashes together any more often than hashing already
+    /// does.
     #[inline(always)]
     pub const fn usable_key(raw: u64) -> u64 {
-        (raw | 1) & !(1 << 63)
+        raw | 1
     }
 }
 
-/// Whether `key` is one of the two values the table reserves for slot state.
+/// Whether `key` is the value the table reserves for an empty slot.
 #[inline(always)]
 const fn is_reserved(key: u64) -> bool {
-    key == EMPTY || key == TOMBSTONE
+    key == EMPTY
 }
 
 /// Finalizer for 64-bit hashes, from SplitMix64.
@@ -473,8 +520,8 @@ mod tests {
 
     /// Miri interprets every instruction, so the native loop counts turn a few
     /// of these into minutes each. Scaling them keeps Miri in the ordinary CI
-    /// path; the properties under test -- growth, tombstone reuse, key
-    /// distribution -- all show up well below the native counts.
+    /// path; the properties under test -- growth, removal, key distribution --
+    /// all show up well below the native counts.
     /// Deliberately larger than [`miri_scale`] would give. Two tests below turn
     /// on crossing `MIN_CAPACITY`'s load factor, so a value under 512 would stop
     /// them testing growth and fullness at all — which is exactly what happened
@@ -533,10 +580,11 @@ mod tests {
         assert_eq!(m.len(), count as usize / 2);
     }
 
-    /// The classic open-addressing bug: probing stops at a tombstone and an
-    /// entry that collided with the removed key becomes unreachable.
+    /// The classic open-addressing bug: a removal empties a slot in the middle
+    /// of a cluster and an entry that collided with the removed key becomes
+    /// unreachable behind it.
     #[test]
-    fn probing_continues_past_tombstones() {
+    fn a_removal_does_not_hide_the_entries_that_probed_past_it() {
         let (arena, mut m) = map(1 << 12);
         // Force a collision chain by using keys that hash into the same slot.
         // Rather than reverse the hash, insert enough keys that chains are
@@ -551,19 +599,19 @@ mod tests {
         for i in 0..count {
             let key = i * 7 + 1;
             let expected = if i % 3 == 0 { None } else { Some(i as u32) };
-            assert_eq!(m.get(key), expected, "key {key} lost behind a tombstone");
+            assert_eq!(m.get(key), expected, "key {key} lost behind a removal");
         }
     }
 
     #[test]
-    fn reinserting_a_removed_key_reuses_its_tombstone() {
+    fn churning_the_same_keys_does_not_grow_the_table() {
         let (arena, mut m) = map(1 << 12);
         for i in 1..=500u64 {
             m.insert(&arena, i, i as u32);
         }
         let capacity_before = m.capacity();
-        // Churn far more than the table could hold if tombstones accumulated
-        // without being reclaimed.
+        // Churn far more than the table could hold if removals left anything
+        // behind.
         #[cfg(miri)]
         const ROUNDS: u64 = 3;
         #[cfg(not(miri))]
@@ -578,8 +626,79 @@ mod tests {
         assert_eq!(
             m.capacity(),
             capacity_before,
-            "steady-state churn grew the table; tombstones are not being reclaimed"
+            "steady-state churn grew the table; removals are not freeing their slots"
         );
+    }
+
+    /// The leak a tombstone was: distinct keys churned through a table at its
+    /// ceiling, with only a handful live at any time. Each removal left a
+    /// tombstone and each insertion that missed one used up an empty slot, so
+    /// the table reached its load factor with 64 entries in it and refused
+    /// every key after that. A program's allocator hands out addresses it has
+    /// never used before for as long as the program runs.
+    #[test]
+    fn churning_distinct_keys_at_the_ceiling_never_fills_the_table() {
+        const LIVE: u64 = 64;
+        let (arena, mut m) = map(MIN_CAPACITY);
+        for key in 1..=SCALE as u64 {
+            assert_eq!(
+                m.insert(&arena, key, key as u32),
+                Insert::Added,
+                "key {key} was refused with {} entries live",
+                m.len()
+            );
+            if key > LIVE {
+                assert_eq!(m.remove(key - LIVE), Some((key - LIVE) as u32));
+            }
+        }
+        assert_eq!(m.len(), LIVE as usize);
+        assert_eq!(m.capacity(), MIN_CAPACITY);
+        for key in SCALE as u64 - LIVE + 1..=SCALE as u64 {
+            assert_eq!(m.get(key), Some(key as u32), "key {key} was lost");
+        }
+    }
+
+    /// Closing a gap moves entries, and a move to the wrong slot hides an entry
+    /// from every later probe. So every operation is checked against a model,
+    /// in a table small and full enough that clusters are long and wrap past
+    /// its end, which is where the arithmetic of "passes through the gap" is
+    /// easiest to get wrong.
+    #[test]
+    fn removals_and_insertions_agree_with_a_model() {
+        use std::collections::HashMap;
+
+        // Below the load factor of the smallest table, so that nothing is
+        // refused and every difference from the model is a lost entry.
+        const KEYS: u64 = (MIN_CAPACITY as u64) * 15 / 32;
+        let operations = miri_scale(200_000) as u64;
+        let (arena, mut m) = map(MIN_CAPACITY);
+        let mut model: HashMap<u64, u32> = HashMap::new();
+
+        for step in 0..operations {
+            let draw = mix(step);
+            let key = draw % KEYS + 1;
+            if draw >> 63 == 0 {
+                let expected = if model.insert(key, step as u32).is_some() {
+                    Insert::Replaced
+                } else {
+                    Insert::Added
+                };
+                assert_eq!(m.insert(&arena, key, step as u32), expected, "step {step}");
+            } else {
+                assert_eq!(m.remove(key), model.remove(&key), "step {step}");
+            }
+            if step % 97 == 0 {
+                assert_eq!(m.len(), model.len(), "step {step}");
+                for key in 1..=KEYS {
+                    assert_eq!(
+                        m.get(key),
+                        model.get(&key).copied(),
+                        "key {key}, step {step}"
+                    );
+                }
+            }
+        }
+        assert_eq!(m.capacity(), MIN_CAPACITY, "the table grew");
     }
 
     #[test]
@@ -646,16 +765,10 @@ mod tests {
         for raw in interesting {
             let key = RawMap::<u32>::usable_key(raw);
             assert_ne!(key, EMPTY, "usable_key({raw:#x}) produced the empty marker");
-            assert_ne!(
-                key, TOMBSTONE,
-                "usable_key({raw:#x}) produced the tombstone marker"
-            );
         }
         for i in 0..(SCALE * 2) as u64 {
             for raw in [mix(i), mix(i).wrapping_neg(), i] {
-                let key = RawMap::<u32>::usable_key(raw);
-                assert_ne!(key, EMPTY);
-                assert_ne!(key, TOMBSTONE);
+                assert_ne!(RawMap::<u32>::usable_key(raw), EMPTY);
             }
         }
     }
@@ -725,33 +838,42 @@ mod tests {
         }
     }
 
-    /// The two reserved values must be *inert*, not merely unlikely. Looking up
-    /// key 0 once matched the first never-written slot and read its
-    /// uninitialized value, which Miri reports as undefined behaviour.
+    /// The reserved value must be *inert*, not merely unlikely. Looking up key
+    /// 0 once matched the first never-written slot and read its uninitialized
+    /// value, which Miri reports as undefined behaviour.
     #[test]
-    fn reserved_keys_are_inert_rather_than_matching_empty_slots() {
+    fn the_reserved_key_is_inert_rather_than_matching_empty_slots() {
         let (arena, mut m) = map(1 << 12);
         for i in 1..=100u64 {
             m.insert(&arena, i, i as u32);
         }
 
         assert_eq!(m.get(EMPTY), None, "key 0 matched an empty slot");
-        assert_eq!(m.get(TOMBSTONE), None, "u64::MAX matched a slot");
         assert_eq!(m.remove(EMPTY), None);
-        assert_eq!(m.remove(TOMBSTONE), None);
         assert_eq!(m.insert(&arena, EMPTY, 1), Insert::Full);
-        assert_eq!(m.insert(&arena, TOMBSTONE, 1), Insert::Full);
-        assert_eq!(m.len(), 100, "a reserved key changed the table's length");
+        assert_eq!(m.len(), 100, "the reserved key changed the table's length");
+    }
+
+    /// `u64::MAX` marked removed slots while removal left tombstones. Nothing
+    /// marks them now, so it is a key like any other.
+    #[test]
+    fn the_former_tombstone_value_is_an_ordinary_key() {
+        let (arena, mut m) = map(1 << 12);
+        assert_eq!(m.get(u64::MAX), None);
+        assert_eq!(m.insert(&arena, u64::MAX, 7), Insert::Added);
+        assert_eq!(m.get(u64::MAX), Some(7));
+        assert_eq!(m.remove(u64::MAX), Some(7));
+        assert_eq!(m.get(u64::MAX), None);
+        assert!(m.is_empty());
     }
 
     /// The same lookup against a completely empty table, where every slot in the
     /// probe sequence is uninitialized.
     #[test]
-    fn reserved_keys_are_inert_on_an_empty_table() {
+    fn the_reserved_key_is_inert_on_an_empty_table() {
         let (arena, mut m) = map(1 << 12);
         m.insert(&arena, 1, 1);
         m.remove(1);
         assert_eq!(m.get(EMPTY), None);
-        assert_eq!(m.get(TOMBSTONE), None);
     }
 }

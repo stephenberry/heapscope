@@ -42,14 +42,13 @@
 //! The cost is 50% more memory per live block, which is bounded by
 //! [`DEFAULT_MAX_LIVE_BLOCKS`] and visible in the profile's self-metrics.
 //!
-//! # Two addresses cannot be tracked
+//! # One address cannot be tracked
 //!
-//! `RawMap` reserves `0` and `u64::MAX` to mark empty and removed slots, so a
-//! block at either address is not tracked. Neither is a valid heap block
-//! address on any supported platform: an allocator returns null only to signal
-//! failure, and `u64::MAX` is not a canonical user-space address anywhere. The
-//! table refuses them rather than mapping them onto some other key, because
-//! folding would make two distinct addresses share one entry.
+//! `RawMap` reserves `0` to mark an empty slot, so a block at null is not
+//! tracked. It is not a valid heap block address on any supported platform: an
+//! allocator returns null only to signal failure. The table refuses it rather
+//! than mapping it onto some other key, because folding would make two
+//! distinct addresses share one entry.
 
 use std::fmt;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -712,23 +711,18 @@ mod tests {
         );
     }
 
-    /// Neither reserved address can be tracked, and neither may disturb the
-    /// table when offered.
+    /// The reserved address cannot be tracked, and may not disturb the table
+    /// when offered.
     #[test]
-    fn reserved_addresses_are_refused_rather_than_folded() {
+    fn the_reserved_address_is_refused_rather_than_folded() {
         let arena = Arena::new();
         let table = LiveBlocks::with_capacity(1 << 12);
 
         table.insert(&arena, 0x1000, block(1, 1));
         assert!(!table.insert(&arena, 0, block(2, 2)), "null was tracked");
-        assert!(
-            !table.insert(&arena, usize::MAX, block(3, 3)),
-            "the tombstone marker was tracked"
-        );
 
         assert_eq!(table.get(0), None);
         assert_eq!(table.remove(0), None);
-        assert_eq!(table.remove(usize::MAX), None);
         assert_eq!(table.len(), 1, "a refused address changed the table");
         assert!(table.get(0x1000).is_some(), "the real block was disturbed");
     }
