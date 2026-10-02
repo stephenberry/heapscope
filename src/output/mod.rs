@@ -47,7 +47,7 @@ use crate::internals::clock::TimeSource;
 use crate::internals::engine::Engine;
 use crate::internals::pp::PpId;
 use crate::symbol::modules::{self, Module};
-use crate::symbol::{Symbolized, Trimmed};
+use crate::symbol::{FunctionNames, Symbolized, Trimmed};
 
 pub use crate::internals::engine::{GlobalStats, Settings, Shutdown};
 pub use crate::internals::pp::Counters;
@@ -56,7 +56,7 @@ pub use crate::internals::site::TallyStats;
 pub use dhat_v2::{FrameFormat, RawAddresses};
 pub use folded::FoldedMetric;
 
-pub(crate) use dhat_v2::push_hex;
+pub(crate) use dhat_v2::{name_after_address, push_hex};
 pub(crate) use text::{count, Ranking};
 
 /// How much of one of the profiler's tables is in use.
@@ -749,10 +749,22 @@ impl Snapshot {
     /// Profiler read. None of them knows anything about this crate, and this is
     /// the format that does not ask them to.
     ///
-    /// Frames are rendered by [`Symbolized`] and [`Trimmed`], the same pair
-    /// [`Snapshot::write_dhat_v2`] uses — a flame graph is read at a glance, so
-    /// it is where the nine frames of runtime entry every stack shares cost the
-    /// most.
+    /// Frames are rendered by [`FunctionNames`] and [`Trimmed`]: the name of
+    /// the function and nothing else, which is the one rendering in this crate
+    /// that drops the address. A flame graph merges frames by their text, so
+    /// the address would keep apart two calls the picture should draw as one,
+    /// and the image path in every frame would make every label a path. Where
+    /// no name is found the frame is `[image+0xfileaddress]`, by file name.
+    /// [`FunctionNames`] has the details and what the rendering gives up; this
+    /// method rendered with [`Symbolized`] up to 0.1.0, and
+    /// [`Snapshot::write_folded_with`] still takes it.
+    ///
+    /// Trimmed because a flame graph is read at a glance, so it is where the
+    /// nine frames of runtime entry every stack shares cost the most.
+    ///
+    /// Two points that render alike are one line, with their counts summed, so
+    /// no reader of the file has to merge repeated stacks itself and each
+    /// [`FoldedMetric`] still sums to the figure it claims.
     ///
     /// # Errors
     ///
@@ -763,7 +775,7 @@ impl Snapshot {
     /// [`FoldedMetric::needs_block_lifetimes`], which is the check that predicts
     /// this.
     pub fn write_folded<W: Write>(&self, out: W, metric: FoldedMetric) -> io::Result<()> {
-        let names = Symbolized::new(&self.modules);
+        let names = FunctionNames::new(&self.modules);
         if self.settings.trim_frames {
             self.write_folded_with(out, &Trimmed::new(names), metric)
         } else {
@@ -775,9 +787,10 @@ impl Snapshot {
     ///
     /// Worth reaching for here more than elsewhere: a flame graph groups by the
     /// text of a frame, so what a renderer chooses to show is what the picture
-    /// merges. [`ModuleOffsets`](crate::symbol::ModuleOffsets) draws one tower
-    /// per image, and [`Symbolized`] without [`Trimmed`] keeps the runtime entry
-    /// sequence that [`Snapshot::write_folded`] leaves out.
+    /// merges. [`Symbolized`] keeps every return address apart and carries the
+    /// image and file address that make a frame resolvable afterwards, and
+    /// [`FunctionNames`] without [`Trimmed`] keeps the runtime entry sequence
+    /// that [`Snapshot::write_folded`] leaves out.
     pub fn write_folded_with<W: Write>(
         &self,
         out: W,

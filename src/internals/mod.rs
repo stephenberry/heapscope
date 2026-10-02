@@ -27,6 +27,15 @@ pub mod site;
 pub mod stack;
 pub mod table;
 
+/// How `heapscope-symbolize` labels an image in a frame with no name, by the
+/// rule [`FunctionNames`](crate::symbol::FunctionNames) uses.
+///
+/// The one item here that is not an engine primitive: it allocates, and it runs
+/// at output time, never from the shim. It lives here because this is the
+/// module without a stability promise, and the binary needs the library's rule
+/// rather than a copy of it. See the function's own documentation.
+pub use crate::symbol::labels::image_labels;
+
 /// Pads and aligns a value to its own cache line.
 ///
 /// Sharding only reduces contention if the shards are on different cache lines.

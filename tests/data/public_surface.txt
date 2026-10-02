@@ -303,6 +303,7 @@ fn heapscope::output::Snapshot::write_text_summary_with
 fn heapscope::region
 fn heapscope::stats::EventStats::get
 fn heapscope::stats::HeapStats::get
+fn heapscope::symbol::FunctionNames::new
 fn heapscope::symbol::ModuleOffsets::new
 fn heapscope::symbol::Symbolized::new
 fn heapscope::symbol::Trimmed::new
@@ -518,6 +519,8 @@ impl heapscope::stats::StatsError: Eq (derived)
 impl heapscope::stats::StatsError: PartialEq (derived)
 impl heapscope::stats::StatsError: fmt::Display
 impl heapscope::stats::StatsError: std::error::Error
+impl heapscope::symbol::FunctionNames: FrameFormat
+impl heapscope::symbol::FunctionNames: std::fmt::Debug
 impl heapscope::symbol::ModuleOffsets: Clone (derived)
 impl heapscope::symbol::ModuleOffsets: Copy (derived)
 impl heapscope::symbol::ModuleOffsets: Debug (derived)
@@ -589,6 +592,7 @@ struct heapscope::output::TallyStats
 struct heapscope::output::ThreadStats
 struct heapscope::stats::EventStats
 struct heapscope::stats::HeapStats
+struct heapscope::symbol::FunctionNames
 struct heapscope::symbol::ModuleOffsets
 struct heapscope::symbol::Resolved
 struct heapscope::symbol::Symbolized

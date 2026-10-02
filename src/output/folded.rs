@@ -36,6 +36,15 @@
 //! rather than left to the reader, because a folded file that is the wrong way
 //! round still renders — upside down, with every stack rooted in whatever
 //! allocated — and looks like a profile rather than like a mistake.
+//!
+//! # Frames are function names
+//!
+//! A flame graph merges frames by their text, so the renderer decides what the
+//! picture merges. The default is
+//! [`FunctionNames`](crate::symbol::FunctionNames), which writes the name of the
+//! function and nothing that would keep two return addresses in it apart. That
+//! makes distinct program points render alike as a matter of course, and the
+//! emitter merges them into one line rather than writing the stack twice.
 
 use std::io::{self, Write};
 
@@ -159,10 +168,14 @@ pub(super) fn write<W: Write>(
     // The line being built, and the stacks already seen. Held rather than
     // streamed because two program points can render onto one stack — the same
     // collapse `dhat_v2::Folded` handles, arriving here through trimming or
-    // through a renderer that names two addresses alike — and a folded file with
-    // a repeated stack is not wrong, merely one every consumer has to sum for
-    // itself. Summing here means the file's line count is its distinct-stack
-    // count.
+    // through a renderer that names two addresses alike. The default renderer,
+    // `FunctionNames`, does that on purpose: it exists so that two return
+    // addresses in one function are one frame. A repeated stack is not
+    // malformed, but the format has no specification to say what a reader must
+    // do with one, so summing here means no reader's answer to that matters,
+    // and the file's line count is its distinct-stack count. Every point's count
+    // still lands on exactly one line, which is what keeps each metric adding
+    // up to its global figure.
     let mut stack = String::new();
     let mut totals: Vec<(String, u64)> = Vec::with_capacity(snapshot.points.len());
     let mut index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
@@ -257,7 +270,9 @@ mod tests {
     impl FrameFormat for Names {
         fn format(&self, address: usize, out: &mut String) {
             out.push_str(match address {
-                0x10 => "inner",
+                // Two return addresses in one function, which is what a
+                // function that allocates through two of its calls looks like.
+                0x10 | 0x11 => "inner",
                 0x20 => "middle",
                 0x30 => "outer",
                 0x40 => "other",
@@ -340,10 +355,13 @@ mod tests {
     /// wide by is a figure the profile reports somewhere else.
     #[test]
     fn every_metric_sums_to_the_global_figure_it_claims() {
+        // The first and last render alike, so this also holds the property
+        // across a merge.
         let snapshot = snapshot(vec![
             point(&[0x10, 0x30], 4096),
             point(&[0x20, 0x30], 2048),
             point(&[0x40], 512),
+            point(&[0x11, 0x30], 1024),
         ]);
         for (metric, total) in [
             (FoldedMetric::TotalBytes, snapshot.stats.total_bytes),
@@ -395,6 +413,35 @@ mod tests {
             FoldedMetric::TotalBytes,
         );
         assert_eq!(text, "outer;inner 125\n");
+    }
+
+    /// The case the default renderer exists for: two points that differ only in
+    /// which return address inside one function they passed through. They are
+    /// two points to the engine and one stack to the reader, so one line, and
+    /// one placed where the first of them was.
+    #[test]
+    fn two_return_addresses_in_one_function_are_one_line() {
+        let text = folded(
+            &snapshot(vec![
+                point(&[0x10, 0x30], 100),
+                point(&[0x40], 7),
+                point(&[0x11, 0x30], 25),
+            ]),
+            FoldedMetric::TotalBytes,
+        );
+        assert_eq!(text, "outer;inner 125\nother 7\n");
+    }
+
+    /// Recursion is a function on the stack under itself, and a flame graph
+    /// draws that as nesting. Merging is between *lines*; nothing collapses
+    /// adjacent frames within one, which would make a recursion depth vanish.
+    #[test]
+    fn a_recursive_stack_keeps_every_level() {
+        let text = folded(
+            &snapshot(vec![point(&[0x10, 0x11, 0x10, 0x30], 64)]),
+            FoldedMetric::TotalBytes,
+        );
+        assert_eq!(text, "outer;inner;inner;inner 64\n");
     }
 
     /// A zero cannot be drawn, and `inferno` rejects the line rather than

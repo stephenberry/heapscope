@@ -366,6 +366,7 @@ fn a_real_workload_is_recorded_end_to_end() {
     assert!(summary.contains("0x"), "the summary should name call sites");
 
     the_default_output_trims(&recorded, &parsed, &summary);
+    the_default_folded_output_trims(&recorded);
     symbolization_resolves_a_recorded_frame(&parsed);
 }
 
@@ -539,6 +540,102 @@ fn the_default_output_trims(snapshot: &heapscope::Snapshot, written: &json::Valu
              trimming ran; `trimmedFrames` above is what pins it here"
         );
     }
+}
+
+/// What `Snapshot::write_folded` does with no renderer, checked the same way
+/// and for a sharper reason.
+///
+/// Folded output renders with `FunctionNames`, whose frames are bare names, and
+/// `Trimmed` finds a name in them only by asking the renderer through
+/// `FrameFormat::name_of`. If that answer were lost (a wrapper that did not
+/// pass it on, a default that read the `0xADDR: ` shape), the rules would find
+/// nothing to read and the flame graph would quietly stop being trimmed, while
+/// every test of `Trimmed<Symbolized>` stayed green.
+///
+/// So the oracle is the rules applied to a rendering the folded path never
+/// uses, `Symbolized`'s. Where they hide frames, the default folded file must
+/// carry fewer frames than the same file untrimmed, and no stack that names
+/// this binary may still carry startup frames. Where they hide nothing, the two
+/// files must be identical, which pins the other half: nothing is removed that
+/// the rules would keep.
+fn the_default_folded_output_trims(snapshot: &heapscope::Snapshot) {
+    use heapscope::output::FrameFormat;
+    use heapscope::symbol::{FunctionNames, Symbolized, Trimmed};
+    use heapscope::FoldedMetric;
+
+    let names = Symbolized::new(&snapshot.modules);
+    let trimmed = Trimmed::new(Symbolized::new(&snapshot.modules));
+    // Only the points the file draws: a zero-width stack is left out of it.
+    let hidden: usize = snapshot
+        .points
+        .iter()
+        .filter(|point| point.counters.total_bytes > 0)
+        .map(|point| {
+            let stack: Vec<String> = point
+                .frames
+                .iter()
+                .map(|&address| {
+                    let mut frame = String::new();
+                    names.format(address, &mut frame);
+                    frame
+                })
+                .collect();
+            stack.len() - trimmed.keep(&stack).len()
+        })
+        .sum();
+
+    let mut out = Vec::new();
+    snapshot
+        .write_folded(&mut out, FoldedMetric::TotalBytes)
+        .expect("the default folded file");
+    let default = String::from_utf8(out).expect("UTF-8");
+
+    let mut out = Vec::new();
+    snapshot
+        .write_folded_with(
+            &mut out,
+            &FunctionNames::new(&snapshot.modules),
+            FoldedMetric::TotalBytes,
+        )
+        .expect("the untrimmed folded file");
+    let untrimmed = String::from_utf8(out).expect("UTF-8");
+
+    let stacks = |text: &str| -> Vec<Vec<String>> {
+        text.lines()
+            .map(|line| {
+                let (stack, _count) = line.rsplit_once(' ').expect("a count");
+                stack.split(';').map(String::from).collect()
+            })
+            .collect()
+    };
+    let frames = |text: &str| -> usize { stacks(text).iter().map(Vec::len).sum() };
+
+    if hidden == 0 {
+        assert_eq!(
+            default, untrimmed,
+            "the rules hide nothing in this profile, and the default folded \
+             file differs from the untrimmed one"
+        );
+        return;
+    }
+
+    assert!(
+        frames(&default) < frames(&untrimmed),
+        "the trimming rules hide {hidden} frames of this profile and the default \
+         folded file is no shorter than the untrimmed one, so `Trimmed` found no \
+         names in `FunctionNames`' frames"
+    );
+    let survivors: Vec<String> = stacks(&default)
+        .into_iter()
+        .filter(|stack| stack.iter().any(|frame| frame.contains("end_to_end::")))
+        .flatten()
+        .filter(|frame| is_runtime(frame))
+        .collect();
+    assert!(
+        survivors.is_empty(),
+        "the default folded file still carries runtime frames on stacks that \
+         name this binary's own functions: {survivors:#?}"
+    );
 }
 
 /// Frames a reader of a heap profile would call startup.

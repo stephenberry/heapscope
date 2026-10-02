@@ -55,6 +55,8 @@ heapscope-symbolize profile.native.json -f folded | inferno-flamegraph > heap.sv
 
 That composes better than it looks. Frame trimming reads frame *names*, so on Linux, where nothing is named at record time, nothing is trimmed either and every stack keeps the nine frames of runtime entry and the allocation path above it. Resolving first is what lets the same cut happen: **measured on the example program, 12–17 recorded frames per stack become 4–8.**
 
+The frames are function names alone, the same rendering `Output::folded` writes, and a frame still unnamed is its image's file name and the frame's `fileAddr`, `[libfoo.so+0x1a2b4]`. That number is the return address as the profile records it, not the call, so to resolve one by hand ask about one byte earlier, as [below](#resolving-offline-is-the-primary-path) describes. See [flame graphs](output-formats.md#frames-are-function-names) for why. Where the process could already name everything, the two agree: **measured on the example program on macOS aarch64, built with the current toolchain and with the 1.96 MSRV, the tool's folded file is byte-identical to the one `Output::folded` wrote at record time.** The 1.96 case needs care because `atos` cannot be told not to demangle and reads a legacy Rust symbol as C++, leaving its hash and escapes in place; the tool reassembles the symbol and demangles it the way the library does.
+
 For a profile recorded somewhere else, point it at the build:
 
 ```sh
@@ -69,7 +71,7 @@ It does not rewrite the bundled HTML page: that page renders from display names 
 
 In-process symbolization does not work on the binaries people ship: on a stripped image `dladdr` returns *success* with a null symbol name, and `strip = true` is common in release profiles. Resolving offline also means a profile recorded on one machine can be symbolized on another, against an archived build, a year later — which is why the build identity is recorded alongside the path.
 
-Whether a frame is named or not, it stays resolvable afterwards by a tool that was not running when the profile was recorded. In a rendered frame, the second number is the address **as it appears in the file**, not an offset from where the image was mapped — those are different numbers on macOS, where file addresses start at 0x1_0000_0000, and on a non-PIE executable, where they start at 0x400000. It is what the ELF tools take, less one.
+Whether a frame is named or not, it stays resolvable afterwards by a tool that was not running when the profile was recorded. Folded output is the one exception: a flame graph merges frames by their text, so its frames are names without addresses, and the native profile is what to keep. In a rendered frame, the second number is the address **as it appears in the file**, not an offset from where the image was mapped — those are different numbers on macOS, where file addresses start at 0x1_0000_0000, and on a non-PIE executable, where they start at 0x400000. It is what the ELF tools take, less one.
 
 Every recorded frame is a return address, the instruction *after* the call, so ask about one byte earlier to name the call itself. The address as recorded names whatever the compiler placed next, which across inlining is often another function entirely: on Linux, a `Vec` growing in `finish_grow` resolves to the `map_err` inlined after the allocator call. For a frame recorded at file address `0x10002c1f0`, ask about `0x10002c1ef`, and ask for inlined frames too, which name the function the code lies in as well as the one inlined there:
 

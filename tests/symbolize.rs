@@ -233,13 +233,25 @@ fn a_folded_rendering_carries_the_resolved_names(recorded: &Path) {
     // somewhere. Trimming and naming a frame by an inlined function can each
     // remove a program's own frame from a stack while the name survives on
     // another one, which the check above cannot tell apart.
-    let blocks = (BLOCKS * BLOCK_SIZE).to_string();
+    //
+    // At least the blocks' bytes rather than exactly, because a folded frame is
+    // a function name and two calls in one function are one frame. The
+    // function also allocates the `Vec` that keeps the blocks, through
+    // `Vec::with_capacity` too, and under legacy mangling, which this crate's
+    // MSRV emits, `Vec<T>::with_capacity` is one name for every instantiation:
+    // the two stacks are one line there, carrying the blocks and the outer
+    // vector's 1536 bytes **[measured, rustc 1.96, macOS]**. The smallest count
+    // that holds the blocks is the stack that holds them.
+    let blocks = BLOCKS * BLOCK_SIZE;
     let charged = folded
         .lines()
-        .find(|line| {
-            line.rsplit_once(' ')
-                .is_some_and(|(_, count)| count == blocks)
+        .filter_map(|line| {
+            let (_, count) = line.rsplit_once(' ')?;
+            let count = count.parse::<u64>().ok()?;
+            (count >= blocks as u64).then_some((count, line))
         })
+        .min_by_key(|&(count, _)| count)
+        .map(|(_, line)| line)
         .unwrap_or_else(|| panic!("no stack carries the {blocks} bytes of blocks:\n{folded}"));
     assert!(
         charged.contains("allocate_from_a_function_with_a_findable_name"),
@@ -314,11 +326,20 @@ fn a_folded_rendering_carries_the_resolved_names(recorded: &Path) {
          recorded, so nothing was trimmed:\n{folded}"
     );
 
-    // The name is added to the image and offset rather than replacing them, so
-    // a symbolized profile stays resolvable all over again.
+    // A named frame is the name alone, as the library's own folded output has
+    // it: the address that would keep two calls in one function apart, and the
+    // image path, are a record's business and not a flame graph's. The native
+    // profile the tool writes is where they stay.
+    let named = folded
+        .lines()
+        .flat_map(|line| line.rsplit_once(' ').expect("a count").0.split(';'))
+        .find(|frame| frame.contains("allocate_from_a_function_with_a_findable_name"))
+        .expect("the frame found above");
     assert!(
-        folded.contains("+0x"),
-        "the file attribution was dropped once a name was found:\n{folded}"
+        named.ends_with("::allocate_from_a_function_with_a_findable_name")
+            && !named.contains("0x")
+            && !named.contains(" ("),
+        "a named frame carries more than its name: {named}"
     );
 }
 

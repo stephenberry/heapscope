@@ -425,8 +425,12 @@ impl Output {
     /// # }
     /// ```
     ///
-    /// See [`Snapshot::write_folded`](crate::Snapshot::write_folded) for what
-    /// each metric counts, and for the one case this refuses to write:
+    /// Frames are function names alone, so a function is one frame however
+    /// many return addresses in it the program passed through.
+    ///
+    /// See [`Snapshot::write_folded`](crate::Snapshot::write_folded) for how
+    /// frames are rendered, what each metric counts, and the one case this
+    /// refuses to write:
     /// [`FoldedMetric::PeakBytes`] and [`FoldedMetric::LiveBytes`] are not
     /// measurements a run without block lifetimes took.
     pub fn folded(path: impl Into<PathBuf>, metric: FoldedMetric) -> Self {

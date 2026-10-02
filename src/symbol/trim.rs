@@ -298,10 +298,25 @@ impl<F: FrameFormat> FrameFormat for Trimmed<F> {
     /// decision it wraps is not a decorator: `Trimmed<F>` would silently undo
     /// an `F` that trims for reasons of its own, and the failure would look
     /// like frames reappearing for no reason.
+    ///
+    /// The names are read where `F` says they are, through
+    /// [`FrameFormat::name_of`], so the same rules trim
+    /// [`Symbolized`](super::Symbolized), which puts a name between an address
+    /// and an image, and [`FunctionNames`](super::FunctionNames), which writes
+    /// nothing but the name.
     fn keep(&self, frames: &[String]) -> Range<usize> {
         let inner = self.inner.keep(frames);
-        let mine = worth_showing(frames);
+        let mine = worth_showing_by(frames, |frame| self.inner.name_of(frame));
         inner.start.max(mine.start)..inner.end.min(mine.end)
+    }
+
+    /// Whatever `F` says, since the text is `F`'s.
+    ///
+    /// Forwarded rather than left to the default so that a `Trimmed` can itself
+    /// be wrapped, by a second `Trimmed` or by anything else that reads names,
+    /// and still find them in a rendering that is not the default shape.
+    fn name_of<'a>(&self, frame: &'a str) -> Option<&'a str> {
+        self.inner.name_of(frame)
     }
 }
 
@@ -311,11 +326,28 @@ impl<F: FrameFormat> FrameFormat for Trimmed<F> {
 /// `[unwalkable]` by the emitter, and a stack that *was* walked must not be
 /// reduced to a claim that it could not be.
 ///
+/// Frames are read in the `0xADDR: name (image+0xoffset)` shape whatever
+/// produced them: the shape of every address-carrying renderer in this crate,
+/// and of the frames `heapscope-symbolize` builds from a resolved profile.
+/// [`Trimmed`] does not call this. It asks the renderer it wraps where the names
+/// are, through [`FrameFormat::name_of`], so that a renderer in another shape is
+/// trimmed by the same rules.
+///
 /// Public because [`Trimmed`] is not the only way to want these rules: a
-/// [`FrameFormat`] that renders in some other shape, or that has trimming of
-/// its own to combine with these, can call this directly from its
-/// [`keep`](FrameFormat::keep) rather than reimplementing the two cuts.
+/// [`FrameFormat`] that has trimming of its own to combine with these can call
+/// this directly from its [`keep`](FrameFormat::keep) rather than
+/// reimplementing the two cuts.
 pub fn worth_showing(frames: &[String]) -> Range<usize> {
+    worth_showing_by(frames, crate::output::name_after_address)
+}
+
+/// [`worth_showing`], reading each frame's name with `name_of`.
+///
+/// The rules are about names, and only the renderer knows where in its text the
+/// name is. A frame `name_of` finds nothing in is neither on the allocation
+/// path nor the runtime marker, so a rendering that cannot be read is left
+/// whole rather than trimmed by guesswork.
+fn worth_showing_by(frames: &[String], name_of: impl Fn(&str) -> Option<&str>) -> Range<usize> {
     if frames.is_empty() {
         return 0..0;
     }
@@ -342,17 +374,6 @@ pub fn worth_showing(frames: &[String]) -> Range<usize> {
     }
 
     start..end
-}
-
-/// The part of a rendered frame that names code, or `None`.
-///
-/// Frames are rendered `0x1044c81f0: name (image+0x2c1f0)`, the shape Valgrind
-/// uses, so the name begins after the first `": "`. A [`FrameFormat`] that
-/// produces some other shape yields `None` here and is left entirely alone,
-/// which is the right answer: trimming a rendering we cannot read would be
-/// guessing.
-fn name_of(frame: &str) -> Option<&str> {
-    frame.split_once(": ").map(|(_, name)| name)
 }
 
 /// Whether `name` is one of the frames between a program and this crate's shim.
@@ -409,7 +430,8 @@ mod tests {
         frames[worth_showing(&frames)]
             .iter()
             .map(|frame| {
-                let name = name_of(frame).expect("the test builds well-shaped frames");
+                let name = crate::output::name_after_address(frame)
+                    .expect("the test builds well-shaped frames");
                 name.split_once(" (")
                     .expect("and an image attribution")
                     .0

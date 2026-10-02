@@ -46,7 +46,9 @@ use std::process::{Command, Stdio};
 /// One resolved location, and the inlined frames above it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Frame {
-    pub function: String,
+    /// The function, or `None` where the tool placed the address in a file
+    /// and line without naming it.
+    pub function: Option<String>,
     pub file: Option<String>,
     pub line: Option<u32>,
 }
@@ -347,30 +349,87 @@ fn split_location(text: &str) -> (Option<String>, Option<u32>) {
 
 /// Names go through this crate's demangler, which refuses what it does not
 /// understand and leaves the linker's own spelling in place.
+///
+/// One tool needs more than that. `atos` cannot be told not to demangle, and
+/// it reads a legacy Rust symbol as a C++ one, which is what the Itanium
+/// mangling it borrows says it is. What comes back is neither form:
+///
+/// ```text
+/// profile_a_program::main::h1f68ab8d4717cc32
+/// _$LT$alloc..alloc..Global$u20$as$u20$core..alloc..Allocator$GT$::allocate::he85b0d7bc7a3e8f2
+/// ```
+///
+/// The hash is still there, and so are Rust's own escapes, so the name matches
+/// neither what the library writes for the same frame nor a single one of the
+/// trimming rules' prefixes. This crate's MSRV emits legacy mangling, so on
+/// macOS that was every frame of a profile built with it. See [`remangled`].
 fn readable(name: &str) -> String {
     let mut out = String::new();
     if heapscope::demangle(name, &mut out) {
         return out;
     }
+    if let Some(mangled) = remangled(name) {
+        out.clear();
+        if heapscope::demangle(&mangled, &mut out) {
+            return out;
+        }
+    }
     String::from(name)
+}
+
+/// The legacy mangled symbol a C++ demangler turned into `name`, or `None` if
+/// `name` does not look like one.
+///
+/// Legacy mangling is Itanium's `_ZN` nested name: each path component
+/// length-prefixed, the last one the hash, then `E`. A C++ demangler undoes
+/// exactly that framing and touches nothing inside a component, so splitting
+/// on `::` and putting the framing back gives the bytes the linker wrote, and
+/// the library's demangler then produces the text it produces everywhere else.
+/// `::` cannot occur inside a legacy component, which escapes it as `..`.
+///
+/// Recognised by its end: a final component of `h` and sixteen hexadecimal
+/// digits, which is the hash's width in every toolchain this crate supports.
+/// A C++ function whose last name component happened to have that shape would
+/// be rewritten too; if the rewrite does not demangle, the name is left as the
+/// tool gave it, and if it does, what is lost is a component that was spelled
+/// like a hash.
+fn remangled(name: &str) -> Option<String> {
+    let (path, hash) = name.rsplit_once("::")?;
+    let digits = hash.strip_prefix('h')?;
+    if digits.len() != 16 || !digits.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut mangled = String::from("_ZN");
+    for component in path.split("::") {
+        if component.is_empty() {
+            return None;
+        }
+        mangled.push_str(&component.len().to_string());
+        mangled.push_str(component);
+    }
+    mangled.push_str(&hash.len().to_string());
+    mangled.push_str(hash);
+    mangled.push('E');
+    Some(mangled)
 }
 
 /// One frame, or nothing where the tool placed neither a name nor a file.
 ///
 /// A location with no name is kept: `addr2line` against a binary that has line
 /// tables and no symbol table answers exactly that way, and a file and line is
-/// more than the reader had.
+/// more than the reader had. Its `function` is `None`, not a placeholder: a
+/// placeholder in the profile is a name to every later reader, which would hide
+/// the name the running process recorded and merge unrelated frames under it.
 fn frame(name: &str, file: Option<String>, line: Option<u32>) -> Option<Frame> {
     match (is_unknown(name), &file) {
         (true, None) => None,
-        // The same three characters every unnamed frame in this crate uses.
         (true, Some(_)) => Some(Frame {
-            function: String::from("???"),
+            function: None,
             file,
             line,
         }),
         (false, _) => Some(Frame {
-            function: readable(name),
+            function: Some(readable(name)),
             file,
             line,
         }),
@@ -532,7 +591,10 @@ _ZN17profile_a_program5churn17h0123456789abcdefE
         assert_eq!(answers.len(), 3);
 
         let first = answers[0].as_ref().expect("a named frame");
-        assert_eq!(first.frames[0].function, "core::fmt::write");
+        assert_eq!(
+            first.frames[0].function.as_deref(),
+            Some("core::fmt::write")
+        );
         assert_eq!(
             first.frames[0].file.as_deref(),
             Some("/rustc/lib/core/src/fmt/mod.rs")
@@ -541,8 +603,10 @@ _ZN17profile_a_program5churn17h0123456789abcdefE
 
         assert_eq!(answers[1], None, "`??` is not a name");
         assert_eq!(
-            answers[2].as_ref().expect("a named frame").frames[0].function,
-            "profile_a_program::churn"
+            answers[2].as_ref().expect("a named frame").frames[0]
+                .function
+                .as_deref(),
+            Some("profile_a_program::churn")
         );
     }
 
@@ -560,8 +624,11 @@ _ZN17profile_a_program5parse17hfedcba9876543210E
         let answers = parse_llvm(text, 1);
         let frames = &answers[0].as_ref().expect("frames").frames;
         assert_eq!(frames.len(), 2, "{frames:#?}");
-        assert_eq!(frames[0].function, "core::option::unwrap");
-        assert_eq!(frames[1].function, "profile_a_program::parse");
+        assert_eq!(frames[0].function.as_deref(), Some("core::option::unwrap"));
+        assert_eq!(
+            frames[1].function.as_deref(),
+            Some("profile_a_program::parse")
+        );
         assert_eq!(frames[1].line, Some(42));
     }
 
@@ -589,24 +656,26 @@ _ZN17profile_a_program5churn17h0123456789abcdefE
         assert_eq!(answers.len(), 3, "{answers:#?}");
 
         let inlined = &answers[0].as_ref().expect("frames").frames;
-        let names: Vec<&str> = inlined
+        let names: Vec<Option<&str>> = inlined
             .iter()
-            .map(|frame| frame.function.as_str())
+            .map(|frame| frame.function.as_deref())
             .collect();
         assert_eq!(
             names,
             [
-                "alloc::alloc::realloc",
-                "alloc::raw_vec::finish_grow",
-                "profile_a_program::grow"
+                Some("alloc::alloc::realloc"),
+                Some("alloc::raw_vec::finish_grow"),
+                Some("profile_a_program::grow")
             ],
             "innermost first"
         );
         assert_eq!(inlined[2].line, Some(12));
 
         assert_eq!(
-            answers[1].as_ref().expect("a name").frames[0].function,
-            "profile_a_program::churn"
+            answers[1].as_ref().expect("a name").frames[0]
+                .function
+                .as_deref(),
+            Some("profile_a_program::churn")
         );
         assert_eq!(answers[2], None);
     }
@@ -658,14 +727,17 @@ _malloc (in libsystem_malloc.dylib) + 32
         assert_eq!(answers.len(), 3);
 
         let first = answers[0].as_ref().expect("a name");
-        assert_eq!(first.frames[0].function, "profile_a_program::churn");
+        assert_eq!(
+            first.frames[0].function.as_deref(),
+            Some("profile_a_program::churn")
+        );
         assert_eq!(first.frames[0].file.as_deref(), Some("main.rs"));
         assert_eq!(first.frames[0].line, Some(129));
 
         // An offset is not a location, and reading it as one would put every
         // system frame at a line number that is really a byte count.
         let second = answers[1].as_ref().expect("a name");
-        assert_eq!(second.frames[0].function, "_malloc");
+        assert_eq!(second.frames[0].function.as_deref(), Some("_malloc"));
         assert_eq!(second.frames[0].file, None);
         assert_eq!(second.frames[0].line, None);
 
@@ -729,13 +801,65 @@ _malloc (in libsystem_malloc.dylib) + 32
     }
 
     /// A binary with line tables and no symbol table. The location is worth
-    /// keeping even though the name is not.
+    /// keeping even though the name is not, and the missing name is missing
+    /// rather than spelled as one: a placeholder would be read as a name.
     #[test]
     fn a_location_with_no_name_is_still_an_answer() {
         let answers = parse_addr2line("0x4d\n??\n/src/main.rs:77\n", &[0x4d]);
         let frame = &answers[0].as_ref().expect("a location").frames[0];
-        assert_eq!(frame.function, "???");
+        assert_eq!(frame.function, None);
+        assert_eq!(frame.file.as_deref(), Some("/src/main.rs"));
         assert_eq!(frame.line, Some(77));
+    }
+
+    /// What `atos` makes of a legacy Rust symbol, captured from a profile built
+    /// with this crate's MSRV: a C++ demangling that keeps the hash and Rust's
+    /// own escapes. Read back to the text the library writes for the same
+    /// symbol, which is what lets the trimming rules and a flame graph match.
+    #[test]
+    fn a_legacy_name_atos_demangled_as_cpp_reads_as_the_library_reads_it() {
+        let text = "\
+profile_a_program::main::h1f68ab8d4717cc32 (in profile_a_program) (main.rs:12)
+_$LT$alloc..alloc..Global$u20$as$u20$core..alloc..Allocator$GT$::allocate::he85b0d7bc7a3e8f2 (in profile_a_program) (alloc.rs:241)
+";
+        let answers = parse_atos(text, 2);
+        let names: Vec<Option<&str>> = answers
+            .iter()
+            .map(|answer| {
+                answer.as_ref().expect("a name").frames[0]
+                    .function
+                    .as_deref()
+            })
+            .collect();
+        assert_eq!(
+            names,
+            [
+                Some("profile_a_program::main"),
+                Some("<alloc::alloc::Global as core::alloc::Allocator>::allocate"),
+            ]
+        );
+
+        // The same text the library produces from the symbol itself.
+        let mut library = String::new();
+        assert!(heapscope::demangle(
+            "_ZN17profile_a_program4main17h1f68ab8d4717cc32E",
+            &mut library
+        ));
+        assert_eq!(names[0], Some(library.as_str()));
+    }
+
+    /// Only a final component shaped like the hash triggers the rewrite, and a
+    /// rewrite the demangler refuses leaves the name as the tool gave it.
+    #[test]
+    fn a_name_without_a_legacy_hash_is_left_alone() {
+        assert_eq!(readable("_malloc"), "_malloc");
+        assert_eq!(
+            readable("std::vector<int>::push_back"),
+            "std::vector<int>::push_back"
+        );
+        // Fifteen digits is not the hash.
+        assert_eq!(readable("a::b::h0123456789abcde"), "a::b::h0123456789abcde");
+        assert_eq!(remangled("a::::h0123456789abcdef"), None);
     }
 
     /// Only `atos` takes the runtime address. The two numbers are equal exactly

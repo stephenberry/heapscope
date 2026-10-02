@@ -40,6 +40,7 @@ pub mod demangle;
 #[cfg(all(unix, not(miri)))]
 mod dl;
 pub mod dynamic;
+pub(crate) mod labels;
 pub mod modules;
 pub mod trim;
 
@@ -48,6 +49,7 @@ use std::collections::HashMap;
 
 use crate::output::FrameFormat;
 use dynamic::Symbol;
+use labels::image_labels;
 use modules::Module;
 
 pub use demangle::demangle;
@@ -280,6 +282,10 @@ fn push_image(modules: &[Module], address: usize, out: &mut String) {
 /// is a small fraction of the ones a debug build has. Dropping the offset in
 /// favour of a name would trade a complete answer for a partial one.
 ///
+/// A flame graph is the one place that trade is worth making, because it
+/// merges frames by their text and the address keeps apart what the picture
+/// should merge. [`FunctionNames`] makes it, and is what folded output uses.
+///
 /// Where a name is not available, and on a stripped binary that is everywhere,
 /// the rendering is byte-for-byte what [`ModuleOffsets`] produces, so nothing is
 /// lost by choosing this.
@@ -297,7 +303,7 @@ pub struct Symbolized<'a> {
     /// A real one has whatever this build happens to export in it, which is not
     /// something a test can assert about.
     lookup: fn(usize) -> Option<Symbol>,
-    cache: RefCell<HashMap<usize, Box<str>>>,
+    cache: Renderings,
 }
 
 impl<'a> Symbolized<'a> {
@@ -312,7 +318,7 @@ impl<'a> Symbolized<'a> {
         Self {
             modules,
             lookup,
-            cache: RefCell::new(HashMap::new()),
+            cache: Renderings::new(),
         }
     }
 
@@ -361,25 +367,7 @@ impl<'a> Symbolized<'a> {
 
         match symbol {
             Some(symbol) => {
-                // Demangling refuses on anything it does not fully understand,
-                // which includes every C and C++ name in the process as well as
-                // a Rust name read out of a damaged table. The raw symbol is
-                // then the best available answer: ugly, but what the linker
-                // actually wrote. Neither branch is screened here — the emitter
-                // screens the finished frame, which is the only place that also
-                // covers a `FrameFormat` this crate did not write.
-                //
-                // The `truncate` is belt and braces: `demangle` documents and
-                // tests that it leaves `out` untouched when it refuses. It is
-                // one instruction, and the failure it guards against is a
-                // half-parsed name attributing an allocation to code that did
-                // not make it, which is the one output error this crate has no
-                // way to make visible to a reader.
-                let before = out.len();
-                if !demangle(&symbol.name, &mut out) {
-                    out.truncate(before);
-                    out.push_str(&symbol.name);
-                }
+                push_symbol_name(&symbol.name, &mut out);
                 if symbol.offset != 0 {
                     out.push('+');
                     crate::output::push_hex(&mut out, symbol.offset);
@@ -397,16 +385,7 @@ impl<'a> Symbolized<'a> {
 
 impl FrameFormat for Symbolized<'_> {
     fn format(&self, address: usize, out: &mut String) {
-        if let Some(cached) = self.cache.borrow().get(&address) {
-            out.push_str(cached);
-            return;
-        }
-        // Deliberately outside the borrow above: `render` calls into the
-        // platform, and holding a `RefCell` borrow across a foreign call is the
-        // kind of thing that is fine until someone adds a lookup that renders.
-        let rendered = self.render(address);
-        out.push_str(&rendered);
-        self.cache.borrow_mut().insert(address, rendered);
+        self.cache.append(address, out, || self.render(address));
     }
 }
 
@@ -414,8 +393,253 @@ impl std::fmt::Debug for Symbolized<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Symbolized")
             .field("modules", &self.modules.len())
-            .field("cached", &self.cache.borrow().len())
+            .field("cached", &self.cache.len())
             .finish()
+    }
+}
+
+/// Renders frames as the name of the function they are in, and nothing else.
+///
+/// ```text
+/// core::fmt::write
+/// <alloc::vec::Vec<u8>>::with_capacity
+/// [program+0x2d330]
+/// ```
+///
+/// This is what [`Snapshot::write_folded`](crate::Snapshot::write_folded)
+/// renders with, and the reason is how a flame graph is built. Its tools merge
+/// frames by their **text**, so whatever a renderer puts in a frame beyond the
+/// function decides what the picture keeps apart. [`Symbolized`] puts in the
+/// runtime address and the offset from the symbol, which is right for a record
+/// and wrong for a picture: a function that allocates through two of its calls
+/// is on the stack at two return addresses, and was drawn as two frames side by
+/// side where a reader expects one. It also repeats the image's absolute path
+/// in every frame, which made the files large and every label in `inferno` or
+/// `speedscope` a path first and a name somewhere after it.
+///
+/// Folded output used [`Symbolized`] up to 0.1.0. The default changed before
+/// 1.0, which is when a default can still change; [`Symbolized`] is one
+/// argument away, through
+/// [`Snapshot::write_folded_with`](crate::Snapshot::write_folded_with), for a
+/// flame graph that has to keep every return address apart.
+///
+/// # The name
+///
+/// Found exactly as [`Symbolized`] finds it: the module map is asked first, so
+/// an address in no image is never named however willing the platform is, and
+/// the symbol is then demangled, or printed as the linker wrote it where the
+/// demangler refuses. So a frame here is always the name part of what
+/// [`Symbolized`] says about the same address, byte for byte. Demangling drops
+/// the hash a legacy-mangled name ends in, which is what makes `core::fmt::write`
+/// one function across a whole profile rather than one per build.
+///
+/// Generic arguments are **kept**. `<alloc::vec::Vec<u8>>::push` and
+/// `<alloc::vec::Vec<String>>::push` are separate machine code with separate
+/// callees, and merging them is a further and lossy decision that a viewer's
+/// search can make at reading time and a file cannot undo. The merge this type
+/// exists for is between return addresses inside one function, and those share
+/// their generic arguments by construction. Keeping them also keeps the text
+/// [`Trimmed`]'s rules were measured against: `<alloc::boxed::Box<` is one of
+/// its prefixes. (A legacy-mangled name carries no instantiation, only the hash
+/// that demangling drops, so code from a toolchain that still emits those, this
+/// crate's MSRV among them, has its instantiations share a frame regardless.)
+///
+/// # A frame with no name
+///
+/// Written `[image+0xfileaddress]`: the image's file name and the address as it
+/// appears in that file, the second half of what [`ModuleOffsets`] says, in
+/// brackets. As there, the image is the one that made the call and the number
+/// is the recorded return address's, not the [`call_site`]'s, so it is the
+/// number the native profile carries. Distinct addresses stay distinct, because merging every unnamed
+/// frame in an image into one, as `stackcollapse-perf.pl` does with its
+/// `[module]`, would draw call paths that never happened. The brackets are that
+/// convention's, and they mark the frame as something other than a function name
+/// to a reader and to [`name_of`](FrameFormat::name_of). No demangled name
+/// begins with one, and no symbol a compiler emits does; a garbage symbol from a
+/// damaged table that did would only be left untrimmed.
+///
+/// The image is named by its **file name**, not its path, which is most of what
+/// made the old labels unreadable. A file name can be ambiguous where a path is
+/// not, and an ambiguous label is worse than a long one: two images both called
+/// `libfoo.so`, in two directories, would put their unnamed frames under one
+/// label, and two such frames at the same file address would merge into a frame
+/// that is neither. So an image whose file name is shared with another image in
+/// the module map keeps its whole path, and the labels stay as distinct as the
+/// paths are. An address in no image, or in an image with no path, is written
+/// as its runtime address, `[0x1044c81f0]`, which is distinct by definition.
+///
+/// # What this gives up
+///
+/// Two things [`Symbolized`] keeps, and both deliberately:
+///
+/// - **The offset from the symbol.** That number is a reader's only clue that a
+///   name is not to be believed: `dladdr` names the nearest preceding symbol it
+///   can see, and on an image with only its exported symbols left, a private
+///   function is reported under whatever exported one precedes it. Here such a
+///   function is drawn as part of that one. That is the cost of a merged
+///   picture, and the same trade `stackcollapse-perf.pl` makes when it strips
+///   the offsets from `perf` output.
+/// - **Resolvability.** The runtime address and file attribution are gone from
+///   every named frame, so a folded file cannot be symbolized afterwards. It is
+///   a picture of a profile, not a record of one; the native profile is the
+///   record, and `heapscope-symbolize` can turn it into a folded file with
+///   names an offline symbolizer found.
+///
+/// And one consequence that is the flame graph convention rather than a loss:
+/// a function name is the merge key, so two images that each contain a function
+/// of the same name draw it as one frame.
+///
+/// # Cost
+///
+/// The same as [`Symbolized`], and for the same reason cached by address for as
+/// long as the renderer lives.
+pub struct FunctionNames<'a> {
+    modules: &'a [Module],
+    /// What an unnamed frame in each image is labelled, by index into
+    /// `modules`. Empty for an image that has no path to label it by.
+    labels: Vec<&'a str>,
+    /// Indirected for the same reason as [`Symbolized`]'s.
+    lookup: fn(usize) -> Option<Symbol>,
+    cache: Renderings,
+}
+
+impl<'a> FunctionNames<'a> {
+    /// Renders against the running process and `modules`, which must be sorted
+    /// by load address — [`modules::capture`] returns them that way.
+    pub fn new(modules: &'a [Module]) -> Self {
+        Self::with_lookup(modules, dynamic::lookup)
+    }
+
+    /// Renders using `lookup` instead of asking the platform. Testing hook.
+    fn with_lookup(modules: &'a [Module], lookup: fn(usize) -> Option<Symbol>) -> Self {
+        let paths: Vec<&str> = modules.iter().map(|module| module.path.as_str()).collect();
+        Self {
+            modules,
+            labels: image_labels(&paths),
+            lookup,
+            cache: Renderings::new(),
+        }
+    }
+
+    fn render(&self, address: usize) -> Box<str> {
+        let mut out = String::new();
+
+        // The module map first, for the reason `Symbolized::render` measures:
+        // the platform lookup names `(void *)-1`, which is what a bad stack walk
+        // produces, and only the map knows that address is in nothing. Both
+        // ask about the call site, as every lookup here does; see the module
+        // documentation.
+        let located = locate(self.modules, address);
+        let symbol = located.and_then(|_| name_call(self.lookup, address));
+
+        if let Some(symbol) = symbol {
+            push_symbol_name(&symbol.name, &mut out);
+            // A name that came back empty cannot be a frame: the line would
+            // carry a level of the flame graph with nothing in it. `lookup`
+            // already refuses an empty name; this holds the rule for a lookup
+            // that does not, rather than trusting every one to.
+            if !out.is_empty() {
+                return out.into_boxed_str();
+            }
+        }
+
+        // The image is the one that made the call and the file address is the
+        // recorded one's, exactly the pair `ModuleOffsets` writes, so the
+        // number here is the one a reader would look up by hand.
+        out.push('[');
+        let image = located
+            .map(|(at, file_address)| (self.labels[at], file_address))
+            .filter(|(label, _)| !label.is_empty());
+        match image {
+            Some((label, file_address)) => {
+                out.push_str(label);
+                out.push('+');
+                crate::output::push_hex(&mut out, file_address);
+            }
+            None => crate::output::push_hex(&mut out, address),
+        }
+        out.push(']');
+        out.into_boxed_str()
+    }
+}
+
+impl FrameFormat for FunctionNames<'_> {
+    fn format(&self, address: usize, out: &mut String) {
+        self.cache.append(address, out, || self.render(address));
+    }
+
+    /// The whole frame, unless it is one of the bracketed stand-ins for a
+    /// frame with no name.
+    fn name_of<'f>(&self, frame: &'f str) -> Option<&'f str> {
+        (!frame.starts_with('[')).then_some(frame)
+    }
+}
+
+impl std::fmt::Debug for FunctionNames<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FunctionNames")
+            .field("modules", &self.modules.len())
+            .field("cached", &self.cache.len())
+            .finish()
+    }
+}
+
+/// Appends `name` demangled, or as the linker wrote it where it cannot be.
+///
+/// Demangling refuses on anything it does not fully understand, which includes
+/// every C and C++ name in the process as well as a Rust name read out of a
+/// damaged table. The raw symbol is then the best available answer: ugly, but
+/// what the linker actually wrote. Neither branch is screened here — the
+/// emitter screens the finished frame, which is the only place that also covers
+/// a `FrameFormat` this crate did not write.
+///
+/// The `truncate` is belt and braces: `demangle` documents and tests that it
+/// leaves `out` untouched when it refuses. It is one instruction, and the
+/// failure it guards against is a half-parsed name attributing an allocation to
+/// code that did not make it, which is the one output error this crate has no
+/// way to make visible to a reader.
+///
+/// Shared by [`Symbolized`] and [`FunctionNames`], whose claim to name a frame
+/// exactly as the other does rests on there being one copy of this.
+fn push_symbol_name(name: &str, out: &mut String) {
+    let before = out.len();
+    if !demangle(name, out) {
+        out.truncate(before);
+        out.push_str(name);
+    }
+}
+
+/// Renderings already made, by address.
+///
+/// Symbol lookup is per address, and on Windows each one is a lock and a
+/// dbghelp call. A profile's frames repeat heavily — every stack shares its
+/// outermost frames with every other — so remembering each answer is what
+/// turns a lookup per frame into a lookup per distinct address. Lives as long
+/// as the renderer that owns it, which is one output operation.
+struct Renderings(RefCell<HashMap<usize, Box<str>>>);
+
+impl Renderings {
+    fn new() -> Self {
+        Self(RefCell::new(HashMap::new()))
+    }
+
+    /// Appends the rendering of `address` to `out`, making it with `render`
+    /// the first time it is asked for.
+    fn append(&self, address: usize, out: &mut String, render: impl FnOnce() -> Box<str>) {
+        if let Some(cached) = self.0.borrow().get(&address) {
+            out.push_str(cached);
+            return;
+        }
+        // Deliberately outside the borrow above: `render` calls into the
+        // platform, and holding a `RefCell` borrow across a foreign call is the
+        // kind of thing that is fine until someone adds a lookup that renders.
+        let rendered = render();
+        out.push_str(&rendered);
+        self.0.borrow_mut().insert(address, rendered);
+    }
+
+    fn len(&self) -> usize {
+        self.0.borrow().len()
     }
 }
 
@@ -772,5 +996,292 @@ mod tests {
             "before 0x1004: core::fmt::write+0x4 (/bin/program+0x1004)\
              0x1004: core::fmt::write+0x4 (/bin/program+0x1004)"
         );
+    }
+
+    // ---- FunctionNames ----
+    //
+    // Against the same supplied symbol tables as `Symbolized`, for the same
+    // reason, and in places against `Symbolized` itself: the claim is that a
+    // name here is the name there.
+
+    fn name(modules: &[Module], address: usize) -> String {
+        let mut out = String::new();
+        FunctionNames::with_lookup(modules, fake_lookup).format(address, &mut out);
+        out
+    }
+
+    /// A module whose file addresses start at zero, so that two of them can
+    /// put different code at the same file address, which is what two
+    /// different builds of one library do.
+    fn image_at(path: &str, start: usize) -> Module {
+        Module {
+            bias: start,
+            ..module(path, start, 0x1000)
+        }
+    }
+
+    #[test]
+    fn a_named_address_is_rendered_as_the_function_name_alone() {
+        let modules = vec![module("/bin/program", 0x1000, 0x1000)];
+        assert_eq!(name(&modules, 0x1004), "core::fmt::write");
+    }
+
+    /// The point of the type. Two return addresses in one function were two
+    /// frames under `Symbolized`, by their addresses and their offsets, and
+    /// are one here.
+    #[test]
+    fn two_return_addresses_in_one_function_render_alike() {
+        let modules = vec![module("/bin/program", 0x1000, 0x1000)];
+        assert_eq!(name(&modules, 0x1004), name(&modules, 0x1010));
+        assert_ne!(
+            symbolize(&modules, 0x1004),
+            symbolize(&modules, 0x1010),
+            "the fixture no longer has two addresses `Symbolized` keeps apart"
+        );
+    }
+
+    /// Named by the call, as every lookup is: a call that is the last
+    /// instruction of `core::fmt::write` returns to the first byte of the next
+    /// function, and is still `core::fmt::write`. An image is chosen the same
+    /// way, so a return address at an image's first byte is not that image's.
+    #[test]
+    fn a_frame_is_named_by_the_function_that_made_the_call_here_too() {
+        let modules = vec![module("/bin/program", 0x1000, 0x1000)];
+        assert_eq!(name(&modules, 0x1020), "core::fmt::write");
+        assert_eq!(name(&modules, 0x1000), "[0x1000]");
+        // The fallback's file address is the recorded one's, not the call's.
+        assert_eq!(name(&modules, 0x2000), "[program+0x2000]");
+    }
+
+    /// The name is found, demangled, and refused exactly as `Symbolized` does
+    /// it, so a frame in a flame graph can be searched for in the text summary
+    /// or the DHAT file of the same run and found.
+    #[test]
+    fn a_name_is_the_name_symbolized_shows_for_the_same_address() {
+        let modules = vec![module("/bin/program", 0x1000, 0x1000)];
+        for address in [0x1004, 0x1010, 0x1020, 0x1024] {
+            let alone = name(&modules, address);
+            let symbolized = symbolize(&modules, address);
+            // `0xADDR: NAME[+0xOFFSET] (IMAGE+0xFILEADDR)`, taken apart from
+            // both ends so that the comparison is with the whole name and
+            // nothing else. A prefix check would pass on a truncated name.
+            let after_address = symbolized
+                .split_once(": ")
+                .expect("Symbolized renders the address, then `: `")
+                .1;
+            let named = after_address
+                .rsplit_once(" (")
+                .expect("and the image after the name")
+                .0;
+            let symbolized_name = named
+                .rsplit_once("+0x")
+                .map_or(named, |(name, _offset)| name);
+            assert_eq!(alone, symbolized_name, "in `{symbolized}`");
+        }
+    }
+
+    /// The legacy hash names a build, not a function. It is the demangler that
+    /// drops it, and this pins that the flame graph gets the demangler's answer.
+    #[test]
+    fn the_legacy_hash_is_not_part_of_the_name() {
+        let modules = vec![module("/bin/program", 0x1000, 0x1000)];
+        let rendered = name(&modules, 0x1004);
+        assert!(!rendered.contains("::h"), "{rendered}");
+        assert!(!rendered.contains("hb1f9a4a7"), "{rendered}");
+    }
+
+    #[test]
+    fn a_name_no_demangler_understands_is_the_name_the_linker_wrote() {
+        let modules = vec![module("/bin/program", 0x1000, 0x1000)];
+        assert_eq!(
+            name(&modules, 0x1024),
+            "a_c_function_no_demangler_will_touch"
+        );
+    }
+
+    /// A frame with no name keeps the half of the `ModuleOffsets` rendering
+    /// that tells two such frames apart: the image and the file address. The
+    /// path is cut to its file name, which is what made every label unreadable.
+    #[test]
+    fn an_unnamed_frame_is_its_image_file_name_and_file_address() {
+        let modules = vec![module("/very/long/path/to/program", 0x1000, 0x1000)];
+        assert_eq!(name(&modules, 0x1030), "[program+0x1030]");
+        assert_eq!(name(&modules, 0x1040), "[program+0x1040]");
+    }
+
+    /// Two images with one file name, in two directories, each with code at
+    /// file address 0x100. Shortened to the file name, those two frames would
+    /// be one frame in the flame graph, made of two unrelated functions.
+    #[test]
+    fn an_image_whose_file_name_another_image_shares_keeps_its_whole_path() {
+        let modules = vec![
+            image_at("/opt/one/libsame.so", 0x1000),
+            image_at("/opt/two/libsame.so", 0x3000),
+            image_at("/usr/lib/libother.so", 0x5000),
+        ];
+        let first = name(&modules, 0x1100);
+        let second = name(&modules, 0x3100);
+        assert_ne!(first, second, "two images' frames merged");
+        assert_eq!(first, "[/opt/one/libsame.so+0x100]");
+        assert_eq!(second, "[/opt/two/libsame.so+0x100]");
+        // And the ambiguity is per file name, not a reason to stop shortening
+        // the images that have none.
+        assert_eq!(name(&modules, 0x5100), "[libother.so+0x100]");
+    }
+
+    #[test]
+    fn an_address_in_no_image_is_its_runtime_address() {
+        let modules = vec![module("/bin/program", 0x1000, 0x1000)];
+        assert_eq!(name(&modules, 0x9999), "[0x9999]");
+        assert_eq!(name(&[], 0x1000), "[0x1000]");
+    }
+
+    /// An image with no path has nothing to be labelled by, and an empty label
+    /// is the same label for every such image. The runtime address is distinct
+    /// by definition.
+    #[test]
+    fn an_image_with_no_path_is_labelled_by_the_address_instead() {
+        let modules = vec![image_at("", 0x1000), image_at("", 0x3000)];
+        assert_eq!(name(&modules, 0x1100), "[0x1100]");
+        assert_eq!(name(&modules, 0x3100), "[0x3100]");
+    }
+
+    /// The same gate `Symbolized` has, held here separately because it is a
+    /// separate line of code: an address in no image is never named.
+    #[test]
+    fn an_address_outside_every_image_is_not_named_here_either() {
+        let modules = vec![module("/bin/program", 0x1000, 0x1000)];
+        let format = FunctionNames::with_lookup(&modules, credulous_lookup);
+        for address in [0, 1, 0x999, 0x1000, 0x2001, usize::MAX] {
+            let mut out = String::new();
+            format.format(address, &mut out);
+            assert!(
+                !out.contains("a_name_for"),
+                "{address:#x} is in no image in the map, and was named anyway: `{out}`"
+            );
+        }
+        let mut inside = String::new();
+        format.format(0x1500, &mut inside);
+        assert_eq!(inside, "a_name_for_0x14ff");
+    }
+
+    /// A name that comes back empty would be an empty frame, which a folded
+    /// line shows as a nameless level. `dynamic::lookup` refuses one; a lookup
+    /// that did not would still not produce it.
+    #[test]
+    fn an_empty_name_is_no_name() {
+        fn empty_lookup(_: usize) -> Option<Symbol> {
+            Some(Symbol {
+                name: String::new(),
+                offset: 0,
+            })
+        }
+        let modules = vec![module("/bin/program", 0x1000, 0x1000)];
+        let mut out = String::new();
+        FunctionNames::with_lookup(&modules, empty_lookup).format(0x1004, &mut out);
+        assert_eq!(out, "[program+0x1004]");
+    }
+
+    /// `Trimmed` reads names where the renderer says they are. Without that,
+    /// it would look for the `0xADDR: ` this rendering does not have, find no
+    /// names, and trim nothing, silently.
+    #[test]
+    fn a_stand_in_is_not_a_name_and_a_name_is_all_of_it() {
+        let format = FunctionNames::with_lookup(&[], fake_lookup);
+        assert_eq!(format.name_of("core::fmt::write"), Some("core::fmt::write"));
+        // A const generic argument renders with `": "` in it, which is why
+        // the default reading cannot be used here.
+        assert_eq!(
+            format.name_of("program::f::<{program::S { a: 1 }}>"),
+            Some("program::f::<{program::S { a: 1 }}>")
+        );
+        assert_eq!(format.name_of("[program+0x1030]"), None);
+        assert_eq!(format.name_of("[0x9999]"), None);
+    }
+
+    /// Names in the shape of a real stack: allocation path inside, runtime
+    /// entry outside, and the program between.
+    fn stack_lookup(address: usize) -> Option<Symbol> {
+        let name = match address {
+            0x1000..0x1100 => "__rust_alloc",
+            0x1100..0x1200 => "_ZN7program5churn17h0123456789abcdefE",
+            0x1200..0x1300 => "_ZN7program4main17h0123456789abcdefE",
+            0x1300..0x1400 => "std::sys::backtrace::__rust_begin_short_backtrace",
+            0x1400..0x1500 => "main",
+            _ => return None,
+        };
+        Some(Symbol {
+            name: String::from(name),
+            offset: 8,
+        })
+    }
+
+    fn kept<F: FrameFormat>(format: &F, stack: &[usize]) -> Vec<String> {
+        let frames: Vec<String> = stack
+            .iter()
+            .map(|&address| {
+                let mut out = String::new();
+                format.format(address, &mut out);
+                out
+            })
+            .collect();
+        frames[format.keep(&frames)].to_vec()
+    }
+
+    /// The same rules cut the same frames whichever of the two renderers a
+    /// stack is in, which is what makes the default folded output trimmed at
+    /// all.
+    #[test]
+    fn trimming_cuts_the_same_frames_from_bare_names() {
+        let modules = vec![module("/bin/program", 0x1000, 0x1000)];
+        let stack = [0x1008, 0x1108, 0x1208, 0x1308, 0x1408];
+
+        let names = kept(
+            &Trimmed::new(FunctionNames::with_lookup(&modules, stack_lookup)),
+            &stack,
+        );
+        assert_eq!(names, ["program::churn", "program::main"]);
+
+        let symbolized = kept(
+            &Trimmed::new(Symbolized::with_lookup(&modules, stack_lookup)),
+            &stack,
+        );
+        assert_eq!(symbolized.len(), names.len(), "{symbolized:?}");
+        for (bare, full) in names.iter().zip(&symbolized) {
+            assert!(full.contains(bare.as_str()), "{full} is not {bare}");
+        }
+    }
+
+    #[test]
+    fn a_repeated_address_is_only_looked_up_once_for_names_too() {
+        use std::cell::Cell;
+
+        thread_local! {
+            static CALLS: Cell<usize> = const { Cell::new(0) };
+        }
+
+        fn counting_lookup(address: usize) -> Option<Symbol> {
+            CALLS.with(|calls| calls.set(calls.get() + 1));
+            fake_lookup(address)
+        }
+
+        let modules = vec![module("/bin/program", 0x1000, 0x1000)];
+        let format = FunctionNames::with_lookup(&modules, counting_lookup);
+        for _ in 0..32 {
+            for address in [0x1004, 0x1030] {
+                format.format(address, &mut String::new());
+            }
+        }
+        assert_eq!(CALLS.with(Cell::get), 2);
+    }
+
+    #[test]
+    fn rendering_names_appends_rather_than_replacing() {
+        let modules = vec![module("/bin/program", 0x1000, 0x1000)];
+        let format = FunctionNames::with_lookup(&modules, fake_lookup);
+        let mut out = String::from("before ");
+        format.format(0x1004, &mut out);
+        format.format(0x1004, &mut out);
+        assert_eq!(out, "before core::fmt::writecore::fmt::write");
     }
 }
