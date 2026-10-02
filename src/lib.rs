@@ -74,6 +74,11 @@
 //! parse();
 //! ```
 //!
+//! The region rows end with one for what no region covered, so together they
+//! add up to the run. [`RegionBreakdown::get`] reads them from inside the
+//! program without taking a whole snapshot, for a program that reports its own
+//! phases.
+//!
 //! # A number a test can fail on
 //!
 //! The other thing a profile is for is a budget that holds. [`HeapStats::get`]

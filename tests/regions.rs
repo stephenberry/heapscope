@@ -162,7 +162,7 @@ fn the_regions_and_what_no_region_covered_add_up_to_the_run() {
         "a block born in a region and grown outside it left the region"
     );
     assert!(
-        breakdown.outside.curr_bytes >= (4 + 256) * 8,
+        breakdown.outside_regions.curr_bytes >= (4 + 256) * 8,
         "a block born outside every region and grown inside one left the \
          remainder"
     );
