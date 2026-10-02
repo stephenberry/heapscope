@@ -187,7 +187,7 @@ fn a_reset_leaves_the_warm_up_out_of_everything_a_run_reports() {
 
     // ---- a stopped run is not restarted ----
     heapscope::engine().stop(heapscope::output::Shutdown::Explicit);
-    assert_eq!(profiler.reset(), Err(ResetError::NotRecording));
+    assert_eq!(profiler.reset(), Err(ResetError::Stopped));
 
     drop(cache);
     drop(profiler);

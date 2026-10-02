@@ -418,15 +418,20 @@ pub struct Reset {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ResetError {
-    /// Recording has stopped, or never started.
+    /// Recording has stopped.
     ///
-    /// The same condition [`StatsError::NotRecording`](crate::StatsError::NotRecording)
-    /// names, seen from the other side. A run stops when it is stopped
-    /// explicitly or when the process starts to exit, and its profile has then
-    /// been, or is being, written from its final counts, which
-    /// [`HeapStats::get`](crate::HeapStats::get) keeps answering with.
-    /// Restarting them would change numbers a reader has already been given.
-    NotRecording,
+    /// A run stops when it is stopped explicitly or when the process starts to
+    /// exit, and its profile has then been, or is being, written from its final
+    /// counts, which [`HeapStats::get`](crate::HeapStats::get) keeps answering
+    /// with. Restarting them would change numbers a reader has already been
+    /// given.
+    ///
+    /// An engine that never started answers this too, having nothing to
+    /// restart. No [`Profiler`](crate::Profiler) can see that case, because one
+    /// exists only once recording has begun, so through it this always means
+    /// stopped. It is not [`StatsError::NotRecording`](crate::StatsError::NotRecording),
+    /// which is the never-started case and treats a stopped run as readable.
+    Stopped,
     /// This process is a `fork` child of a profiled parent.
     ///
     /// The counters came across the `fork` and describe the parent's run, as
@@ -465,7 +470,7 @@ pub enum ResetError {
 impl fmt::Display for ResetError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ResetError::NotRecording => write!(
+            ResetError::Stopped => write!(
                 f,
                 "the heapscope profiler has stopped recording, explicitly or \
                  because the process is exiting, so its counts are final and \
@@ -1798,6 +1803,18 @@ impl Engine {
         // reported. Checked *after* the counters move, so the snapshot the epoch
         // implies includes this event.
         if next >= self.max_bytes.load(Ordering::Relaxed) {
+            // For readers outside the gate, and nothing else: the peak is the
+            // one counter of a window written with a plain store, which,
+            // unlike the totals' read-modify-writes, carries no release
+            // sequence back to the restart that opened the window. With this
+            // fence the chain is formal: that restart's odd sequence store
+            // happens before this thread took the gate, which happens before
+            // this fence, which synchronizes with the acquire fence of any
+            // reader that loads the stores below, so that reader's second load
+            // of the sequence sees the restart and retries. See
+            // `Engine::read_window`. On the cold path only, with the gate held
+            // exclusively, where one fence is nothing beside the peak itself.
+            fence(Ordering::Release);
             self.max_bytes.store(next, Ordering::Relaxed);
             self.max_blocks.store(next_blocks, Ordering::Relaxed);
             self.time_at_max
@@ -2213,6 +2230,13 @@ impl Engine {
         debug_assert!(sequence.is_multiple_of(2), "a restart began inside another");
         self.reset_sequence.store(sequence + 1, Ordering::Relaxed);
         fence(Ordering::Release);
+        // Even again when this drops, on every way out of here. Declared after
+        // the gate, so dropped before it: the even store is made while the
+        // gate is still held, as the odd one was.
+        let restarting = Restarting {
+            sequence: &self.reset_sequence,
+            even: sequence + 2,
+        };
 
         self.total_bytes.store(0, Ordering::Relaxed);
         self.total_blocks.store(0, Ordering::Relaxed);
@@ -2238,9 +2262,7 @@ impl Engine {
         // Released last, as `apply_locked` releases it, so that a reader that
         // observes the new epoch also observes the counters that justify it.
         self.epoch.store(epoch, Ordering::Release);
-        // Even again, with release: a reader that loads this value with
-        // acquire sees every store above, so it reads the new window whole.
-        self.reset_sequence.store(sequence + 2, Ordering::Release);
+        drop(restarting);
         Ok(())
     }
 
@@ -2249,9 +2271,9 @@ impl Engine {
         match self.state() {
             State::Running => {}
             State::ForkedChild => return Err(ResetError::ForkedChild),
-            State::Idle | State::Starting | State::Finished => {
-                return Err(ResetError::NotRecording)
-            }
+            // Idle and Starting are unreachable through a `Profiler`, which
+            // exists only once the run is `Running`; see `ResetError::Stopped`.
+            State::Idle | State::Starting | State::Finished => return Err(ResetError::Stopped),
         }
         if super::diagnostic::is_poisoned() {
             return Err(ResetError::Poisoned);
@@ -2309,18 +2331,38 @@ impl Engine {
     /// load. If `read` saw any store a restart made after its release fence,
     /// the two fences synchronize, the restart's odd store happens before the
     /// second load, and the second load cannot return the first's value: the
-    /// reading is retried. That covers the totals, which are what a window
-    /// check compares, without exception: after a restart's store to one, every
-    /// later write to it is a read-modify-write, which extends the restart's
-    /// store's release sequence, so a total read from the new window
-    /// synchronizes however many allocations have added to it since. A
-    /// counter some path writes with a plain store, the peak's, is covered on
-    /// every platform this runs on but not by the language's model in every
-    /// interleaving; nothing compares a peak across two readings.
-    pub fn read_window<T>(&self, mut read: impl FnMut() -> T) -> (u64, T) {
+    /// reading is retried. That covers every counter a window owns:
+    ///
+    /// - the totals, because after a restart's store to one every later write
+    ///   to it is a read-modify-write, which extends that store's release
+    ///   sequence, so a total read from the new window synchronizes however
+    ///   many allocations have added to it since;
+    /// - the peak, which a new peak writes with a plain store, because
+    ///   `apply_locked` puts a release fence before it, and the restart that
+    ///   opened the window happens before that thread took the gate.
+    ///
+    /// The live figures are not a window's: a restart carries them across
+    /// unchanged, so a reading cannot pair them with the wrong one.
+    ///
+    /// # When a restart is under way
+    ///
+    /// The reading waits it out, which is short: a sweep of the tables. Except
+    /// on a thread that cannot enter the profiler, which is how a thread inside
+    /// it looks, the restarting thread among them: a signal handler that
+    /// interrupted a restart and read the counters would otherwise wait for
+    /// the very restart it stopped, forever. That reading returns `None`. The
+    /// check is made only when the sequence is odd, so an ordinary reading
+    /// never pays for it.
+    pub fn read_window<T>(&self, mut read: impl FnMut() -> T) -> Option<(u64, T)> {
         loop {
             let before = self.reset_sequence.load(Ordering::Acquire);
             if !before.is_multiple_of(2) {
+                // `None` from `enter` is a thread already inside the profiler,
+                // or one with no slot to enter with; either way it cannot be
+                // told apart from the thread the restart is running on. The
+                // guard is only a probe: `let _` releases it at once, so this
+                // thread does not wait while holding it.
+                let _ = super::guard::enter()?;
                 // A restart holds the gate and every shard for a sweep of the
                 // tables, which is long enough to be worth giving the core up.
                 std::thread::yield_now();
@@ -2329,7 +2371,7 @@ impl Engine {
             let value = read();
             fence(Ordering::Acquire);
             if self.reset_sequence.load(Ordering::Relaxed) == before {
-                return (before / 2, value);
+                return Some((before / 2, value));
             }
         }
     }
@@ -2340,6 +2382,32 @@ impl Engine {
     /// short enough that a wedged thread costs a noticeable pause rather than a
     /// hang.
     pub const FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
+}
+
+/// The writer's half of the sequence lock around [`Engine::reset`], from the
+/// odd store to the even one.
+///
+/// A guard rather than a store at the end, because a reset that unwound
+/// between the two, and was caught, would leave the sequence odd for good, and
+/// every reading after it waiting for a restart that will never finish. The
+/// even store is made however the restart ends. An unwinding restart has left
+/// the counters half restarted, so it also poisons the run: what readers then
+/// get is a refusal that says the profiler failed, not a window that is half
+/// of one and half of another.
+struct Restarting<'a> {
+    sequence: &'a AtomicU64,
+    even: u64,
+}
+
+impl Drop for Restarting<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            super::diagnostic::poison("a restart of the counts was interrupted partway");
+        }
+        // Release: a reader that loads this value with acquire sees every
+        // store the restart made, so it reads the new window whole.
+        self.sequence.store(self.even, Ordering::Release);
+    }
 }
 
 /// [`Engine::record_alloc`] and [`Engine::record_realloc_taken`] with the
@@ -4409,13 +4477,13 @@ mod tests {
         let _quiet = super::super::diagnostic::POISON_TESTS.lock();
 
         let idle = Engine::with_limits(1 << 10, 1 << 12);
-        assert_eq!(idle.reset_guarded(), Err(ResetError::NotRecording));
+        assert_eq!(idle.reset_guarded(), Err(ResetError::Stopped));
 
         let stopped = engine();
         stopped.record_alloc_guarded(0x1000, Shape::of(64), &[0xAA]);
         stopped.stop(Shutdown::Explicit);
         let before = stopped.stats();
-        assert_eq!(stopped.reset_guarded(), Err(ResetError::NotRecording));
+        assert_eq!(stopped.reset_guarded(), Err(ResetError::Stopped));
         assert_eq!(
             stopped.stats(),
             before,
@@ -4448,6 +4516,61 @@ mod tests {
 
         assert_eq!(refused, Err(ResetError::Poisoned));
         assert_eq!(engine.stats(), before);
+    }
+
+    /// A reading on a thread inside the profiler refuses instead of waiting
+    /// out a restart, because the restart may be running on that very thread,
+    /// interrupted by the signal handler that is reading. Elsewhere, and once
+    /// the restart is done, it reads as ever.
+    #[test]
+    fn a_reading_inside_the_profiler_refuses_rather_than_wait_for_a_restart() {
+        let _quiet = quiet();
+        let engine = engine();
+        let sequence = engine.reset_sequence.load(Ordering::Relaxed);
+        assert_eq!(engine.read_window(|| ()), Some((sequence / 2, ())));
+
+        // What a restart on this thread looks like to a handler that
+        // interrupts it: the sequence odd, and the guard held.
+        engine.reset_sequence.store(sequence + 1, Ordering::Relaxed);
+        let guard = super::super::guard::enter().expect("the test thread can enter");
+        assert_eq!(
+            engine.read_window(|| ()),
+            None,
+            "a reading inside the profiler waited for a restart"
+        );
+        drop(guard);
+        engine.reset_sequence.store(sequence + 2, Ordering::Release);
+
+        assert_eq!(engine.read_window(|| ()), Some((sequence / 2 + 1, ())));
+    }
+
+    /// A restart that unwinds partway, and is caught, still closes its window:
+    /// the sequence is even again, so readings return instead of waiting for
+    /// ever, and the run is poisoned, so what they return is a refusal and
+    /// not half a restart.
+    #[test]
+    fn an_interrupted_restart_does_not_leave_readings_waiting() {
+        let _quiet = quiet();
+        super::super::diagnostic::reset();
+        super::super::diagnostic::set_quiet(true);
+        let engine = engine();
+        let sequence = engine.reset_sequence.load(Ordering::Relaxed);
+
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            engine.reset_sequence.store(sequence + 1, Ordering::Relaxed);
+            let _restarting = Restarting {
+                sequence: &engine.reset_sequence,
+                even: sequence + 2,
+            };
+            // Not `panic!`, which would print through the hook.
+            std::panic::resume_unwind(Box::new("a restart failed partway"));
+        }));
+        let poisoned = super::super::diagnostic::is_poisoned();
+        super::super::diagnostic::reset();
+
+        assert!(unwound.is_err());
+        assert!(poisoned, "a half-done restart left the run unpoisoned");
+        assert_eq!(engine.read_window(|| ()), Some((sequence / 2 + 1, ())));
     }
 
     /// Restarting twice is restarting from the second one: the record counts

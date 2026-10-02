@@ -93,16 +93,16 @@ pub struct Baseline {
     pub curr_bytes: u64,
     /// Blocks live when the baseline was taken.
     pub curr_blocks: u64,
-    /// The peak since the run started or its counts were last restarted. DHAT's
-    /// `gmax`.
+    /// The peak since the run started or its counts were last restarted.
+    /// DHAT's `gmax`.
     pub max_bytes: u64,
     /// Blocks live at that peak.
     pub max_blocks: u64,
-    /// Bytes allocated
-    /// since the run started or its counts were last restarted.
+    /// Bytes allocated since the run started or its counts were last
+    /// restarted.
     pub total_bytes: u64,
-    /// Allocations made
-    /// since the run started or its counts were last restarted.
+    /// Allocations made since the run started or its counts were last
+    /// restarted.
     pub total_blocks: u64,
 }
 

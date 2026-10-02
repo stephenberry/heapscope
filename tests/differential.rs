@@ -1022,6 +1022,21 @@ fn sums_agree(engine: &Engine) -> Result<heapscope::internals::engine::GlobalSta
     Ok(stats)
 }
 
+/// Clears a flag when dropped, so that the threads waiting on it are let go
+/// however the thread holding this ends.
+///
+/// The restarting thread in the race tests holds one. If it panicked, on a
+/// refused restart or a failed check, without one, the threads waiting for it
+/// to finish would spin forever and a CI runner would report a timeout with no
+/// message instead of the panic.
+struct ClearOnDrop<'a>(&'a std::sync::atomic::AtomicBool);
+
+impl Drop for ClearOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
 /// A restart lands wherever another thread happens to be, so it has to leave
 /// the counters as coherent as it found them whatever was in flight.
 ///
@@ -1044,9 +1059,14 @@ fn sums_agree(engine: &Engine) -> Result<heapscope::internals::engine::GlobalSta
 /// passed it. Each restart wipes the totals the one before it got wrong, so a
 /// check at the end sees only the last; checking after each one gives every
 /// restart its own chance to be caught. And the workers run until the
-/// restarting thread is done and then for a tail more, so every restart lands
-/// on running threads and the last window has allocations, frees and peaks of
-/// its own.
+/// restarting thread is done and then for a tail more, so the last window has
+/// allocations, frees and peaks of its own.
+///
+/// "Lands on running threads" is arranged rather than hoped for. The
+/// restarting thread holds every lock while it restarts and checks, back to
+/// back, and the platform locks are not fair, so left to itself it starved the
+/// workers: one run in seven saw fewer rounds than restarts. So before each
+/// restart it waits for the workers to finish another round apiece.
 ///
 /// **Measured:** with the peak gate taken out of `Engine::reset`, this fails
 /// in 20 runs of 20, where checking only at the end failed 2 of 20.
@@ -1086,12 +1106,18 @@ fn restarts_racing_with_allocating_threads_keep_the_counters_coherent() {
         let (engine, started, restarting) = (&engine, &started, &restarting);
         let (raced, violation) = (&raced, &violation);
         s.spawn(move || {
+            let _release_the_workers = ClearOnDrop(restarting);
             // Not before every worker is running, so that even the first
             // restart lands on threads that are recording.
             while started.load(Ordering::Acquire) < THREADS {
                 std::thread::yield_now();
             }
             for restart in 1..=RESETS {
+                // A round per worker since the last restart, in aggregate.
+                let rounds = raced.load(Ordering::Acquire);
+                while raced.load(Ordering::Acquire) < rounds + THREADS {
+                    std::thread::yield_now();
+                }
                 let guard = heapscope::internals::guard::enter()
                     .expect("the restarting thread is not inside the profiler");
                 engine
@@ -1104,7 +1130,6 @@ fn restarts_racing_with_allocating_threads_keep_the_counters_coherent() {
                     break;
                 }
             }
-            restarting.store(false, Ordering::Release);
         });
 
         let workers: Vec<_> = (0..THREADS)
@@ -1169,10 +1194,11 @@ fn restarts_racing_with_allocating_threads_keep_the_counters_coherent() {
         "a restart racing with allocations poisoned the profiler"
     );
     assert_eq!(engine.resets(), RESETS as u64);
+    // By construction, and checked so that a change to the waiting above
+    // cannot quietly make the restarts race nothing.
     assert!(
-        raced.load(Ordering::Relaxed) >= RESETS,
-        "only {} rounds ran while {RESETS} restarts landed, so the restarts \
-         barely raced anything",
+        raced.load(Ordering::Relaxed) >= RESETS * THREADS,
+        "only {} rounds ran while {RESETS} restarts landed",
         raced.load(Ordering::Relaxed)
     );
 
@@ -1180,6 +1206,13 @@ fn restarts_racing_with_allocating_threads_keep_the_counters_coherent() {
     let reset = engine.last_reset().expect("the run was restarted");
     assert_eq!(reset.count, RESETS as u64);
 
+    // Every allocation was tracked. Each worker keeps a few dozen blocks live
+    // in a table sized for hundreds of thousands, so a drop here is the table
+    // refusing keys it has room for, which is what the live table once did
+    // once churn had used up its empty slots: on a loaded runner, where the
+    // workers run millions of rounds, it dropped all but the first, and every
+    // check after this one failed for a reason that was not the restart's.
+    assert_eq!(stats.dropped_blocks, 0, "the live table refused blocks");
     // The last window is not empty, or the sums above compare zero with zero.
     assert!(
         stats.total_blocks > 0,

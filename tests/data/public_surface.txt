@@ -718,8 +718,8 @@ variant heapscope::Mode::Heap
 variant heapscope::ResetError::Busy
 variant heapscope::ResetError::CannotEnter
 variant heapscope::ResetError::ForkedChild
-variant heapscope::ResetError::NotRecording
 variant heapscope::ResetError::Poisoned
+variant heapscope::ResetError::Stopped
 variant heapscope::StartError::AlreadyRecorded
 variant heapscope::StartError::AlreadyRunning
 variant heapscope::StartError::NoBacktraces
@@ -731,6 +731,7 @@ variant heapscope::StatsError::NotAHeapRun
 variant heapscope::StatsError::NotAnEventRun
 variant heapscope::StatsError::NotRecording
 variant heapscope::StatsError::Poisoned
+variant heapscope::StatsError::ResetInProgress
 variant heapscope::StatsError::Sampled
 variant heapscope::TimeSource::Events
 variant heapscope::TimeSource::Monotonic
@@ -752,4 +753,5 @@ variant heapscope::stats::StatsError::NotAHeapRun
 variant heapscope::stats::StatsError::NotAnEventRun
 variant heapscope::stats::StatsError::NotRecording
 variant heapscope::stats::StatsError::Poisoned
+variant heapscope::stats::StatsError::ResetInProgress
 variant heapscope::stats::StatsError::Sampled
