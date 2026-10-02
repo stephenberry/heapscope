@@ -340,24 +340,8 @@ impl Profile {
     /// `dladdr` names almost nothing, it had nothing to work with and left every
     /// stack whole. Here the names exist.
     ///
-    /// # Trimmed by function, not by frame
-    ///
-    /// The rule reads each frame as every function its address is in. With
-    /// inlining one address is in several at once, and reading any single one
-    /// of them is wrong somewhere. A `Vec::with_capacity` call in
-    /// `tests/symbolize.rs` is one frame that is `RawVec::with_capacity_in`,
-    /// inlined into `Vec::with_capacity_in`, inlined into `Vec::with_capacity`
-    /// **\[measured, Linux and Windows\]**. Judged by the innermost, the frame
-    /// is the allocation path and goes, taking with it the call the program
-    /// wrote; judged by the outermost, it stays and is shown by a name the rule
-    /// exists to hide.
-    ///
-    /// Expanded, the stack is the one the source describes, the rule applies to
-    /// it unchanged, and a frame that keeps any of its functions is shown by
-    /// the innermost one kept — so where the cut falls no longer depends on
-    /// where the optimiser happened to leave a frame boundary. The same holds at
-    /// the other end: on Windows `std`'s runtime marker arrives inlined into its
-    /// caller **\[measured\]**, and is found there.
+    /// Inlined frames take part: see [`worth_showing_inlined`] for how a frame
+    /// is judged and which of its functions names it.
     pub fn to_folded(&self, metric: &str) -> Result<String, String> {
         if !METRICS.contains(&metric) {
             return Err(format!(
@@ -400,37 +384,17 @@ impl Profile {
                 .filter(|&at| at < rendered.len())
                 .collect();
 
-            // Every function on the stack, innermost first, each with the
-            // position of the frame it belongs to.
-            let mut functions: Vec<String> = Vec::new();
-            let mut owners: Vec<usize> = Vec::new();
-            for (position, &at) in indices.iter().enumerate() {
-                for function in &rendered[at] {
-                    functions.push(function.clone());
-                    owners.push(position);
-                }
-            }
-            let keep = heapscope::symbol::trim::worth_showing(&functions);
-
-            // A frame per owner, named by the innermost function it kept. The
-            // range is contiguous and the owners ascend, so a change of owner
-            // is a new frame.
-            let mut shown: Vec<&str> = Vec::new();
-            let mut previous = None;
-            for at in keep {
-                if previous != Some(owners[at]) {
-                    previous = Some(owners[at]);
-                    shown.push(&functions[at]);
-                }
-            }
+            let chains: Vec<&[String]> =
+                indices.iter().map(|&at| rendered[at].as_slice()).collect();
+            let shown = worth_showing_inlined(&chains);
 
             stack.clear();
             // Outermost first, which is where a flame graph puts its root.
-            for frame in shown.iter().rev() {
+            for &(frame, function) in shown.iter().rev() {
                 if !stack.is_empty() {
                     stack.push(';');
                 }
-                push_frame(&mut stack, frame);
+                push_frame(&mut stack, &chains[frame][function]);
             }
             if stack.is_empty() {
                 push_frame(
@@ -458,6 +422,63 @@ impl Profile {
         }
         Ok(out)
     }
+}
+
+/// Which frames of a stack are worth showing, and which function names each.
+///
+/// `stack` is innermost first, one entry per frame, and each entry is every
+/// function that frame's address is in — innermost first, rendered in the shape
+/// [`worth_showing`](heapscope::symbol::trim::worth_showing) reads, as
+/// `Profile::render_inlined` makes them. The answer is innermost first too: one
+/// `(frame, function)` pair per frame kept, indexing into `stack`.
+///
+/// # Judged by function
+///
+/// With inlining one address is in several functions at once, and judging a
+/// frame by any single one of them is wrong somewhere. A `Vec::with_capacity`
+/// call in `tests/symbolize.rs` is one frame that is `RawVec::with_capacity_in`,
+/// inlined into `Vec::with_capacity_in`, inlined into `Vec::with_capacity`
+/// **\[measured, Linux and Windows\]**. Judged by the innermost, the frame is the
+/// allocation path and goes, taking with it the call the program wrote. So the
+/// stack is expanded to the one the source describes and the crate's rule
+/// applies to that unchanged: where the cut falls no longer depends on where
+/// the optimiser happened to leave a frame boundary. The same holds at the
+/// other end, where on Windows and Linux `std`'s runtime marker arrives inlined
+/// into its caller **\[measured\]** and is found there.
+///
+/// # Named by the outermost function kept
+///
+/// A frame that keeps any of its functions is shown by the outermost of them,
+/// which is the function the address physically lies in whenever that
+/// survives. That is the name `atos`, `dladdr` and `SymFromAddr` give the same
+/// frame, and the name the library writes at record time, so a profile
+/// symbolized here and one named in-process agree about it. The innermost would
+/// not: a program function with `Vec::with_capacity` inlined into it would be
+/// shown as `Vec::with_capacity_in` and the program's own name would vanish
+/// from the stack. Where the physical function is itself cut — the runtime
+/// marker, inlined into the frame that calls the thread's closure — the
+/// outermost function kept is the one inside it.
+fn worth_showing_inlined(stack: &[&[String]]) -> Vec<(usize, usize)> {
+    let mut functions: Vec<String> = Vec::new();
+    let mut owners: Vec<(usize, usize)> = Vec::new();
+    for (frame, chain) in stack.iter().enumerate() {
+        for (function, rendered) in chain.iter().enumerate() {
+            functions.push(rendered.clone());
+            owners.push((frame, function));
+        }
+    }
+
+    // The kept range is contiguous and the owners ascend, so a frame's kept
+    // functions are adjacent and the last of them is its outermost.
+    let mut shown: Vec<(usize, usize)> = Vec::new();
+    for at in heapscope::symbol::trim::worth_showing(&functions) {
+        let (frame, function) = owners[at];
+        match shown.last_mut() {
+            Some(last) if last.0 == frame => last.1 = function,
+            _ => shown.push((frame, function)),
+        }
+    }
+    shown
 }
 
 /// The two labels the library's emitters give a point with no frames. Repeated
@@ -799,11 +820,12 @@ mod tests {
             .collect()
     }
 
-    /// Allocation machinery inlined into the call the program wrote. Judged by
-    /// its innermost function the frame goes, and `Vec::with_capacity` with
-    /// it; judged by its outermost it stays, named `RawVec`. Neither is right.
+    /// Allocation machinery inlined into the call the program wrote, as
+    /// `tests/symbolize.rs` measures it. Judged by its innermost function the
+    /// frame would go, and `Vec::with_capacity` with it. It stays, and is named
+    /// as `atos` and the library name it: by the function it lies in.
     #[test]
-    fn a_frame_is_shown_by_the_innermost_function_trimming_keeps() {
+    fn a_frame_with_machinery_inlined_into_it_keeps_its_own_name() {
         let mut profile = a_stack(3);
         profile.resolve_frame(0, &inlined(&["__rustc::__rust_alloc"]));
         profile.resolve_frame(
@@ -817,8 +839,34 @@ mod tests {
         profile.resolve_frame(2, &inlined(&["program::grow"]));
         assert_eq!(
             shown(&profile),
-            ["<alloc::vec::Vec<u8>>::with_capacity_in", "program::grow"]
+            ["<alloc::vec::Vec<u8>>::with_capacity", "program::grow"]
         );
+    }
+
+    /// The case that decides between innermost and outermost: the program's own
+    /// function is the physical frame, with `Vec` and its machinery inlined into
+    /// it — what `rustc -O` makes of an `#[inline(always)]` helper calling
+    /// `Vec::with_capacity` from an `#[inline(never)]` one. Named by the
+    /// innermost function kept, the stack would read `Vec::with_capacity_in` and
+    /// `t::outer` would vanish from it.
+    #[test]
+    fn a_program_function_with_vec_inlined_into_it_is_shown_by_its_own_name() {
+        let mut profile = a_stack(2);
+        profile.resolve_frame(
+            0,
+            &inlined(&[
+                "alloc::alloc::alloc",
+                "<alloc::alloc::Global as core::alloc::Allocator>::allocate",
+                "<alloc::raw_vec::RawVecInner>::try_allocate_in",
+                "<alloc::raw_vec::RawVec<u8>>::with_capacity_in",
+                "<alloc::vec::Vec<u8>>::with_capacity_in",
+                "<alloc::vec::Vec<u8>>::with_capacity",
+                "t::inner",
+                "t::outer",
+            ]),
+        );
+        profile.resolve_frame(1, &inlined(&["t::main"]));
+        assert_eq!(shown(&profile), ["t::outer", "t::main"]);
     }
 
     /// A frame that is machinery all the way out goes whole, however much was
@@ -838,18 +886,19 @@ mod tests {
         assert_eq!(shown(&profile), ["program::grow"]);
     }
 
-    /// Only the choice of name moves: a frame nothing was trimmed from still
-    /// shows its innermost function, which is the more specific answer.
+    /// A frame nothing was trimmed from is named by the function it lies in,
+    /// as every in-process lookup names it.
     #[test]
-    fn a_kept_frame_still_shows_what_was_inlined_into_it() {
+    fn a_kept_frame_is_named_by_the_function_it_lies_in() {
         let mut profile = a_stack(1);
         profile.resolve_frame(0, &inlined(&["program::helper", "program::outer"]));
-        assert_eq!(shown(&profile), ["program::helper"]);
+        assert_eq!(shown(&profile), ["program::outer"]);
     }
 
     /// The runtime marker, found where Windows puts it: inlined into the frame
     /// that calls the thread's closure. The frame stays, because a function
-    /// inside the marker is in it, and everything outside goes.
+    /// inside the marker is in it, and is named by that function, the outermost
+    /// one kept; everything outside goes.
     #[test]
     fn an_inlined_runtime_marker_still_ends_the_stack() {
         let mut profile = a_stack(3);
