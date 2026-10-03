@@ -128,13 +128,14 @@ impl Profile {
     /// recorded number itself, which is the rule the library's own lookups
     /// follow.
     ///
-    /// Frames already carrying a resolved `function` are skipped, so running
-    /// this tool twice over one profile does no work the second time and cannot
-    /// overwrite a better answer with a worse one.
+    /// Frames a symbolizer already answered for are skipped, so running this
+    /// tool twice over one profile does no work the second time and cannot
+    /// overwrite a better answer with a worse one. An answer is a `function`,
+    /// or a `file` where the tool placed the address without naming it.
     pub fn batches(&self, runtime_addresses: bool) -> BTreeMap<usize, Vec<(usize, u64)>> {
         let mut batches: BTreeMap<usize, Vec<(usize, u64)>> = BTreeMap::new();
         for (at, frame) in self.frames().iter().enumerate() {
-            if frame.get("function").is_some() {
+            if frame.get("function").is_some() || frame.get("file").is_some() {
                 continue;
             }
             let Some(module) = frame.get("module").and_then(Value::as_u64) else {
@@ -187,7 +188,13 @@ impl Profile {
             return;
         };
 
-        frame.set("function", Value::String(innermost.function.clone()));
+        // Absent where the tool found a file and line but no name, rather than
+        // a placeholder: every reader of `function` takes it as a name, and a
+        // placeholder would outrank the `symbol` the running process recorded
+        // and draw unrelated frames as one.
+        if let Some(function) = &innermost.function {
+            frame.set("function", Value::String(function.clone()));
+        }
         if let Some(file) = &innermost.file {
             frame.set("file", Value::String(file.clone()));
         }
@@ -203,10 +210,10 @@ impl Profile {
             let inlined = resolution.frames[1..]
                 .iter()
                 .map(|frame| {
-                    let mut members = vec![(
-                        String::from("function"),
-                        Value::String(frame.function.clone()),
-                    )];
+                    let mut members = Vec::new();
+                    if let Some(function) = &frame.function {
+                        members.push((String::from("function"), Value::String(function.clone())));
+                    }
                     if let Some(file) = &frame.file {
                         members.push((String::from("file"), Value::String(file.clone())));
                     }
@@ -234,7 +241,7 @@ impl Profile {
     pub fn resolved_frames(&self) -> usize {
         self.frames()
             .iter()
-            .filter(|frame| frame.get("function").is_some())
+            .filter(|frame| resolved_name(frame).is_some())
             .count()
     }
 
@@ -243,7 +250,9 @@ impl Profile {
         json::render(&self.root)
     }
 
-    /// One rendered frame, in the shape this crate renders frames everywhere.
+    /// One frame, in the shape the trimming rules read, once for every function
+    /// its address is in, innermost first: the one the symbolizer named, then
+    /// each caller that inlined it.
     ///
     /// ```text
     /// 0x1044c81f0: profile_a_program::churn (/path/to/program+0x2c1f0)
@@ -251,73 +260,86 @@ impl Profile {
     ///
     /// The shape is not cosmetic. It is what
     /// [`trim::worth_showing`](heapscope::symbol::trim::worth_showing) parses,
-    /// so rendering some other way would silently disable trimming; and keeping
-    /// the image and file address after the name is the rule
-    /// [`Symbolized`](heapscope::symbol::Symbolized) documents — a name is
-    /// *added to* the attribution rather than replacing it, so nothing is lost
-    /// by having resolved one.
-    ///
-    /// The best available name wins: what this tool resolved, then what the
-    /// running process knew, then nothing.
-    fn render_frame(&self, frame: &Value) -> String {
-        self.render_frame_as(frame, frame.get("function").and_then(Value::as_str))
-    }
-
-    /// The frame rendered once for every function its address is in, innermost
-    /// first: the one the symbolizer named, then each caller that inlined it.
+    /// so deciding which frames to keep from some other rendering would
+    /// silently disable trimming. A frame with a recorded name and no resolved
+    /// one is exactly what [`Symbolized`](heapscope::symbol::Symbolized) writes,
+    /// so the rules see what they would have seen at record time.
     ///
     /// Every entry carries the frame's own address and image, because every one
-    /// of them is a true answer about that one instruction. A frame with nothing
-    /// inlined, or that no symbolizer resolved, is the one entry
-    /// [`render_frame`](Self::render_frame) makes.
-    fn render_inlined(&self, frame: &Value) -> Vec<String> {
-        let mut rendered = vec![self.render_frame(frame)];
-        let callers = frame
-            .get("inlinedBy")
-            .and_then(Value::as_array)
-            .unwrap_or(&[]);
-        for caller in callers {
-            if let Some(name) = caller.get("function").and_then(Value::as_str) {
-                rendered.push(self.render_frame_as(frame, Some(name)));
-            }
-        }
-        rendered
+    /// of them is a true answer about that one instruction.
+    fn render_for_trimming(&self, frame: &Value) -> Vec<String> {
+        functions_of(frame)
+            .iter()
+            .map(|function| self.render_addressed(frame, function))
+            .collect()
     }
 
-    /// The frame, named `resolved` where there is a name to give it.
-    fn render_frame_as(&self, frame: &Value, resolved: Option<&str>) -> String {
+    /// The same functions as [`render_for_trimming`](Self::render_for_trimming),
+    /// in the same order, as a flame graph wants them: the name and nothing that
+    /// would keep two return addresses in one function apart.
+    ///
+    /// ```text
+    /// profile_a_program::churn
+    /// [libsystem_malloc.dylib+0x1a2b4]
+    /// ```
+    ///
+    /// What [`FunctionNames`](heapscope::symbol::FunctionNames) writes in the
+    /// library's own folded output, with a name a symbolizer resolved taking
+    /// precedence over the one the running process knew. A function with no
+    /// name is the image's label and the frame's `fileAddr` in brackets, or its
+    /// runtime address where there is no image; `labels` is
+    /// [`image_labels`](heapscope::internals::image_labels) over this profile's
+    /// module map, so an image is labelled here exactly as it would have been at
+    /// record time.
+    fn render_for_display(&self, frame: &Value, labels: &[&str]) -> Vec<String> {
+        functions_of(frame)
+            .iter()
+            .map(|function| {
+                let mut out = String::new();
+                if push_name(function, &mut out) {
+                    return out;
+                }
+                out.push('[');
+                let image = self
+                    .module_of(frame)
+                    .map(|at| labels[at])
+                    .filter(|label| !label.is_empty())
+                    .zip(frame.get("fileAddr").and_then(Value::as_address));
+                match image {
+                    Some((label, file_address)) => {
+                        heapscope::output::push_display(&mut out, label);
+                        out.push_str(&format!("+{file_address:#x}"));
+                    }
+                    None => push_hex(&mut out, frame.get("addr").and_then(Value::as_address)),
+                }
+                out.push(']');
+                out
+            })
+            .collect()
+    }
+
+    /// `function` as the frame `0xADDR: name (image+0xfileaddress)`.
+    fn render_addressed(&self, frame: &Value, function: &Function) -> String {
         let mut out = String::new();
         push_hex(&mut out, frame.get("addr").and_then(Value::as_address));
         out.push_str(": ");
 
-        let recorded = frame.get("symbol").and_then(Value::as_str);
-        match (resolved, recorded) {
-            (Some(name), _) => heapscope::output::push_display(&mut out, name),
-            (None, Some(name)) => {
-                // Still mangled in the file, because the format keeps the
-                // linker's own spelling. Rendered the way every other reader of
-                // this crate renders it.
-                let mut demangled = String::new();
-                if heapscope::demangle(name, &mut demangled) {
-                    heapscope::output::push_display(&mut out, &demangled);
-                } else {
-                    heapscope::output::push_display(&mut out, name);
-                }
+        if push_name(function, &mut out) {
+            // An offset belongs to a name the running process found, not to
+            // one a symbolizer resolved for this exact address.
+            if matches!(function, Function::Recorded(_)) {
                 if let Some(offset) = frame.get("symbolOffset").and_then(Value::as_u64) {
                     if offset != 0 {
                         out.push_str(&format!("+{offset:#x}"));
                     }
                 }
             }
-            (None, None) => out.push_str("???"),
+        } else {
+            out.push_str("???");
         }
 
         if let (Some(module), Some(file_address)) = (
-            frame
-                .get("module")
-                .and_then(Value::as_u64)
-                .and_then(|at| usize::try_from(at).ok())
-                .and_then(|at| self.modules.get(at)),
+            self.module_of(frame).map(|at| &self.modules[at]),
             frame.get("fileAddr").and_then(Value::as_address),
         ) {
             out.push_str(" (");
@@ -327,13 +349,25 @@ impl Profile {
         out
     }
 
+    /// Where in the module map `frame`'s image is, if it names one that exists.
+    fn module_of(&self, frame: &Value) -> Option<usize> {
+        frame
+            .get("module")
+            .and_then(Value::as_u64)
+            .and_then(|at| usize::try_from(at).ok())
+            .filter(|&at| at < self.modules.len())
+    }
+
     /// The profile as folded stacks, counted by `metric`.
     ///
     /// The same file [`Snapshot::write_folded`](heapscope::Snapshot::write_folded)
     /// writes, produced from the profile rather than from an engine — which is
     /// the whole reason this exists: on a platform where in-process
     /// symbolization names nothing, the flame graph worth drawing is the one
-    /// made *after* the addresses have been resolved.
+    /// made *after* the addresses have been resolved. So frames are function
+    /// names alone, as [`render_for_display`](Self::render_for_display)
+    /// describes, and two points that render alike are one line with their
+    /// counts summed.
     ///
     /// Trimmed by the crate's own rule, and that is a strict improvement on
     /// trimming at record time: the rule reads frame names, so on Linux, where
@@ -341,7 +375,9 @@ impl Profile {
     /// stack whole. Here the names exist.
     ///
     /// Inlined frames take part: see [`worth_showing_inlined`] for how a frame
-    /// is judged and which of its functions names it.
+    /// is judged and which of its functions names it. The judgement is made on
+    /// the [`render_for_trimming`](Self::render_for_trimming) shape, which the
+    /// rule parses, and the function it chooses is then written by name alone.
     pub fn to_folded(&self, metric: &str) -> Result<String, String> {
         if !METRICS.contains(&metric) {
             return Err(format!(
@@ -352,7 +388,20 @@ impl Profile {
         let rendered: Vec<Vec<String>> = self
             .frames()
             .iter()
-            .map(|frame| self.render_inlined(frame))
+            .map(|frame| self.render_for_trimming(frame))
+            .collect();
+        let paths: Vec<&str> = self
+            .modules
+            .iter()
+            .map(|module| module.path.as_str())
+            .collect();
+        let labels = heapscope::internals::image_labels(&paths);
+        // Parallel to `rendered`, function for function, so that the pair
+        // `worth_showing_inlined` chooses indexes both.
+        let named: Vec<Vec<String>> = self
+            .frames()
+            .iter()
+            .map(|frame| self.render_for_display(frame, &labels))
             .collect();
 
         let mut totals: Vec<(String, u64)> = Vec::new();
@@ -394,7 +443,7 @@ impl Profile {
                 if !stack.is_empty() {
                     stack.push(';');
                 }
-                push_frame(&mut stack, &chains[frame][function]);
+                push_frame(&mut stack, &named[indices[frame]][function]);
             }
             if stack.is_empty() {
                 push_frame(
@@ -429,7 +478,7 @@ impl Profile {
 /// `stack` is innermost first, one entry per frame, and each entry is every
 /// function that frame's address is in — innermost first, rendered in the shape
 /// [`worth_showing`](heapscope::symbol::trim::worth_showing) reads, as
-/// `Profile::render_inlined` makes them. The answer is innermost first too: one
+/// `Profile::render_for_trimming` makes them. The answer is innermost first too: one
 /// `(frame, function)` pair per frame kept, indexing into `stack`.
 ///
 /// # Judged by function
@@ -488,6 +537,93 @@ const OVERFLOW_FRAME: &str =
     "[overflow]: allocations recorded after the program-point table filled up";
 const UNWALKABLE_FRAME: &str = "[unwalkable]: no frame pointer chain at this allocation";
 
+/// One of the functions a frame's address is in, and what is known of its name.
+enum Function<'a> {
+    /// What a symbolizer resolved, already demangled.
+    Resolved(&'a str),
+    /// What the running process knew the frame by, still mangled.
+    Recorded(&'a str),
+    /// A function the symbolizer placed the address in without naming.
+    Unnamed,
+}
+
+/// Every function `frame`'s address is in, innermost first: the one the frame
+/// is named by, then each caller that inlined it.
+///
+/// Each level is what this tool resolved for it. Where it resolved nothing,
+/// the outermost level, the function the address physically lies in, falls
+/// back to what the running process knew: `symbol` is the name the image's
+/// symbol table gives that address, which is that function's, and it is what
+/// the library writes for the same frame. A level inside it has no such
+/// fallback, since the recorded name is not its name.
+///
+/// An inner level with no name is kept, as [`Function::Unnamed`], rather than
+/// dropped. It is a real level of the call chain, and the trimming rules treat
+/// a level they cannot read as program code: dropping it would let the leading
+/// run of allocation-path functions continue through code that might be the
+/// program's own and remove it.
+fn functions_of(frame: &Value) -> Vec<Function<'_>> {
+    let callers = frame
+        .get("inlinedBy")
+        .and_then(Value::as_array)
+        .unwrap_or(&[]);
+    let entries = std::iter::once(frame).chain(callers);
+    let outermost = callers.len();
+    entries
+        .enumerate()
+        .map(|(level, entry)| match resolved_name(entry) {
+            Some(name) => Function::Resolved(name),
+            None if level == outermost => frame
+                .get("symbol")
+                .and_then(Value::as_str)
+                .map_or(Function::Unnamed, Function::Recorded),
+            None => Function::Unnamed,
+        })
+        .collect()
+}
+
+/// Appends `function`'s name, screened, and says whether there was one.
+///
+/// A recorded name is still mangled in the file, because the format keeps the
+/// linker's own spelling, and is demangled the way every other reader of this
+/// crate does it. A name that comes out empty is no name: a frame of nothing
+/// would be a nameless level in a flame graph.
+fn push_name(function: &Function, out: &mut String) -> bool {
+    let before = out.len();
+    match *function {
+        Function::Resolved(name) => heapscope::output::push_display(out, name),
+        Function::Recorded(symbol) => {
+            let mut demangled = String::new();
+            if heapscope::demangle(symbol, &mut demangled) {
+                heapscope::output::push_display(out, &demangled);
+            } else {
+                heapscope::output::push_display(out, symbol);
+            }
+        }
+        Function::Unnamed => {}
+    }
+    out.len() > before
+}
+
+/// The name a symbolizer resolved for `entry`, a frame or one of its
+/// `inlinedBy` callers, if it resolved one.
+///
+/// This tool now leaves `function` out where a symbolizer placed an address
+/// without naming it. Version 0.1.0 wrote `"???"` there instead, in frames and
+/// in `inlinedBy` entries alike, and profiles it rewrote are on disk, so that
+/// spelling is read as what it meant: no name. Taken as a name it would outrank
+/// the `symbol` the process recorded and draw every such frame as one.
+fn resolved_name(entry: &Value) -> Option<&str> {
+    entry
+        .get("function")
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty() && *name != UNNAMED_IN_0_1_0)
+}
+
+/// What version 0.1.0 of this tool wrote as the `function` of a frame it had a
+/// location for and no name. See [`resolved_name`].
+const UNNAMED_IN_0_1_0: &str = "???";
+
 fn push_hex(out: &mut String, address: Option<u64>) {
     match address {
         Some(address) => out.push_str(&format!("{address:#x}")),
@@ -535,7 +671,7 @@ mod tests {
     fn resolution(function: &str) -> Resolution {
         Resolution {
             frames: vec![Frame {
-                function: String::from(function),
+                function: Some(String::from(function)),
                 file: Some(String::from("/src/main.rs")),
                 line: Some(42),
             }],
@@ -621,12 +757,12 @@ mod tests {
             &Resolution {
                 frames: vec![
                     Frame {
-                        function: String::from("inner"),
+                        function: Some(String::from("inner")),
                         file: None,
                         line: None,
                     },
                     Frame {
-                        function: String::from("outer"),
+                        function: Some(String::from("outer")),
                         file: Some(String::from("/src/a.rs")),
                         line: Some(7),
                     },
@@ -700,24 +836,143 @@ mod tests {
         let folded = profile.to_folded("totalBytes").expect("a metric");
 
         // Frame 0 resolved, frame 1 only known in-process and demangled from
-        // what the file carries, frame 2 known nowhere.
-        assert!(folded.contains("program::churn"), "{folded}");
-        assert!(folded.contains("core::fmt::write+0x10"), "{folded}");
-        assert!(folded.contains("0x9999: ???"), "{folded}");
-        // Both points survive, and the counts are the profile's own.
-        assert_eq!(folded.lines().count(), 2, "{folded}");
-        assert!(folded.contains(" 4096\n"), "{folded}");
-        assert!(folded.contains(" 1024\n"), "{folded}");
+        // what the file carries, frame 2 known nowhere and in no image. Names
+        // alone, as the library's folded output has them: no address, no
+        // offset from the symbol, no image.
+        assert_eq!(
+            folded,
+            "core::fmt::write;program::churn 4096\n[0x9999] 1024\n"
+        );
     }
 
-    /// The name is added to the image and offset rather than replacing them,
-    /// which is what keeps a symbolized profile resolvable all over again.
+    /// A frame nothing named keeps what tells it apart from its neighbours,
+    /// the image and the file address, with the image cut to its file name.
     #[test]
-    fn resolving_a_name_never_costs_the_attribution_underneath_it() {
-        let mut profile = Profile::parse(&a_profile()).expect("a native profile");
-        profile.resolve_frame(0, &resolution("program::churn"));
+    fn an_unnamed_frame_is_its_image_file_name_and_file_address() {
+        let profile = Profile::parse(&a_profile()).expect("a native profile");
         let folded = profile.to_folded("totalBytes").expect("a metric");
-        assert!(folded.contains("(/bin/program+0x100)"), "{folded}");
+        assert!(
+            folded.starts_with("core::fmt::write;[program+0x100] "),
+            "{folded}"
+        );
+    }
+
+    /// The flame graph merge, from a profile: two points that differ only in
+    /// which return address in one function they passed through are one stack.
+    /// Their counts are summed, so the file still adds up to the profile.
+    #[test]
+    fn two_return_addresses_in_one_function_are_one_line() {
+        let text = r#"{
+  "format":"heapscope-profile","formatVersion":1,
+  "frames":[
+    {"addr":"0x1100","module":0,"fileAddr":"0x100","symbol":"_ZN7program5churn17h0123456789abcdefE","symbolOffset":16},
+    {"addr":"0x1140","module":0,"fileAddr":"0x140","symbol":"_ZN7program5churn17h0123456789abcdefE","symbolOffset":80},
+    {"addr":"0x1200","module":0,"fileAddr":"0x200","symbol":"_ZN7program4main17h0123456789abcdefE","symbolOffset":8}
+  ],
+  "points":[
+    {"kind":"recorded","totalBytes":4096,"frames":[0,2]},
+    {"kind":"recorded","totalBytes":1024,"frames":[1,2]}
+  ],
+  "modules":[{"path":"/bin/program","load":"0x1000","start":"0x1000","size":4096,"bias":"0x1000"}]
+}"#;
+        let profile = Profile::parse(text).expect("a native profile");
+        assert_eq!(
+            profile.to_folded("totalBytes").expect("a metric"),
+            "program::main;program::churn 5120\n"
+        );
+    }
+
+    /// Two frames a symbolizer placed in a file without naming, under one
+    /// caller. Neither has a name, so neither may be drawn as one: the first
+    /// falls back to the name the process recorded, the second to its image and
+    /// file address, and the two stay two stacks.
+    #[test]
+    fn a_location_without_a_name_is_not_a_name() {
+        let location = Resolution {
+            frames: vec![Frame {
+                function: None,
+                file: Some(String::from("/src/main.rs")),
+                line: Some(7),
+            }],
+        };
+        let text = r#"{
+  "format":"heapscope-profile","formatVersion":1,
+  "frames":[
+    {"addr":"0x1100","module":0,"fileAddr":"0x100","symbol":"_ZN7program5churn17h0123456789abcdefE","symbolOffset":16},
+    {"addr":"0x1140","module":0,"fileAddr":"0x140"},
+    {"addr":"0x1200","module":0,"fileAddr":"0x200"}
+  ],
+  "points":[
+    {"kind":"recorded","totalBytes":4096,"frames":[0,2]},
+    {"kind":"recorded","totalBytes":1024,"frames":[1,2]}
+  ],
+  "modules":[{"path":"/bin/program","load":"0x1000","start":"0x1000","size":4096,"bias":"0x1000"}]
+}"#;
+        let mut profile = Profile::parse(text).expect("a native profile");
+        profile.resolve_frame(0, &location);
+        profile.resolve_frame(1, &location);
+        profile.resolve_frame(2, &resolution("program::main"));
+
+        assert_eq!(
+            profile.to_folded("totalBytes").expect("a metric"),
+            "program::main;program::churn 4096\nprogram::main;[program+0x140] 1024\n"
+        );
+        // The location is kept, and is not counted as a name.
+        let after = json::parse(&profile.to_json()).expect("parses");
+        let frames = after
+            .get("frames")
+            .and_then(Value::as_array)
+            .expect("frames");
+        assert_eq!(frames[1].get("function"), None);
+        assert_eq!(frames[1].get("line").and_then(Value::as_u64), Some(7));
+        assert_eq!(profile.resolved_frames(), 1);
+        // And a frame that has its answer is not asked about again.
+        assert!(profile.batches(false).is_empty());
+    }
+
+    /// Version 0.1.0 of this tool wrote `"???"` as the `function` of a frame
+    /// it had only a location for, and profiles it rewrote exist. That spelling
+    /// is read as no name, or every such frame would be drawn as one.
+    #[test]
+    fn the_placeholder_an_older_version_wrote_is_not_a_name() {
+        let text = a_profile().replace(
+            r#"{"addr":"0x1100","module":0,"fileAddr":"0x100"}"#,
+            r#"{"addr":"0x1100","module":0,"fileAddr":"0x100","function":"???","file":"/src/main.rs","line":7}"#,
+        );
+        let profile = Profile::parse(&text).expect("a native profile");
+        assert_eq!(
+            profile.to_folded("totalBytes").expect("a metric"),
+            "core::fmt::write;[program+0x100] 4096\n[0x9999] 1024\n"
+        );
+        assert_eq!(profile.resolved_frames(), 0);
+    }
+
+    /// Two images with one file name would put their unnamed frames under one
+    /// label, and two such frames at one file address would merge into a frame
+    /// that is neither. The library's rule keeps them apart, and this tool uses
+    /// the library's rule.
+    #[test]
+    fn images_that_share_a_file_name_keep_their_paths() {
+        let text = r#"{
+  "format":"heapscope-profile","formatVersion":1,
+  "frames":[
+    {"addr":"0x1100","module":0,"fileAddr":"0x100"},
+    {"addr":"0x3100","module":1,"fileAddr":"0x100"}
+  ],
+  "points":[
+    {"kind":"recorded","totalBytes":4096,"frames":[0]},
+    {"kind":"recorded","totalBytes":1024,"frames":[1]}
+  ],
+  "modules":[
+    {"path":"/opt/one/libsame.so","load":"0x1000","start":"0x1000","size":4096,"bias":"0x1000"},
+    {"path":"/opt/two/libsame.so","load":"0x3000","start":"0x3000","size":4096,"bias":"0x3000"}
+  ]
+}"#;
+        let profile = Profile::parse(text).expect("a native profile");
+        assert_eq!(
+            profile.to_folded("totalBytes").expect("a metric"),
+            "[/opt/one/libsame.so+0x100] 4096\n[/opt/two/libsame.so+0x100] 1024\n"
+        );
     }
 
     #[test]
@@ -753,7 +1008,7 @@ mod tests {
             0,
             &Resolution {
                 frames: vec![Frame {
-                    function: String::from("evil\u{1b}[2J\u{202e}gnp.eslaf"),
+                    function: Some(String::from("evil\u{1b}[2J\u{202e}gnp.eslaf")),
                     file: None,
                     line: None,
                 }],
@@ -771,7 +1026,7 @@ mod tests {
             frames: functions
                 .iter()
                 .map(|function| Frame {
-                    function: String::from(*function),
+                    function: Some(String::from(*function)),
                     file: None,
                     line: None,
                 })
@@ -801,7 +1056,8 @@ mod tests {
         .expect("a native profile")
     }
 
-    /// The names a folded stack shows, innermost first.
+    /// The names a folded stack shows, innermost first. A folded frame is a
+    /// name and nothing else, so the frames are the names.
     fn shown(profile: &Profile) -> Vec<String> {
         let folded = profile.to_folded("totalBytes").expect("a metric");
         let stack = folded
@@ -811,13 +1067,7 @@ mod tests {
             .rsplit_once(' ')
             .expect("a count")
             .0;
-        stack
-            .rsplit(';')
-            .map(|frame| {
-                let name = frame.split_once(": ").expect("an address").1;
-                String::from(name.split_once(" (").expect("an image").0)
-            })
-            .collect()
+        stack.rsplit(';').map(String::from).collect()
     }
 
     /// Allocation machinery inlined into the call the program wrote, as
@@ -912,6 +1162,90 @@ mod tests {
         );
         profile.resolve_frame(2, &inlined(&["std::rt::lang_start_internal"]));
         assert_eq!(shown(&profile), ["program::allocates", "program::main"]);
+    }
+
+    /// One level of a resolution, named or not.
+    fn level(function: Option<&str>) -> Frame {
+        Frame {
+            function: function.map(String::from),
+            file: Some(String::from("/src/main.rs")),
+            line: Some(3),
+        }
+    }
+
+    /// An inlined level the symbolizer could not name is still a level. In the
+    /// middle of a chain of machinery it stops the leading run of
+    /// allocation-path functions, as any frame the rules cannot read does, so
+    /// whatever program code it may be is not trimmed away. Without it this
+    /// frame would be machinery throughout and go.
+    #[test]
+    fn an_unnamed_middle_level_is_kept_and_stops_the_trim() {
+        let mut profile = a_stack(2);
+        profile.resolve_frame(
+            0,
+            &Resolution {
+                frames: vec![
+                    level(Some("alloc::alloc::alloc")),
+                    level(None),
+                    level(Some("<alloc::raw_vec::RawVecInner>::finish_grow")),
+                ],
+            },
+        );
+        profile.resolve_frame(1, &inlined(&["program::main"]));
+        assert_eq!(
+            shown(&profile),
+            [
+                "<alloc::raw_vec::RawVecInner>::finish_grow",
+                "program::main"
+            ]
+        );
+    }
+
+    /// The outermost level is the function the address physically lies in,
+    /// and the name the running process recorded for the address is that
+    /// function's. Where the symbolizer left that level unnamed, the recorded
+    /// name stands in, as it does in the library's own output.
+    #[test]
+    fn an_unnamed_outermost_level_takes_the_recorded_name() {
+        let text = r#"{
+  "format":"heapscope-profile","formatVersion":1,
+  "frames":[
+    {"addr":"0x1100","module":0,"fileAddr":"0x100","symbol":"_ZN7program5churn17h0123456789abcdefE","symbolOffset":16},
+    {"addr":"0x1200","module":0,"fileAddr":"0x200"}
+  ],
+  "points":[{"kind":"recorded","totalBytes":64,"frames":[0,1]}],
+  "modules":[{"path":"/bin/program","load":"0x1000","start":"0x1000","size":4096,"bias":"0x1000"}]
+}"#;
+        let mut profile = Profile::parse(text).expect("a native profile");
+        profile.resolve_frame(
+            0,
+            &Resolution {
+                frames: vec![level(Some("alloc::alloc::alloc")), level(None)],
+            },
+        );
+        profile.resolve_frame(1, &inlined(&["program::main"]));
+        assert_eq!(shown(&profile), ["program::churn", "program::main"]);
+    }
+
+    /// Version 0.1.0 wrote `"???"` into `inlinedBy` entries as well as into
+    /// frames. Read as no name there too, it is an unnamed level like the ones
+    /// above, and not a function called `???`.
+    #[test]
+    fn the_placeholder_an_older_version_wrote_into_an_inlined_caller_is_not_a_name() {
+        let text = r#"{
+  "format":"heapscope-profile","formatVersion":1,
+  "frames":[
+    {"addr":"0x1100","module":0,"fileAddr":"0x100","function":"alloc::alloc::alloc","inlinedBy":[{"function":"???","file":"/src/main.rs","line":3}]},
+    {"addr":"0x1200","module":0,"fileAddr":"0x200","function":"program::main"}
+  ],
+  "points":[{"kind":"recorded","totalBytes":64,"frames":[0,1]}],
+  "modules":[{"path":"/bin/program","load":"0x1000","start":"0x1000","size":4096,"bias":"0x1000"}]
+}"#;
+        let profile = Profile::parse(text).expect("a native profile");
+        assert_eq!(
+            profile.to_folded("totalBytes").expect("a metric"),
+            "program::main;[program+0x100] 64\n"
+        );
     }
 
     /// A profile with no module map is the degraded case, not a crash.

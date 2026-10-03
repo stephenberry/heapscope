@@ -50,7 +50,9 @@
 //! and none of them has to know anything about this crate. A folded file carries
 //! one number per stack, so [`FoldedMetric`] says which: each of the four sums
 //! to a figure the profile reports globally, which makes a flame graph's total
-//! width checkable against the summary.
+//! width checkable against the summary. Its frames are function names and
+//! nothing else, because a flame graph merges frames by their text: see
+//! [`symbol::FunctionNames`] for why, and for what that gives up.
 //!
 //! Ask for as many as you want: they come from a single reading of the engine,
 //! so they cannot disagree.

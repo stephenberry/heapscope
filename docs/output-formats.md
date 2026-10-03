@@ -78,4 +78,22 @@ let profiler = Profiler::builder()
 
 The last two are not measurements an ad hoc or copy run took: an event is never live and never dies. Asking for one is refused rather than written as a file of zeroes, which would read as a program that allocated nothing. `FoldedMetric::needs_block_lifetimes` is the check that predicts it.
 
-Frames are trimmed and symbolized like everywhere else, so on Linux — where in-process symbolization names almost nothing — [resolve offline](symbolization.md) first or the flame graph is a tower of addresses.
+### Frames are function names
+
+A frame in a folded file is the name of the function and nothing else: `core::fmt::write`, not `0x1044c81f0: core::fmt::write+0x1c (/path/to/program+0x2c1f0)`. A flame graph merges frames by their text, so an address in the frame would split a function into one node per return address it was reached through, and an image path would make every label a path with a name somewhere at the end of it. Two stacks that render alike are written as one line with their counts summed.
+
+Names are found and demangled exactly as in every other output, so a frame in the flame graph can be searched for in the text summary or the DHAT file of the same run. The hash a legacy-mangled name ends in is dropped; generic arguments are kept, because `Vec<u8>::push` and `Vec<String>::push` are different code and merging them is a choice a viewer's search can make and a file cannot undo.
+
+A frame with no name is `[program+0x2c1f0]`: the image's file name and the frame's address as it appears in that file. That is the return address the stack walk recorded, the same number the native profile and `Symbolized` carry, so a symbolizer asked about it by hand should be asked about one byte earlier, the call itself; see [symbolization](symbolization.md). Unnamed frames stay apart from each other, rather than collapsing into one node per image. Where two loaded images share a file name, both are written with their whole path, so code from two different `libfoo.so` files is never merged. An address in no image is written as itself, `[0x1044c81f0]`.
+
+Frames are trimmed as in every other output: the allocation path above a stack and the runtime entry below it are left out. Trimming reads names, and the names come from the running process, so on Linux, where in-process symbolization names almost nothing, a folded file written at record time is untrimmed and mostly `[program+0x…]` frames. `heapscope-symbolize profile.native.json -f folded` writes the same file from names an offline symbolizer found, trimmed by the same rules; see [symbolization](symbolization.md).
+
+What a name alone gives up is the offset from the symbol, which is how a reader spots a name the platform matched from too far away, and resolvability: a folded file is a picture of the profile, and the native profile is the record. Folded output up to 0.1.0 used the addressed rendering, trimmed by default, and it is one argument away for anyone who wants it:
+
+```rust
+use heapscope::symbol::{Symbolized, Trimmed};
+
+let file = std::fs::File::create("target/addressed.folded")?;
+let addressed = Trimmed::new(Symbolized::new(&snapshot.modules));
+snapshot.write_folded_with(file, &addressed, FoldedMetric::TotalBytes)?;
+```

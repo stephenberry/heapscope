@@ -72,10 +72,10 @@ pub(super) const UNWALKABLE_FRAME: &str = "[unwalkable]: no frame pointer chain 
 /// [`RawAddresses`], names nothing at all and leaves symbolization to be done
 /// later — possibly on another machine.
 ///
-/// There are two questions, and they are here together because the second can
-/// only be answered by whoever answered the first: deciding that a frame is
-/// uninteresting means reading its name, and the name is whatever this trait
-/// produced.
+/// There are three questions, and they are here together because the last two
+/// can only be answered by whoever answered the first: deciding that a frame is
+/// uninteresting means reading its name, and the name is wherever this trait
+/// put it.
 pub trait FrameFormat {
     /// Appends the rendering of `address` to `out`.
     ///
@@ -96,6 +96,47 @@ pub trait FrameFormat {
     fn keep(&self, frames: &[String]) -> std::ops::Range<usize> {
         0..frames.len()
     }
+
+    /// The part of `frame`, as [`format`](FrameFormat::format) rendered it,
+    /// that names code. `None` where the frame names nothing this can find.
+    ///
+    /// This is what [`Trimmed`](crate::symbol::Trimmed) reads its rules
+    /// against. Only the start of the answer matters to those rules, which
+    /// match names by prefix, so text after the name may be left on it.
+    ///
+    /// The default reads the shape every address-carrying renderer in this
+    /// crate produces, the one Valgrind uses: `0x1044c81f0: name (image+0x2c1f0)`,
+    /// with the name after the first `": "`. A renderer that writes some other
+    /// shape and says nothing here gets `None` for every frame, so it is left
+    /// untrimmed rather than trimmed by guesswork.
+    /// [`FunctionNames`](crate::symbol::FunctionNames) writes a bare name, and
+    /// is the reason this is a question for the renderer rather than a parser
+    /// in the trimming rules: a demangled name can itself contain `": "`, in a
+    /// const generic argument, so no single parser reads both shapes.
+    ///
+    /// `frame` is the text after screening (see the emitters' documentation on
+    /// escaping), which is what a reader sees and what the rules should judge.
+    ///
+    /// **A wrapper that delegates [`format`](FrameFormat::format) must delegate
+    /// this too**, for the same reason it must delegate
+    /// [`keep`](FrameFormat::keep): the text is the inner renderer's, so only
+    /// the inner renderer knows where the name is. Left to the default, a
+    /// wrapper around [`FunctionNames`](crate::symbol::FunctionNames) finds no
+    /// names, and anything trimming through it silently trims nothing.
+    /// [`Trimmed`](crate::symbol::Trimmed) delegates both.
+    fn name_of<'a>(&self, frame: &'a str) -> Option<&'a str> {
+        name_after_address(frame)
+    }
+}
+
+/// The name in a frame rendered `0xADDR: name (image+0xoffset)`, or `None`.
+///
+/// The text after the first `": "`, image attribution and all. Shared by the
+/// default [`FrameFormat::name_of`] and by
+/// [`worth_showing`](crate::symbol::trim::worth_showing), which promises to read
+/// this shape whatever renderer produced it.
+pub(crate) fn name_after_address(frame: &str) -> Option<&str> {
+    frame.split_once(": ").map(|(_, name)| name)
 }
 
 /// Renders frames as bare hexadecimal return addresses.

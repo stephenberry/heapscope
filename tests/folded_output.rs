@@ -21,10 +21,10 @@
 //!
 //! What is checked by unit test rather than here is the rendering itself — the
 //! frame order, the escaping, the refusal — against renderers a test controls.
-//! This suite is about the whole emitter, including the [`Symbolized`] and
+//! This suite is about the whole emitter, including the [`FunctionNames`] and
 //! [`Trimmed`] pair the default path uses, whose output depends on the platform.
 //!
-//! [`Symbolized`]: heapscope::symbol::Symbolized
+//! [`FunctionNames`]: heapscope::symbol::FunctionNames
 //! [`Trimmed`]: heapscope::symbol::Trimmed
 
 mod support;
@@ -50,11 +50,12 @@ fn emit(snapshot: &Snapshot, metric: FoldedMetric) -> String {
 /// One line, split the way `inferno` and `speedscope` split it.
 ///
 /// Both take everything up to the **last** space as the stack and the rest as
-/// the count, which is what lets a frame contain spaces — and every frame this
-/// crate renders does, since `0x1044c81f0: name (/path+0x2c1f0)` has three.
-/// Splitting on the first space instead would pass on a file of bare symbols and
-/// fail on every real profile, so the test splits the way the tools do rather
-/// than the way that is convenient.
+/// the count, which is what lets a frame contain spaces — and real frames do: a
+/// trait method is `<alloc::vec::Vec<u8> as core::ops::drop::Drop>::drop`, and
+/// `0x1044c81f0: name (/path+0x2c1f0)` from `Symbolized` has three. Splitting on
+/// the first space instead would pass on a file of plain function names and fail
+/// on every real profile, so the test splits the way the tools do rather than
+/// the way that is convenient.
 fn split(line: &str) -> (Vec<&str>, u64) {
     let (stack, count) = line
         .rsplit_once(' ')
@@ -197,7 +198,7 @@ fn stacks_share_a_prefix_where_the_program_shared_a_caller() {
 /// no trimming can only produce at least as many frames.
 #[test]
 fn the_untrimmed_rendering_is_never_shorter() {
-    use heapscope::symbol::Symbolized;
+    use heapscope::symbol::FunctionNames;
 
     let snapshot = snapshot();
     let trimmed = emit(&snapshot, FoldedMetric::TotalBytes);
@@ -206,7 +207,7 @@ fn the_untrimmed_rendering_is_never_shorter() {
     snapshot
         .write_folded_with(
             &mut out,
-            &Symbolized::new(&snapshot.modules),
+            &FunctionNames::new(&snapshot.modules),
             FoldedMetric::TotalBytes,
         )
         .expect("the untrimmed rendering");
@@ -278,45 +279,171 @@ fn a_refused_save_leaves_nothing_behind() {
     );
 }
 
-/// A directory named with a `;` does not add a level to the flame graph.
+/// An image path with a `;` in it does not add a level to the flame graph.
 ///
 /// The realistic way a separator reaches a frame, and the reason it is worth an
 /// integration test rather than only a unit one: every renderer this crate ships
-/// puts the *image path* into the frame text, and a path is whatever the
-/// filesystem allows. Nothing about the resulting file looks wrong — the stack
-/// simply has a frame in it that the program never called.
+/// puts the image into the frame text where it has no name, the whole path or
+/// just its file name, and a path is whatever the filesystem allows. Nothing
+/// about the resulting file looks wrong — the stack simply has a frame in it
+/// that the program never called.
+///
+/// Both renderings, because they put different parts of the path in the frame:
+/// the default only the file name, `Symbolized` the directories as well.
 ///
 /// Counted rather than matched, because what the frames are called depends on
 /// the platform and what they are worth here is only how many there are.
 #[test]
 fn a_semicolon_in_an_image_path_does_not_invent_a_frame() {
-    use heapscope::symbol::modules::Module;
+    use heapscope::symbol::Symbolized;
 
     const FRAMES: usize = 3;
 
     let mut snapshot = hand_built(vec![point(&[0x1000, 0x1100, 0x1200], 4096, 4)]);
-    snapshot.modules = vec![Module {
-        path: String::from("/tmp/we;ird/program"),
-        start: 0x1000,
-        size: 0x1000,
-        bias: 0,
-        image_base: 0x1000,
-        build_id: None,
-    }];
+    snapshot.modules = vec![image("/tmp/we;ird/pro;gram", 0x1000)];
 
-    let text = emit(&snapshot, FoldedMetric::TotalBytes);
-    let (stack, count) = split(text.lines().next().expect("one line"));
-    assert_eq!(count, 4096);
+    let mut out = Vec::new();
+    snapshot
+        .write_folded_with(
+            &mut out,
+            &Symbolized::new(&snapshot.modules),
+            FoldedMetric::TotalBytes,
+        )
+        .expect("the addressed rendering");
+    let symbolized = String::from_utf8(out).expect("UTF-8");
+
+    for (text, escaped) in [
+        (emit(&snapshot, FoldedMetric::TotalBytes), r"pro\u{3b}gram"),
+        (symbolized, r"we\u{3b}ird/pro\u{3b}gram"),
+    ] {
+        let (stack, count) = split(text.lines().next().expect("one line"));
+        assert_eq!(count, 4096);
+        assert_eq!(
+            stack.len(),
+            FRAMES,
+            "{FRAMES} frames became {} because a path carried the separator:\n{text}",
+            stack.len()
+        );
+        assert!(
+            text.contains(escaped),
+            "the separator was not escaped: {text}"
+        );
+    }
+}
+
+/// An image whose file addresses start at zero, at `start`, which is what lets
+/// two images put different code at the same file address.
+fn image(path: &str, start: usize) -> heapscope::symbol::modules::Module {
+    heapscope::symbol::modules::Module {
+        path: String::from(path),
+        start,
+        size: 0x1000,
+        bias: start,
+        image_base: start,
+        build_id: None,
+    }
+}
+
+/// A frame nothing names is drawn as its image and file address, by file name.
+///
+/// The addresses sit in images invented for the test, far below anything a
+/// real process maps, so no platform names them and the fallback is what every
+/// platform writes. Exact, for that reason.
+#[test]
+fn an_unnamed_frame_is_its_image_file_name_and_file_address() {
+    let mut snapshot = hand_built(vec![
+        point(&[0x1100], 4096, 4),
+        point(&[0x3100], 2048, 2),
+        point(&[0x5100], 1024, 1),
+        point(&[0x9_0000], 512, 1),
+    ]);
+    snapshot.modules = vec![
+        image("/opt/one/libsame.so", 0x1000),
+        image("/opt/two/libsame.so", 0x3000),
+        image("/usr/lib/libother.so", 0x5000),
+    ];
+
     assert_eq!(
-        stack.len(),
-        FRAMES,
-        "{FRAMES} frames became {} because a path carried the separator:\n{text}",
-        stack.len()
+        emit(&snapshot, FoldedMetric::TotalBytes),
+        // Two images share a file name, so both keep their paths: shortened,
+        // these two frames at file address 0x100 would be one frame made of two
+        // unrelated functions. The image that shares nothing is shortened. And
+        // an address in no image is its runtime address.
+        "[/opt/one/libsame.so+0x100] 4096\n\
+         [/opt/two/libsame.so+0x100] 2048\n\
+         [libother.so+0x100] 1024\n\
+         [0x90000] 512\n"
     );
-    assert!(
-        text.contains(r"we\u{3b}ird"),
-        "the separator was not escaped: {text}"
+}
+
+/// The addressed rendering the default used to be is one argument away, and
+/// still carries what makes a frame resolvable afterwards.
+#[test]
+fn the_addressed_rendering_is_still_available() {
+    use heapscope::symbol::Symbolized;
+
+    let mut snapshot = hand_built(vec![point(&[0x1100], 4096, 4)]);
+    snapshot.modules = vec![image("/opt/one/libsame.so", 0x1000)];
+
+    let mut out = Vec::new();
+    snapshot
+        .write_folded_with(
+            &mut out,
+            &Symbolized::new(&snapshot.modules),
+            FoldedMetric::TotalBytes,
+        )
+        .expect("the addressed rendering");
+    assert_eq!(
+        String::from_utf8(out).expect("UTF-8"),
+        "0x1100: ??? (/opt/one/libsame.so+0x100) 4096\n"
     );
+}
+
+/// The merge the default rendering exists for, against a real symbol table:
+/// two return addresses inside one function are one frame, so two points
+/// through them are one line, with the counts summed.
+///
+/// `malloc` because it is the one function every supported platform's
+/// in-process lookup can name, Linux included, where `dladdr` sees only what
+/// an image exports and a Rust executable exports almost nothing. Where the
+/// platform still names neither address (symbolization turned off, Miri, a
+/// `malloc` reached through a stub in the executable), they stay two lines,
+/// which is the honest answer, and that is checked instead.
+#[test]
+fn two_return_addresses_in_one_named_function_are_one_line() {
+    extern "C" {
+        fn malloc(size: usize) -> *mut std::ffi::c_void;
+    }
+    let entry = malloc as unsafe extern "C" fn(usize) -> *mut std::ffi::c_void as usize;
+    let (first, second) = (entry + 4, entry + 8);
+
+    let mut snapshot = hand_built(vec![
+        point(&[first, 0x10], 4096, 4),
+        point(&[second, 0x10], 1024, 1),
+    ]);
+    snapshot.modules = heapscope::symbol::capture_modules();
+    let text = emit(&snapshot, FoldedMetric::TotalBytes);
+    assert!(problems(&text).is_empty(), "{text}");
+    assert_eq!(
+        text.lines().map(|line| split(line).1).sum::<u64>(),
+        global(&snapshot, FoldedMetric::TotalBytes),
+        "{text}"
+    );
+
+    let named = |address| {
+        heapscope::symbol::resolve(&snapshot.modules, address)
+            .symbol
+            .map(|symbol| symbol.name)
+    };
+    match (named(first), named(second)) {
+        (Some(one), Some(other)) if one == other => {
+            let (stack, count) = split(text.lines().next().expect("a line"));
+            assert_eq!(text.lines().count(), 1, "one function, two lines:\n{text}");
+            assert_eq!(count, 5120);
+            assert_eq!(stack.last(), Some(&one.as_str()), "{text}");
+        }
+        _ => assert_eq!(text.lines().count(), 2, "{text}"),
+    }
 }
 
 /// A profile with no points is an empty file rather than a malformed one.
