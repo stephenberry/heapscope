@@ -23,7 +23,7 @@ mod support;
 
 use heapscope::internals::shape::{Shape, Shapes};
 use heapscope::output::{
-    PointKind, ProgramPoint, RegionStats, Snapshot, TableUsage, TallyStats, ThreadStats,
+    PointKind, ProgramPoint, RegionStats, Reset, Snapshot, TableUsage, TallyStats, ThreadStats,
 };
 use heapscope::symbol::modules::Module;
 use heapscope::Mode;
@@ -871,6 +871,104 @@ fn the_validator_rejects_points_that_do_not_sum_to_the_totals() {
     );
 }
 
+/// A point that peaked on blocks it allocated before a restart, which is the
+/// shape a restart gives a point that holds a warm-up's cache.
+fn restarted(at: u64) -> Snapshot {
+    let mut snapshot = snapshot(vec![point(&[0x1500], 4096, 8), point(&[0x4500], 512, 1)]);
+    snapshot.points[0].counters.max_bytes = 3 * 4096;
+    let mut reset = Reset::default();
+    reset.count = 1;
+    reset.at = at;
+    reset.carried_bytes = 2 * 4096;
+    reset.carried_blocks = 2;
+    snapshot.reset = Some(reset);
+    snapshot
+}
+
+/// After a restart a point can have held more than it allocated, because the
+/// window's totals leave out what it carried into the window. The file says so,
+/// and saying so is the only thing that makes the shape acceptable.
+#[test]
+fn a_restarted_profile_may_hold_what_its_window_did_not_allocate() {
+    let text = emit(&restarted(0));
+    native::assert_valid(&text);
+    assert!(text.contains(r#""formatVersion":2"#), "{text}");
+
+    rejects(
+        &damaged_by(&text, |t| {
+            let undeclared = replacing(t, r#""formatVersion":2"#, r#""formatVersion":1"#);
+            // From the comma before the key to the brace that closes it, so
+            // the object it leaves behind is still JSON.
+            let key = undeclared
+                .find(r#""reset":{"#)
+                .expect("the restart is declared");
+            let start = undeclared[..key].rfind(',').expect("after another field");
+            let end = key + undeclared[key..].find('}').expect("and closed") + 1;
+            format!("{}{}", &undeclared[..start], &undeclared[end..])
+        }),
+        "a point peaked at 12288 bytes having allocated 4096 and the run carried 0",
+    );
+
+    // Declared, and still bounded: 4,096 allocated and 8,192 carried explain
+    // the 12,288 peak, and 4,096 carried does not.
+    rejects(
+        &damaged_by(&text, |t| {
+            replacing(t, r#""carriedBytes":8192"#, r#""carriedBytes":4096"#)
+        }),
+        "a point peaked at 12288 bytes having allocated 4096 and the run carried 4096",
+    );
+}
+
+/// The version and the declaration travel together, both ways: a reader that
+/// predates restarts must refuse exactly the files it would misread.
+#[test]
+fn the_validator_rejects_a_version_that_disagrees_with_the_restart() {
+    let text = emit(&restarted(0));
+    rejects(
+        &damaged_by(&text, |t| {
+            replacing(t, r#""formatVersion":2"#, r#""formatVersion":1"#)
+        }),
+        "the file says version 1",
+    );
+
+    let never = emit(&snapshot(vec![point(&[0x1500], 4096, 8)]));
+    rejects(
+        &damaged_by(&never, |t| {
+            replacing(t, r#""formatVersion":1"#, r#""formatVersion":2"#)
+        }),
+        "declares no restart",
+    );
+}
+
+/// The restart is an instant on the run's time axis, and the window it opens
+/// is where the peak was found.
+#[test]
+fn the_validator_rejects_a_restart_outside_the_window_it_opens() {
+    let snapshot = restarted(0);
+    let text = emit(&snapshot);
+    let after_end = format!(r#""reset":{{"count":1,"at":{}"#, snapshot.time_at_end + 1);
+    rejects(
+        &damaged_by(&text, |t| {
+            replacing(t, r#""reset":{"count":1,"at":0"#, &after_end)
+        }),
+        "after the run ended",
+    );
+    rejects(
+        &damaged_by(&text, |t| {
+            replacing(t, r#""reset":{"count":1,"#, r#""reset":{"count":0,"#)
+        }),
+        "counts no restart",
+    );
+    let peak = snapshot.stats.time_at_max;
+    let after_peak = format!(r#""reset":{{"count":1,"at":{}"#, peak + 1);
+    rejects(
+        &damaged_by(&text, |t| {
+            replacing(t, r#""reset":{"count":1,"at":0"#, &after_peak)
+        }),
+        "before the restart",
+    );
+}
+
 /// The property the peak gate exists to make true.
 #[test]
 fn the_validator_rejects_at_peak_columns_that_do_not_sum_to_the_peak() {
@@ -1190,17 +1288,32 @@ fn the_validator_rejects_a_reallocation_that_copied_without_moving() {
 /// with the emitter by construction and prove nothing.
 #[test]
 fn the_dhat_file_carries_no_number_the_native_file_lacks() {
-    let snapshot = snapshot(vec![
+    the_two_files_agree(&snapshot(vec![
         point(&[0x1500, 0x1600], 4096, 8),
         point(&[0x4500], 512, 1),
-    ]);
+    ]));
+}
 
+/// The same, for a run whose counts were restarted: the restart is declared in
+/// both files, field for field, and `cmd` is the command with a note after it.
+#[test]
+fn a_restart_is_the_same_restart_in_both_files() {
+    let mut restarted = restarted(0);
+    if let Some(reset) = restarted.reset.as_mut() {
+        reset.count = 2;
+        reset.dropped_blocks = 3;
+    }
+    restarted.stats.dropped_blocks = 5;
+    the_two_files_agree(&restarted);
+}
+
+fn the_two_files_agree(snapshot: &Snapshot) {
     let mut buffer = Vec::new();
     snapshot
         .write_dhat_v2(&mut buffer)
         .expect("writing to a Vec cannot fail");
     let dhat = parse(&String::from_utf8(buffer).expect("valid UTF-8"));
-    let native = parse(&emit(&snapshot));
+    let native = parse(&emit(snapshot));
 
     let at = |value: &Value, path: &str| -> u64 {
         let mut current = value.clone();
@@ -1244,21 +1357,69 @@ fn the_dhat_file_carries_no_number_the_native_file_lacks() {
         );
     }
 
+    let text = |value: &Value, path: &str| -> String {
+        let mut current = value.clone();
+        for step in path.split('.') {
+            current = current.get(step).expect("the field exists").clone();
+        }
+        current.as_str().expect("a string").to_string()
+    };
     for (dhat_path, native_path) in [
         ("mode", "run.mode"),
-        ("cmd", "run.command"),
         ("heapscope.shutdown", "run.shutdown"),
         ("heapscope.unwinder", "run.unwinder"),
         ("tu", "run.timeSource"),
     ] {
-        let text = |value: &Value, path: &str| -> String {
-            let mut current = value.clone();
-            for step in path.split('.') {
-                current = current.get(step).expect("the field exists").clone();
-            }
-            current.as_str().expect("a string").to_string()
-        };
         assert_eq!(text(&dhat, dhat_path), text(&native, native_path));
+    }
+
+    // `cmd` is the command, and after a restart the command with a note on the
+    // end, because it is the one line of text dh_view shows.
+    let command = text(&native, "run.command");
+    let cmd = text(&dhat, "cmd");
+    assert!(
+        cmd.starts_with(&command),
+        "`cmd` is {cmd:?}, which does not begin with the command {command:?}"
+    );
+    let restart = (
+        dhat.get("heapscope")
+            .and_then(|section| section.get("reset")),
+        native.get("run").and_then(|run| run.get("reset")),
+    );
+    match restart {
+        (None, None) => assert_eq!(cmd, command, "a run never restarted has a note"),
+        (Some(_), Some(_)) => {
+            assert!(
+                cmd.len() > command.len(),
+                "a restarted run's `cmd` has no note"
+            );
+            // The section's own spelling for blocks the table turned away is
+            // `droppedBlocks`, as at its top level; the native file says
+            // `notRecorded`, as it does everywhere.
+            for (dhat_path, native_path) in [
+                ("heapscope.reset.count", "run.reset.count"),
+                ("heapscope.reset.at", "run.reset.at"),
+                ("heapscope.reset.carriedBytes", "run.reset.carriedBytes"),
+                ("heapscope.reset.carriedBlocks", "run.reset.carriedBlocks"),
+                (
+                    "heapscope.reset.droppedBlocks",
+                    "run.reset.notRecordedBlocks",
+                ),
+            ] {
+                assert_eq!(
+                    at(&dhat, dhat_path),
+                    at(&native, native_path),
+                    "`{dhat_path}` and `{native_path}` describe the same restart \
+                     and disagree"
+                );
+            }
+        }
+        (dhat_reset, native_reset) => panic!(
+            "one file declares a restart and the other does not: DHAT {:?}, \
+             native {:?}",
+            dhat_reset.is_some(),
+            native_reset.is_some()
+        ),
     }
 
     // The module map, which both files carry and nothing compared. It is the one

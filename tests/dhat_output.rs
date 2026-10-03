@@ -14,7 +14,7 @@ mod support;
 
 use std::collections::BTreeMap;
 
-use heapscope::output::{Counters, FrameFormat, PointKind, ProgramPoint, Snapshot};
+use heapscope::output::{Counters, FrameFormat, PointKind, ProgramPoint, Reset, Snapshot};
 use heapscope::symbol::modules::Module;
 use heapscope::{Mode, TimeSource};
 use proptest::prelude::*;
@@ -925,6 +925,78 @@ fn the_validator_rejects_impossible_counters() {
     assert!(
         problems.iter().any(|p| p.contains("global peak")),
         "{problems:?}"
+    );
+}
+
+/// A restarted profile, with its first point holding blocks it allocated
+/// before the window: three times what it allocated in it.
+fn restarted() -> String {
+    let mut snapshot = snapshot(vec![
+        point(&[0x1000, 0x2000], 4096, 8),
+        point(&[0x3000], 512, 2),
+    ]);
+    snapshot.points[0].counters.max_bytes = 3 * 4096;
+    let mut reset = Reset::default();
+    reset.count = 1;
+    reset.carried_bytes = 2 * 4096;
+    reset.carried_blocks = 2;
+    snapshot.reset = Some(reset);
+    emit(&snapshot)
+}
+
+/// dh_view shows `cmd` and not the `heapscope` section, so a restart has to be
+/// in both, and the shape it gives a point is acceptable only where declared.
+#[test]
+fn a_restart_is_declared_where_the_viewer_shows_it_and_relaxes_nothing_undeclared() {
+    let profile = restarted();
+    dhat::assert_valid(&profile);
+
+    let quiet = damaged_by(&profile, |root| {
+        root.insert(
+            String::from("cmd"),
+            Value::String(String::from("target/debug/example")),
+        );
+    });
+    assert!(
+        quiet
+            .iter()
+            .any(|p| p.contains("`cmd` does not mention it")),
+        "{quiet:?}"
+    );
+
+    let undeclared = damaged_by(&profile, |root| {
+        let Some(Value::Object(extension)) = root.get_mut("heapscope") else {
+            panic!("the heapscope section is an object");
+        };
+        extension.remove("reset");
+        root.insert(
+            String::from("cmd"),
+            Value::String(String::from("target/debug/example")),
+        );
+    });
+    let too_much = "more bytes were live at once than were allocated and carried";
+    assert!(
+        undeclared.iter().any(|p| p.contains(too_much)),
+        "{undeclared:?}"
+    );
+
+    // Declared, and still bounded: the point peaked at 12,288 bytes having
+    // allocated 4,096, which the 8,192 carried explains and 4,096 does not.
+    let understated = damaged_by(&profile, |root| {
+        let Some(Value::Object(extension)) = root.get_mut("heapscope") else {
+            panic!("the heapscope section is an object");
+        };
+        let Some(Value::Object(reset)) = extension.get_mut("reset") else {
+            panic!("the restart is declared");
+        };
+        reset.insert(
+            String::from("carriedBytes"),
+            Value::Number(String::from("4096")),
+        );
+    });
+    assert!(
+        understated.iter().any(|p| p.contains(too_much)),
+        "{understated:?}"
     );
 }
 

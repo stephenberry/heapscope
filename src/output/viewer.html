@@ -482,6 +482,28 @@ const HEAPSCOPE = (function () {
         body: "The run did not hold the peak gate exactly, so the global peak and every at-peak figure are lower bounds rather than measurements.",
       });
     }
+    // Ahead of everything that qualifies a number, because this changes what
+    // every number means: a site can hold more than it allocated, and the
+    // reader would otherwise take that for a defect in the profile.
+    if (run.reset) {
+      const reset = run.reset;
+      const unit = run.timeUnit ? " " + run.timeUnit : "";
+      const carried = Number.isFinite(reset.carriedBytes)
+        ? " " + formatBytes(reset.carriedBytes) + " in " + formatCount(reset.carriedBlocks)
+          + " blocks were live then; they count as live and toward the peak, and not as allocated."
+        : "";
+      // The same test the header makes: a run with no live blocks has no peak
+      // and no lifetimes, and naming them would say it had.
+      const covered = profile.totals && profile.totals.maxBytes !== undefined
+        ? "totals, peaks and lifetimes cover"
+        : "totals cover";
+      out.push({
+        title: "Counts were restarted partway through the run.",
+        body: "Profiler::reset restarted them at " + formatCount(reset.at) + unit
+          + (reset.count > 1 ? ", the last of " + formatCount(reset.count) + " restarts" : "")
+          + ", so " + covered + " only what followed." + carried,
+      });
+    }
     if (interval) {
       const accuracy = samplingAccuracy(profile);
       const detail = accuracy
@@ -566,11 +588,12 @@ if (typeof document !== "undefined") {
 
     // A reader must refuse a formatVersion it does not know: that rule is
     // written into every profile this crate produces, and the bundled viewer
-    // is the one reader guaranteed to be looking at it.
-    if (profile.formatVersion !== 1) {
+    // is the one reader guaranteed to be looking at it. Version 2 is a run
+    // whose counts were restarted, which the warnings above explain.
+    if (profile.formatVersion !== 1 && profile.formatVersion !== 2) {
       document.getElementById("banners").innerHTML = "";
       addBanner("This profile is in a format this viewer does not know.",
-        "It says formatVersion " + String(profile.formatVersion) + ", and this page understands version 1."
+        "It says formatVersion " + String(profile.formatVersion) + ", and this page understands versions 1 and 2."
         + " It was written by " + String(profile.producer || "an unknown producer")
         + ". Nothing below is displayed, because a reader that guesses at an unknown format reports numbers that are not there.");
       document.getElementById("tabs").hidden = true;

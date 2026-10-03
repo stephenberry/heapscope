@@ -51,8 +51,8 @@
 
 use std::fmt;
 use std::num::NonZeroU64;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
-use std::time::Duration;
+use std::sync::atomic::{fence, AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use super::arena::Arena;
 use super::clock::{Clock, TimeSource};
@@ -349,7 +349,151 @@ pub struct Flush {
     /// and the global one, so the two need not agree. The profile records this
     /// rather than presenting a possibly inconsistent snapshot as exact.
     pub exclusive: bool,
+    /// The most recent restart of the counts, if there has been one, read in
+    /// the same window: it says what the totals beside it cover.
+    pub reset: Option<Reset>,
 }
+
+/// The most recent restart of a run's counts, and what the run held then.
+///
+/// A run whose counts were restarted with
+/// [`Profiler::reset`](crate::Profiler::reset) reports totals, peaks and
+/// lifetimes for the window since, while what was live at the restart stays
+/// live and stays counted as live. A profile carries this so that a reader can
+/// tell that window from the whole run, which nothing in the numbers
+/// themselves would say. See [`Engine::reset`] for every counter's rule.
+///
+/// `#[non_exhaustive]`, like the other readings a profile is written from.
+/// Built outside this crate as `Reset::default()` and then assigned to.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Reset {
+    /// Restarts so far. At least one wherever a `Reset` is reported.
+    pub count: u64,
+    /// The clock reading at the most recent restart, in the run's time source.
+    ///
+    /// On the same axis as every other instant in the profile: a restart does
+    /// not move the clock's zero, so the window a profile describes runs from
+    /// here to its time at end.
+    pub at: u64,
+    /// Bytes live at the restart, and so carried into the window: allocated
+    /// before it, and counted as live and toward its peaks but not toward its
+    /// totals.
+    pub carried_bytes: u64,
+    /// Blocks live at the restart. See [`Reset::carried_bytes`].
+    pub carried_blocks: u64,
+    /// Blocks the live-block table had turned away by the restart.
+    ///
+    /// [`GlobalStats::dropped_blocks`] is not restarted, because a block the
+    /// table could not track may still be live, and the live figures carry
+    /// across a restart with that block missing from them. This is the part of
+    /// that count that predates the window, which is what a reader needs in
+    /// order to hold the window's own requests against its own totals.
+    pub dropped_blocks: u64,
+    /// The peak epoch the restart left the run at.
+    ///
+    /// A restart is a peak: live bytes at that instant are the most the window
+    /// has held, so it moves the epoch like any other. [`GlobalStats::epoch`]
+    /// less this is how many times the peak has moved since.
+    pub epoch: u64,
+}
+
+/// Why a run's counts could not be restarted.
+///
+/// Every variant leaves the counts exactly as they were. A restart is applied
+/// whole or not at all: half a restart would be a profile whose totals and
+/// peaks describe two different windows, with nothing in it to say so.
+///
+/// `#[non_exhaustive]`: the reasons a run cannot be restarted are not a closed
+/// set, and [`StatsError`](crate::StatsError) gained one after it shipped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ResetError {
+    /// Recording has stopped.
+    ///
+    /// A run stops when it is stopped explicitly or when the process starts to
+    /// exit, and its profile has then been, or is being, written from its final
+    /// counts, which [`HeapStats::get`](crate::HeapStats::get) keeps answering
+    /// with. Restarting them would change numbers a reader has already been
+    /// given.
+    ///
+    /// An engine that never started answers this too, having nothing to
+    /// restart. No [`Profiler`](crate::Profiler) can see that case, because one
+    /// exists only once recording has begun, so through it this always means
+    /// stopped. It is not [`StatsError::NotRecording`](crate::StatsError::NotRecording),
+    /// which is the never-started case and treats a stopped run as readable.
+    Stopped,
+    /// This process is a `fork` child of a profiled parent.
+    ///
+    /// The counters came across the `fork` and describe the parent's run, as
+    /// [`StatsError::ForkedChild`](crate::StatsError::ForkedChild) says.
+    ForkedChild,
+    /// The profiler reported an internal failure and stopped recording.
+    ///
+    /// The failure was in what the counters hold, and a restart keeps what is
+    /// live: it would carry the damage into a window that looked clean.
+    Poisoned,
+    /// The calling thread could not enter the profiler.
+    ///
+    /// Either it is already inside it (this was called from a signal handler
+    /// that interrupted an allocation, or from a `Drop` running under the
+    /// allocator) or the profiler's table of threads is full, so this thread
+    /// has no slot to enter with. A restart takes locks an interrupted
+    /// allocation may hold, and on Apple platforms taking one twice kills the
+    /// process rather than deadlocking it.
+    ///
+    /// One variant for both because the profiler's entry point answers one
+    /// question, whether this thread may enter now, on the allocator's hot
+    /// path; telling the two apart would add a branch there for the sake of an
+    /// error message here. What the two have in common is the remedy: call
+    /// again from ordinary code on a thread the profiler already knows, which
+    /// any thread that has allocated is.
+    CannotEnter,
+    /// Other threads kept the profiler busy past the deadline.
+    ///
+    /// A restart needs a quiet point, when no thread is midway through moving
+    /// a counter or a live-block entry, and waits for one for as long as a
+    /// profile written at shutdown would. A thread stopped inside the
+    /// profiler, under a debugger say, can hold it off for longer than that.
+    Busy,
+}
+
+impl fmt::Display for ResetError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ResetError::Stopped => write!(
+                f,
+                "the heapscope profiler has stopped recording, explicitly or \
+                 because the process is exiting, so its counts are final and \
+                 there is nothing to restart"
+            ),
+            ResetError::ForkedChild => write!(
+                f,
+                "this process is a fork child, and the counters it inherited \
+                 belong to the parent's run"
+            ),
+            ResetError::Poisoned => write!(
+                f,
+                "the profiler reported an internal failure and stopped \
+                 recording; restarting would carry its live counts forward"
+            ),
+            ResetError::CannotEnter => write!(
+                f,
+                "this thread could not enter the profiler to restart its counts: \
+                 it is already inside it (a signal handler, or a Drop running \
+                 under the allocator), or its table of threads is full"
+            ),
+            ResetError::Busy => write!(
+                f,
+                "other threads kept the profiler busy for longer than {} seconds; \
+                 nothing was restarted",
+                Engine::FLUSH_TIMEOUT.as_secs()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ResetError {}
 
 /// What a run was configured to do, as it was actually applied.
 ///
@@ -401,19 +545,31 @@ pub struct GlobalStats {
     pub curr_bytes: u64,
     /// Live blocks now.
     pub curr_blocks: u64,
-    /// Greatest live bytes reached. DHAT's `gmax`.
+    /// Greatest live bytes reached since the run started or its counts were
+    /// last restarted. DHAT's `gmax`.
     pub max_bytes: u64,
     /// Live blocks at the moment of that peak.
     pub max_blocks: u64,
-    /// Bytes ever allocated.
+    /// Bytes allocated since the run started or its counts were last
+    /// restarted.
     pub total_bytes: u64,
-    /// Blocks ever allocated.
+    /// Blocks allocated since the run started or its counts were last
+    /// restarted.
     pub total_blocks: u64,
     /// Clock reading at the peak. DHAT's `tg`.
     pub time_at_max: u64,
-    /// Number of peaks recorded, which is also the current epoch.
+    /// The current peak epoch, which moves on every new peak and on every
+    /// restart of the counts.
+    ///
+    /// The number of peaks recorded, in a run that was never restarted. In one
+    /// that was, the peaks since the most recent restart are this less
+    /// [`Reset::epoch`].
     pub epoch: u64,
     /// Allocations not recorded because the live-block table was full.
+    ///
+    /// Over the whole run, and not restarted with the other counts: a block the
+    /// table turned away may still be live, so the live figures, which carry
+    /// across a restart, may be short of it. See [`Reset::dropped_blocks`].
     pub dropped_blocks: u64,
     /// Events reported to a run that does not count them.
     ///
@@ -528,6 +684,26 @@ pub struct Engine {
     /// [`Engine::max_depth`] — written at most once per process, so the load
     /// generates no coherence traffic.
     sampling: AtomicU64,
+
+    /// Twice the number of restarts of the counts, plus one while a restart is
+    /// being applied: a sequence lock around [`Engine::reset`].
+    ///
+    /// A reading of the counters outside the gate, which is what
+    /// [`HeapStats::get`](crate::HeapStats::get) is, cannot otherwise say
+    /// which window it read. [`Engine::read_window`] is the reader's half, and
+    /// the comments there and in [`Engine::reset`] give the orderings.
+    reset_sequence: AtomicU64,
+    /// The most recent restart of the counts, field by field. See [`Reset`].
+    ///
+    /// Written only by [`Engine::reset`], with the peak gate held exclusively,
+    /// and read together only in a flush window, which holds it too: so a
+    /// profile never pairs half of one restart with half of another. Nothing on
+    /// the allocator path reads them.
+    reset_at: AtomicU64,
+    reset_epoch: AtomicU64,
+    carried_bytes: AtomicU64,
+    carried_blocks: AtomicU64,
+    dropped_at_reset: AtomicU64,
 }
 
 impl Engine {
@@ -569,6 +745,12 @@ impl Engine {
             mode: AtomicU8::new(Mode::Heap as u8),
             serialized: AtomicBool::new(false),
             sampling: AtomicU64::new(0),
+            reset_sequence: AtomicU64::new(0),
+            reset_at: AtomicU64::new(0),
+            reset_epoch: AtomicU64::new(0),
+            carried_bytes: AtomicU64::new(0),
+            carried_blocks: AtomicU64::new(0),
+            dropped_at_reset: AtomicU64::new(0),
         }
     }
 
@@ -1257,7 +1439,9 @@ impl Engine {
             Delta {
                 curr_bytes: -(bytes as i64),
                 curr_blocks: -(blocks as i64),
-                lifetime: Self::weighted_lifetime(now.saturating_sub(block.birth), blocks),
+                // Zero for a block carried across a restart of the counts. See
+                // `LiveBlock::CARRIED` for why, and for why it costs nothing.
+                lifetime: Self::weighted_lifetime(block.lifetime_at(now), blocks),
                 ..Delta::at(block.site)
             },
         );
@@ -1327,7 +1511,11 @@ impl Engine {
         // the reallocation also increments the block total: counting a block
         // without its lifetime deflates the average-lifetime column at every
         // realloc-heavy site, which is exactly where a reader looks first.
-        let old_lifetime = now.saturating_sub(old.birth);
+        //
+        // A block carried across a restart of the counts has none to record:
+        // it is in none of the window's allocation counts. The block it becomes is
+        // born here, so it is in them, and its lifetime will count.
+        let old_lifetime = old.lifetime_at(now);
 
         // The block stood for `old_blocks` blocks of `old_bytes` and now stands
         // for `new_blocks` of `new_bytes`. On an exact run both block figures are
@@ -1456,9 +1644,15 @@ impl Engine {
             // gate sees anything. Removing it would leave a future harness that
             // drove events without that mutex comparing against a model whose
             // order the engine no longer follows.
+            //
+            // Exclusive, and still not `apply_locked`: that is the path for
+            // something that may be a peak, and it records an equal one when
+            // live bytes sit at the maximum and the delta moves them by zero,
+            // which is every event. It did, until the differential model
+            // started counting peaks.
             let _order = super::order::enter(super::order::Level::PeakGate);
             let _guard = self.gate.write();
-            self.apply_locked(pp, delta);
+            self.commit(pp, delta, self.epoch.load(Ordering::Relaxed));
             return;
         }
 
@@ -1600,6 +1794,18 @@ impl Engine {
         // reported. Checked *after* the counters move, so the snapshot the epoch
         // implies includes this event.
         if next >= self.max_bytes.load(Ordering::Relaxed) {
+            // For readers outside the gate, and nothing else: the peak is the
+            // one counter of a window written with a plain store, which,
+            // unlike the totals' read-modify-writes, carries no release
+            // sequence back to the restart that opened the window. With this
+            // fence the chain is formal: that restart's odd sequence store
+            // happens before this thread took the gate, which happens before
+            // this fence, which synchronizes with the acquire fence of any
+            // reader that loads the stores below, so that reader's second load
+            // of the sequence sees the restart and retries. See
+            // `Engine::read_window`. On the cold path only, with the gate held
+            // exclusively, where one fence is nothing beside the peak itself.
+            fence(Ordering::Release);
             self.max_bytes.store(next, Ordering::Relaxed);
             self.max_blocks.store(next_blocks, Ordering::Relaxed);
             self.time_at_max
@@ -1793,12 +1999,293 @@ impl Engine {
         // `a_snapshot_of_a_running_engine_still_sums` covers.
         self.threads.visit(visit_thread);
         self.regions.visit(visit_region);
+        let reset = self.last_reset();
         drop(guard);
 
         Flush {
             stats,
             shapes,
             exclusive,
+            reset,
+        }
+    }
+
+    /// Restarts the run's counts, keeping what is live.
+    ///
+    /// This is [`Profiler::reset`](crate::Profiler::reset), and what follows is
+    /// the rule it applies to every counter the engine keeps. One principle
+    /// decides all of them: what *happened* before the restart is forgotten,
+    /// and what *is* at the restart is kept. A warm-up's allocations happened;
+    /// the caches it left behind are.
+    ///
+    /// | Counters | After a restart |
+    /// |---|---|
+    /// | Bytes and blocks allocated, globally, per program point, per thread and per region | zero |
+    /// | Events refused for being the wrong kind | zero |
+    /// | Live bytes and blocks, at every one of those levels | unchanged |
+    /// | The peak, and each point's and row's own running maximum | what is live now |
+    /// | Each point's bytes and blocks at the peak | what it holds now |
+    /// | The instant of the peak | now |
+    /// | Summed lifetimes per point | zero, with every block live now counting toward none |
+    /// | Requested sizes, alignments, zeroed blocks, reallocation costs | zero |
+    /// | Blocks the live-block table turned away | unchanged; see [`GlobalStats::dropped_blocks`] |
+    /// | The clock, capture counts, a region's entries, the profiler's own costs | unchanged |
+    ///
+    /// # Why live state survives
+    ///
+    /// Because it is still true. A block allocated during the warm-up and
+    /// freed afterwards must bring live bytes down when it goes, or every
+    /// figure that depends on them goes negative, which this crate treats as
+    /// corruption. Its program point, thread and region must still hold it, or
+    /// the free lands on a counter that never knew it. So the live-block table
+    /// is kept entry for entry, and so are the live counters it balances.
+    ///
+    /// # The peak
+    ///
+    /// A restart is a peak, at the level that is live when it happens: that is
+    /// the most the new window has held. So it moves the peak to the current
+    /// level, moves its instant to now, and moves the epoch like any other new
+    /// peak, so the per-point at-peak figures describe this instant and sum to
+    /// it. They are set eagerly, by the walk of the program-point table this
+    /// already makes, rather than left to the lazy refresh; the epoch moves so
+    /// that the scheme's invariant, one epoch per peak, still holds.
+    ///
+    /// # Lifetimes
+    ///
+    /// DHAT's average lifetime is the summed lifetime over the blocks counted,
+    /// and the blocks counted are now the window's. A block live across the
+    /// restart is not one of them, so its lifetime is counted nowhere, not even
+    /// the part of it that falls inside the window: in the sum and not in the
+    /// count, a warm-up's long-lived caches would inflate the average at
+    /// exactly the sites a reader scans for churn. Every live block is marked
+    /// [`LiveBlock::CARRIED`] to say so, which costs the free path nothing.
+    /// A reallocation of one is a new block, born in the window, and counts.
+    ///
+    /// # Locks
+    ///
+    /// Every live-block shard, then the peak gate exclusively: the order
+    /// [`super::order`] fixes, and the one [`Engine::fork_prepare`] takes
+    /// them in. Holding both means no block is inserted or removed and no
+    /// counter moves while the restart is applied, so it is one step at one
+    /// instant.
+    ///
+    /// All of it is waited for against one deadline, the one a profile written
+    /// at shutdown has, and [`ResetError::Busy`] is the result of missing it,
+    /// with every lock taken so far released and nothing changed. The shards
+    /// are polled for rather than blocked on, unlike `fork_prepare`'s, because
+    /// that handler has no way to give up and this does: a thread stopped while
+    /// holding one shard, under a debugger say, would otherwise hold the
+    /// restart forever, and with it every thread whose blocks hash to a shard
+    /// the restart already holds. Bounded, the worst a wedged shard costs is
+    /// those threads stalling for the deadline, once.
+    ///
+    /// # What is not exact while other threads are recording
+    ///
+    /// Every counter the gate covers is: an event's counters land wholly before
+    /// the restart or wholly after it. Two things straddle it, both because
+    /// they happen outside the gate. A shape is counted before an allocation
+    /// reaches the gate, as [`Flush::shapes`] documents. And a block's live
+    /// entry is written before its counters move, so a block whose entry was
+    /// marked carried and whose counters land after the restart is in the
+    /// window's totals with no lifetime, while a block removed just before the
+    /// restart and counted just after it brings a lifetime from before. Both
+    /// are bounded by the threads in flight at that instant.
+    ///
+    /// # Readers outside the gate
+    ///
+    /// [`Engine::reset_sequence`] is made odd before the first counter moves
+    /// and even again after the last, so a reader that does not take the gate
+    /// can still tell which window it read. See [`Engine::read_window`].
+    ///
+    /// # Why this takes a [`Guard`]
+    ///
+    /// For the reason [`Engine::record_event`] does, and with more at stake:
+    /// this takes every live-block shard, and a thread already inside the
+    /// profiler may hold one. On Apple platforms a second acquisition kills the
+    /// process. Proof of the guard makes that a borrow-check error rather than
+    /// a crash.
+    pub fn reset(&self, _entered: &Guard) -> Result<(), ResetError> {
+        // Refused before any lock is taken, so that a stopped run is not made
+        // to wait two seconds to be told it is stopped.
+        self.resettable()?;
+
+        // `checked_add` for the reason `RawLock::try_lock_for` gives: a panic
+        // here would be inside the profiler, and two seconds from now is
+        // representable on every platform this runs on, so the fallback is
+        // never taken in practice.
+        let deadline = Instant::now().checked_add(Self::FLUSH_TIMEOUT);
+        let Some(mut live) = self.live.lock_all_until(deadline) else {
+            return Err(ResetError::Busy);
+        };
+        let _order = super::order::enter(super::order::Level::PeakGate);
+        let remaining = deadline.map_or(Self::FLUSH_TIMEOUT, |deadline| {
+            deadline.saturating_duration_since(Instant::now())
+        });
+        let Some(_gate) = self.gate.write_for(remaining) else {
+            return Err(ResetError::Busy);
+        };
+        // Asked again now that nothing can move: a shutdown or a poison may have
+        // arrived while this waited, and a stopping run's profile is about to be
+        // read from these counters.
+        self.resettable()?;
+
+        let now = self.clock.now(self.time_source());
+        let curr_bytes = self.curr_bytes.load(Ordering::Relaxed);
+        let curr_blocks = self.curr_blocks.load(Ordering::Relaxed);
+        let epoch = self.epoch.load(Ordering::Relaxed) + 1;
+
+        // The writer's half of the sequence lock. Relaxed load: the gate makes
+        // this the only writer, and the value it last wrote is its own. Odd
+        // before anything moves, then a release fence, so that a reader which
+        // observes any store below has, through its own acquire fence, also
+        // observed this one. See `read_window` for that side.
+        let sequence = self.reset_sequence.load(Ordering::Relaxed);
+        debug_assert!(sequence.is_multiple_of(2), "a restart began inside another");
+        self.reset_sequence.store(sequence + 1, Ordering::Relaxed);
+        fence(Ordering::Release);
+        // Even again when this drops, on every way out of here. Declared after
+        // the gate, so dropped before it: the even store is made while the
+        // gate is still held, as the odd one was.
+        let restarting = Restarting {
+            sequence: &self.reset_sequence,
+            even: sequence + 2,
+        };
+
+        self.total_bytes.store(0, Ordering::Relaxed);
+        self.total_blocks.store(0, Ordering::Relaxed);
+        self.refused_events.store(0, Ordering::Relaxed);
+        self.max_bytes.store(curr_bytes, Ordering::Relaxed);
+        self.max_blocks.store(curr_blocks, Ordering::Relaxed);
+        self.time_at_max.store(now, Ordering::Relaxed);
+
+        self.pps.restart(epoch);
+        self.threads.restart();
+        self.regions.restart();
+        self.shapes.clear();
+        live.for_each_mut(|_, block| block.birth = LiveBlock::CARRIED);
+
+        self.reset_at.store(now, Ordering::Relaxed);
+        self.reset_epoch.store(epoch, Ordering::Relaxed);
+        self.carried_bytes.store(curr_bytes, Ordering::Relaxed);
+        self.carried_blocks.store(curr_blocks, Ordering::Relaxed);
+        self.dropped_at_reset.store(
+            self.dropped_blocks.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        // Released last, as `apply_locked` releases it, so that a reader that
+        // observes the new epoch also observes the counters that justify it.
+        self.epoch.store(epoch, Ordering::Release);
+        drop(restarting);
+        Ok(())
+    }
+
+    /// Whether this engine has counts a restart may touch, or why not.
+    fn resettable(&self) -> Result<(), ResetError> {
+        match self.state() {
+            State::Running => {}
+            State::ForkedChild => return Err(ResetError::ForkedChild),
+            // Idle and Starting are unreachable through a `Profiler`, which
+            // exists only once the run is `Running`; see `ResetError::Stopped`.
+            State::Idle | State::Starting | State::Finished => return Err(ResetError::Stopped),
+        }
+        if super::diagnostic::is_poisoned() {
+            return Err(ResetError::Poisoned);
+        }
+        Ok(())
+    }
+
+    /// The most recent restart of the counts, or `None` if there has been none.
+    ///
+    /// Read field by field, so exact only with the peak gate held, which is how
+    /// [`Engine::flush_and_visit`] reads it. A caller that needs to know only
+    /// *whether* the counts moved under it wants [`Engine::resets`].
+    pub fn last_reset(&self) -> Option<Reset> {
+        // Even, and the count it implies complete, wherever the gate is held,
+        // because the restart holds the gate across the whole odd interval.
+        let count = self.reset_sequence.load(Ordering::Relaxed) / 2;
+        if count == 0 {
+            return None;
+        }
+        Some(Reset {
+            count,
+            at: self.reset_at.load(Ordering::Relaxed),
+            carried_bytes: self.carried_bytes.load(Ordering::Relaxed),
+            carried_blocks: self.carried_blocks.load(Ordering::Relaxed),
+            dropped_blocks: self.dropped_at_reset.load(Ordering::Relaxed),
+            epoch: self.reset_epoch.load(Ordering::Relaxed),
+        })
+    }
+
+    /// How many restarts of the counts have completed.
+    ///
+    /// Exact as a count, and not a statement about any counter read beside
+    /// it: a restart may land between the two reads. A reader that needs both
+    /// to describe one window wants [`Engine::read_window`].
+    pub fn resets(&self) -> u64 {
+        self.reset_sequence.load(Ordering::Acquire) / 2
+    }
+
+    /// Runs `read` and returns what it read with the number of restarts that
+    /// had completed, guaranteeing that no restart landed in between.
+    ///
+    /// The reader's half of a sequence lock around [`Engine::reset`], and how a
+    /// reading outside the gate pairs its counters with its window without
+    /// taking a lock. `read` may run more than once, so it must only load.
+    ///
+    /// # Orderings
+    ///
+    /// The first load is `Acquire`: if it sees the even value a restart
+    /// released at its end, every store that restart made is visible to
+    /// `read`, which then reads the new window whole. An odd value means a
+    /// restart is under way, and the reading waits it out rather than read
+    /// half of one.
+    ///
+    /// `read` loads with `Relaxed`, then an `Acquire` fence, then the second
+    /// load. If `read` saw any store a restart made after its release fence,
+    /// the two fences synchronize, the restart's odd store happens before the
+    /// second load, and the second load cannot return the first's value: the
+    /// reading is retried. That covers every counter a window owns:
+    ///
+    /// - the totals, because after a restart's store to one every later write
+    ///   to it is a read-modify-write, which extends that store's release
+    ///   sequence, so a total read from the new window synchronizes however
+    ///   many allocations have added to it since;
+    /// - the peak, which a new peak writes with a plain store, because
+    ///   `apply_locked` puts a release fence before it, and the restart that
+    ///   opened the window happens before that thread took the gate.
+    ///
+    /// The live figures are not a window's: a restart carries them across
+    /// unchanged, so a reading cannot pair them with the wrong one.
+    ///
+    /// # When a restart is under way
+    ///
+    /// The reading waits it out, which is short: a sweep of the tables. Except
+    /// on a thread that cannot enter the profiler, which is how a thread inside
+    /// it looks, the restarting thread among them: a signal handler that
+    /// interrupted a restart and read the counters would otherwise wait for
+    /// the very restart it stopped, forever. That reading returns `None`. The
+    /// check is made only when the sequence is odd, so an ordinary reading
+    /// never pays for it.
+    pub fn read_window<T>(&self, mut read: impl FnMut() -> T) -> Option<(u64, T)> {
+        loop {
+            let before = self.reset_sequence.load(Ordering::Acquire);
+            if !before.is_multiple_of(2) {
+                // `None` from `enter` is a thread already inside the profiler,
+                // or one with no slot to enter with; either way it cannot be
+                // told apart from the thread the restart is running on. The
+                // guard is only a probe: `let _` releases it at once, so this
+                // thread does not wait while holding it.
+                let _ = super::guard::enter()?;
+                // A restart holds the gate and every shard for a sweep of the
+                // tables, which is long enough to be worth giving the core up.
+                std::thread::yield_now();
+                continue;
+            }
+            let value = read();
+            fence(Ordering::Acquire);
+            if self.reset_sequence.load(Ordering::Relaxed) == before {
+                return Some((before / 2, value));
+            }
         }
     }
 
@@ -1808,6 +2295,32 @@ impl Engine {
     /// short enough that a wedged thread costs a noticeable pause rather than a
     /// hang.
     pub const FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
+}
+
+/// The writer's half of the sequence lock around [`Engine::reset`], from the
+/// odd store to the even one.
+///
+/// A guard rather than a store at the end, because a reset that unwound
+/// between the two, and was caught, would leave the sequence odd for good, and
+/// every reading after it waiting for a restart that will never finish. The
+/// even store is made however the restart ends. An unwinding restart has left
+/// the counters half restarted, so it also poisons the run: what readers then
+/// get is a refusal that says the profiler failed, not a window that is half
+/// of one and half of another.
+struct Restarting<'a> {
+    sequence: &'a AtomicU64,
+    even: u64,
+}
+
+impl Drop for Restarting<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            super::diagnostic::poison("a restart of the counts was interrupted partway");
+        }
+        // Release: a reader that loads this value with acquire sees every
+        // store the restart made, so it reads the new window whole.
+        self.sequence.store(self.even, Ordering::Release);
+    }
 }
 
 /// [`Engine::record_alloc`] and [`Engine::record_realloc_taken`] with the
@@ -1842,6 +2355,13 @@ impl Engine {
         if self.observe_realloc(&guard, &realloc, taken.is_some()) {
             self.record_realloc_taken(&guard, taken, realloc, frames);
         }
+    }
+
+    /// [`Engine::reset`], from a thread standing in for the program, which
+    /// is not inside the profiler.
+    pub(crate) fn reset_guarded(&self) -> Result<(), ResetError> {
+        let guard = super::guard::enter().expect("this thread is already inside the profiler");
+        self.reset(&guard)
     }
 
     /// Puts this engine in the state a `fork` child inherits.
@@ -3208,5 +3728,435 @@ mod tests {
         );
         recorder.join().expect("the recording thread panicked");
         ENGINE.stop(Shutdown::Explicit);
+    }
+
+    // ---- restarting the counts ------------------------------------------
+
+    /// The lock every test that poisons holds, for a test to hold from its
+    /// first line to its last.
+    ///
+    /// A restart refuses a poisoned profiler, and the poison flag is
+    /// process-wide: a test elsewhere in this binary that poisons on purpose
+    /// would otherwise make a restart here fail, or a later `is_poisoned`
+    /// assertion here fail, for a reason the test has nothing to do with.
+    /// Holding it around the restart alone was not enough, because these tests
+    /// go on to assert the flag is clear after the restart has released it.
+    fn quiet() -> super::super::lock::RawGuard<'static> {
+        super::super::diagnostic::POISON_TESTS.lock()
+    }
+
+    /// Restarts `engine`'s counts as the program would. The caller holds
+    /// [`quiet`].
+    fn reset(engine: &Engine) {
+        engine
+            .reset_guarded()
+            .expect("a running engine restarts its counts");
+    }
+
+    /// Every program point the engine would put in a profile, keyed by frames.
+    fn points(engine: &Engine) -> std::collections::BTreeMap<Vec<usize>, Counters> {
+        let mut points = std::collections::BTreeMap::new();
+        let flush = engine.flush_and_visit(
+            Engine::FLUSH_TIMEOUT,
+            |_id, frames, counters| {
+                points.insert(frames.to_vec(), *counters);
+            },
+            |_| {},
+            |_| {},
+        );
+        assert!(flush.exclusive, "a quiet engine could not be flushed");
+        points
+    }
+
+    /// The whole rule, on one run: what happened before the restart is
+    /// forgotten, and what is live at it is kept.
+    ///
+    /// The run is shaped so that every class of counter has a different answer
+    /// before and after: a block held across the restart, one freed before it,
+    /// a transient peak above the level the restart finds, and a site that
+    /// allocates only afterwards.
+    #[test]
+    fn a_restart_forgets_what_happened_and_keeps_what_is() {
+        let _quiet = quiet();
+        let engine = engine();
+        engine.record_alloc_guarded(0x1000, Shape::of(4_096), &[0xAA]);
+        engine.record_alloc_guarded(0x2000, Shape::of(1_024), &[0xBB]);
+        engine.record_free(0x2000, 1_024);
+        engine.record_alloc_guarded(0x3000, Shape::of(512), &[0xCC]);
+        let before = engine.stats();
+        assert_eq!(before.max_bytes, 5_120, "the warm-up's transient peak");
+        assert_eq!(before.curr_bytes, 4_608);
+
+        reset(&engine);
+
+        let after = engine.stats();
+        assert_eq!((after.total_bytes, after.total_blocks), (0, 0));
+        assert_eq!(
+            (after.curr_bytes, after.curr_blocks),
+            (4_608, 2),
+            "a restart moved what is live"
+        );
+        assert_eq!(
+            (after.max_bytes, after.max_blocks),
+            (4_608, 2),
+            "the peak did not start again from what is live"
+        );
+        assert_eq!(after.time_at_max, engine.clock().now(TimeSource::Events));
+        assert_eq!(after.epoch, before.epoch + 1, "a restart is a peak");
+
+        let reset_record = engine.last_reset().expect("the restart is recorded");
+        assert_eq!(reset_record.count, 1);
+        assert_eq!(reset_record.at, after.time_at_max);
+        assert_eq!(
+            (reset_record.carried_bytes, reset_record.carried_blocks),
+            (4_608, 2)
+        );
+        assert_eq!(reset_record.epoch, after.epoch);
+
+        let held = points(&engine);
+        assert_eq!(
+            held.keys().cloned().collect::<Vec<_>>(),
+            vec![vec![0xAA], vec![0xCC]],
+            "the point whose block was freed before the restart is still \
+             reported, or one holding a carried block is not"
+        );
+        let aa = held[&vec![0xAA]];
+        assert_eq!(
+            aa,
+            Counters {
+                total_bytes: 0,
+                total_blocks: 0,
+                total_lifetime: 0,
+                curr_bytes: 4_096,
+                curr_blocks: 1,
+                max_bytes: 4_096,
+                max_blocks: 1,
+                at_gmax_bytes: 4_096,
+                at_gmax_blocks: 1,
+            }
+        );
+
+        // The window's own events. A carried block freed: live bytes come down
+        // by exactly its size, and it brings no lifetime with it, because it is
+        // in none of the window's allocation counts.
+        engine.record_alloc_guarded(0x4000, Shape::of(8_192), &[0xDD]);
+        engine.record_alloc_guarded(0x5000, Shape::of(16), &[0xEE]);
+        engine.record_free(0x1000, 4_096);
+        engine.record_free(0x4000, 8_192);
+
+        let end = engine.stats();
+        assert_eq!(end.curr_bytes, 512 + 16);
+        assert_eq!((end.total_bytes, end.total_blocks), (8_192 + 16, 2));
+        assert_eq!(end.max_bytes, 4_608 + 8_192 + 16, "the window's own peak");
+
+        let window = points(&engine);
+        let aa = window[&vec![0xAA]];
+        assert_eq!(
+            aa.curr_bytes, 0,
+            "the carried block's free missed its point"
+        );
+        assert_eq!(
+            aa.total_lifetime, 0,
+            "a carried block brought a lifetime into a point that allocated \
+             nothing in the window, so its average lifetime is a division of \
+             something by zero"
+        );
+        assert_eq!(aa.at_gmax_bytes, 4_096, "it was live at the window's peak");
+        let dd = window[&vec![0xDD]];
+        assert_eq!(
+            dd.total_lifetime, 1,
+            "a block of the window's own lived one event and recorded otherwise"
+        );
+        let at_peak: u64 = window.values().map(|counters| counters.at_gmax_bytes).sum();
+        assert_eq!(at_peak, end.max_bytes, "the at-peak columns do not sum");
+        assert!(!super::super::diagnostic::is_poisoned());
+    }
+
+    /// The at-peak columns have to describe the restart for a point the window
+    /// never touches, which only the epoch can arrange: the lazy refresh that
+    /// would otherwise copy a stale snapshot happens on a touch that never
+    /// comes. And the `>=` rule has to apply to the level the restart set, so
+    /// returning to it is an equal peak that moves the snapshot to now.
+    #[test]
+    fn a_restart_is_a_peak_the_lazy_scheme_honours() {
+        let _quiet = quiet();
+        let engine = engine();
+        engine.record_alloc_guarded(0x1000, Shape::of(1_000), &[0xAA]);
+        engine.record_alloc_guarded(0x2000, Shape::of(3_000), &[0xBB]);
+        engine.record_free(0x2000, 3_000);
+        engine.record_alloc_guarded(0x3000, Shape::of(500), &[0xCC]);
+        // AA was last touched at an epoch whose snapshot is the 4,000-byte peak.
+        reset(&engine);
+
+        let restarted = points(&engine);
+        assert_eq!(restarted[&vec![0xAA]].at_gmax_bytes, 1_000);
+        assert_eq!(restarted[&vec![0xCC]].at_gmax_bytes, 500);
+
+        // Back to exactly the restart's level, held by different points.
+        engine.record_free(0x3000, 500);
+        engine.record_alloc_guarded(0x4000, Shape::of(500), &[0xDD]);
+        let equal = points(&engine);
+        assert_eq!(engine.stats().max_bytes, 1_500);
+        assert_eq!(
+            equal
+                .get(&vec![0xCC])
+                .map_or(0, |counters| counters.at_gmax_bytes),
+            0,
+            "an equal peak after a restart must record the latest instant"
+        );
+        assert_eq!(equal[&vec![0xDD]].at_gmax_bytes, 500);
+    }
+
+    /// A reallocation of a carried block ends a block the window never counted
+    /// and begins one it does: no lifetime from the old one, a block and its
+    /// bytes in the totals, and a lifetime for the new one when it goes.
+    #[test]
+    fn a_carried_block_reallocated_after_a_restart_is_a_new_block_of_the_window() {
+        let _quiet = quiet();
+        let engine = engine();
+        engine.record_alloc_guarded(0x1000, Shape::of(100), &[0xAA]);
+        for i in 0..5usize {
+            engine.record_alloc_guarded(0x8000 + i * 64, Shape::of(8), &[0xBB]);
+        }
+        reset(&engine);
+
+        let taken = engine.live_blocks().remove(0x1000);
+        assert!(taken.is_some_and(|block| block.is_carried()));
+        engine.record_realloc_guarded(taken, grew(0x1000, 100, 0x2000, 300), &[0xCC]);
+
+        let point = points(&engine)[&vec![0xAA]];
+        assert_eq!((point.total_bytes, point.total_blocks), (300, 1));
+        assert_eq!(
+            point.total_lifetime, 0,
+            "the carried half brought a lifetime"
+        );
+        assert_eq!(point.curr_bytes, 300);
+        assert!(
+            engine
+                .live_blocks()
+                .get(0x2000)
+                .is_some_and(|block| !block.is_carried()),
+            "the resized block is the window's, and must be born in it"
+        );
+
+        engine.record_alloc_guarded(0x9000, Shape::of(8), &[0xBB]);
+        engine.record_free(0x2000, 300);
+        assert_eq!(points(&engine)[&vec![0xAA]].total_lifetime, 1);
+    }
+
+    /// The rows and the histograms restart with the totals they are checked
+    /// against, so the window's profile still sums: the rows to the totals
+    /// and the live figures, and the requests to the blocks recorded.
+    #[test]
+    fn a_restart_restarts_the_rows_and_the_shapes_with_the_totals() {
+        let _quiet = quiet();
+        let engine = engine();
+        engine.record_alloc_guarded(0x1000, Shape::of(4_096), &[0xAA]);
+        engine.record_alloc_guarded(0x2000, Shape::of(64), &[0xBB]);
+        engine.record_free(0x2000, 64);
+        reset(&engine);
+
+        let (bytes, blocks, live) = thread_totals(&engine);
+        assert_eq!((bytes, blocks), (0, 0));
+        assert_eq!(live, 4_096, "the row lost its carried block");
+        assert_eq!(engine.shapes(), ShapeStats::default());
+
+        engine.record_alloc_guarded(0x3000, Shape::of(32), &[0xCC]);
+        engine.record_free(0x1000, 4_096);
+        let stats = engine.stats();
+        let (bytes, blocks, live) = thread_totals(&engine);
+        assert_eq!((bytes, blocks, live), (32, 1, 32));
+        assert_eq!(
+            (stats.total_bytes, stats.total_blocks, stats.curr_bytes),
+            (bytes, blocks, live)
+        );
+        assert_eq!(
+            engine.shapes().observed_blocks,
+            stats.total_blocks + stats.dropped_blocks
+                - engine.last_reset().expect("restarted").dropped_blocks,
+            "the window's requests and its recorded blocks disagree"
+        );
+    }
+
+    /// An event run has totals and nothing live, and restarts the totals.
+    /// Refused events restart too: they qualify the totals, not the run.
+    #[test]
+    fn an_event_run_restarts_its_totals() {
+        let _quiet = quiet();
+        let engine = Engine::with_limits(1 << 10, 1 << 12);
+        assert!(
+            engine.start(TimeSource::Events, || engine.configure(Settings {
+                mode: Mode::AdHoc,
+                ..Settings::default()
+            }))
+        );
+        let guard = super::super::guard::enter().expect("not inside the profiler");
+        engine.record_event(&guard, 40, &[0xAA]);
+        engine.refuse_event();
+        drop(guard);
+
+        reset(&engine);
+        let stats = engine.stats();
+        assert_eq!((stats.total_bytes, stats.total_blocks), (0, 0));
+        assert_eq!(stats.refused_events, 0);
+        assert!(
+            points(&engine).is_empty(),
+            "an emptied event point was reported"
+        );
+
+        let guard = super::super::guard::enter().expect("not inside the profiler");
+        engine.record_event(&guard, 7, &[0xAA]);
+        drop(guard);
+        assert_eq!(points(&engine)[&vec![0xAA]].total_bytes, 7);
+    }
+
+    /// A sampled block carried across a restart is freed with the weight it
+    /// was recorded with, so live bytes come back to exactly zero rather than
+    /// drifting by a rounding error, and its estimate brings no lifetime.
+    #[test]
+    fn a_sampled_run_restarts_and_still_balances() {
+        let _quiet = quiet();
+        const SIZE: usize = 256;
+        let engine = sampled(4_096);
+        let address = record_until_sampled(&engine, 0x10_0000, SIZE, &[0xAA]);
+        let held = engine.stats().curr_bytes;
+        assert!(held > 0);
+
+        reset(&engine);
+        assert_eq!(engine.stats().curr_bytes, held);
+        engine.record_free(address, SIZE);
+
+        let stats = engine.stats();
+        assert_eq!((stats.curr_bytes, stats.curr_blocks), (0, 0));
+        let point = points(&engine)[&vec![0xAA]];
+        assert_eq!(point.total_lifetime, 0);
+        assert_eq!(point.max_bytes, held);
+        assert!(!super::super::diagnostic::is_poisoned());
+    }
+
+    /// A restart is refused, with nothing changed, wherever the counts are not
+    /// this process's to restart.
+    #[test]
+    fn a_restart_is_refused_where_the_counts_are_not_ours() {
+        let _quiet = super::super::diagnostic::POISON_TESTS.lock();
+
+        let idle = Engine::with_limits(1 << 10, 1 << 12);
+        assert_eq!(idle.reset_guarded(), Err(ResetError::Stopped));
+
+        let stopped = engine();
+        stopped.record_alloc_guarded(0x1000, Shape::of(64), &[0xAA]);
+        stopped.stop(Shutdown::Explicit);
+        let before = stopped.stats();
+        assert_eq!(stopped.reset_guarded(), Err(ResetError::Stopped));
+        assert_eq!(
+            stopped.stats(),
+            before,
+            "a refused restart changed the counts"
+        );
+        assert_eq!(stopped.last_reset(), None);
+
+        let child = engine();
+        child.record_alloc_guarded(0x1000, Shape::of(64), &[0xAA]);
+        child.disown_for_testing();
+        let before = child.stats();
+        assert_eq!(child.reset_guarded(), Err(ResetError::ForkedChild));
+        assert_eq!(child.stats(), before);
+    }
+
+    /// A poisoned profiler is not restarted: what is live is what it keeps,
+    /// and the failure was in what it holds.
+    #[test]
+    fn a_poisoned_engine_is_not_restarted() {
+        let _quiet = super::super::diagnostic::POISON_TESTS.lock();
+        super::super::diagnostic::reset();
+        super::super::diagnostic::set_quiet(true);
+
+        let engine = engine();
+        engine.record_alloc_guarded(0x1000, Shape::of(64), &[0xAA]);
+        let before = engine.stats();
+        super::super::diagnostic::poison("test: a restart must refuse this");
+        let refused = engine.reset_guarded();
+        super::super::diagnostic::reset();
+
+        assert_eq!(refused, Err(ResetError::Poisoned));
+        assert_eq!(engine.stats(), before);
+    }
+
+    /// A reading on a thread inside the profiler refuses instead of waiting
+    /// out a restart, because the restart may be running on that very thread,
+    /// interrupted by the signal handler that is reading. Elsewhere, and once
+    /// the restart is done, it reads as ever.
+    #[test]
+    fn a_reading_inside_the_profiler_refuses_rather_than_wait_for_a_restart() {
+        let _quiet = quiet();
+        let engine = engine();
+        let sequence = engine.reset_sequence.load(Ordering::Relaxed);
+        assert_eq!(engine.read_window(|| ()), Some((sequence / 2, ())));
+
+        // What a restart on this thread looks like to a handler that
+        // interrupts it: the sequence odd, and the guard held.
+        engine.reset_sequence.store(sequence + 1, Ordering::Relaxed);
+        let guard = super::super::guard::enter().expect("the test thread can enter");
+        assert_eq!(
+            engine.read_window(|| ()),
+            None,
+            "a reading inside the profiler waited for a restart"
+        );
+        drop(guard);
+        engine.reset_sequence.store(sequence + 2, Ordering::Release);
+
+        assert_eq!(engine.read_window(|| ()), Some((sequence / 2 + 1, ())));
+    }
+
+    /// A restart that unwinds partway, and is caught, still closes its window:
+    /// the sequence is even again, so readings return instead of waiting for
+    /// ever, and the run is poisoned, so what they return is a refusal and
+    /// not half a restart.
+    #[test]
+    fn an_interrupted_restart_does_not_leave_readings_waiting() {
+        let _quiet = quiet();
+        super::super::diagnostic::reset();
+        super::super::diagnostic::set_quiet(true);
+        let engine = engine();
+        let sequence = engine.reset_sequence.load(Ordering::Relaxed);
+
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            engine.reset_sequence.store(sequence + 1, Ordering::Relaxed);
+            let _restarting = Restarting {
+                sequence: &engine.reset_sequence,
+                even: sequence + 2,
+            };
+            // Not `panic!`, which would print through the hook.
+            std::panic::resume_unwind(Box::new("a restart failed partway"));
+        }));
+        let poisoned = super::super::diagnostic::is_poisoned();
+        super::super::diagnostic::reset();
+
+        assert!(unwound.is_err());
+        assert!(poisoned, "a half-done restart left the run unpoisoned");
+        assert_eq!(engine.read_window(|| ()), Some((sequence / 2 + 1, ())));
+    }
+
+    /// Restarting twice is restarting from the second one: the record counts
+    /// both and describes the last, and the peaks the profile reports count
+    /// from it.
+    #[test]
+    fn a_second_restart_describes_the_window_since_it() {
+        let _quiet = quiet();
+        let engine = engine();
+        engine.record_alloc_guarded(0x1000, Shape::of(100), &[0xAA]);
+        reset(&engine);
+        engine.record_alloc_guarded(0x2000, Shape::of(200), &[0xBB]);
+        let peaks_in_first_window = engine.stats().epoch - engine.last_reset().unwrap().epoch;
+        assert_eq!(peaks_in_first_window, 1);
+        reset(&engine);
+
+        let record = engine.last_reset().unwrap();
+        assert_eq!(record.count, 2);
+        assert_eq!((record.carried_bytes, record.carried_blocks), (300, 2));
+        assert_eq!(engine.stats().epoch, record.epoch);
+        assert_eq!(engine.resets(), 2);
+        let window = points(&engine);
+        assert!(window.values().all(|counters| counters.total_blocks == 0));
     }
 }

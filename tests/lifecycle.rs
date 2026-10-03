@@ -1519,8 +1519,13 @@ fn assert_fresh(probe: &Path) {
     let mut newest_source = std::time::SystemTime::UNIX_EPOCH;
     let mut newest_path = PathBuf::new();
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    // Not `src/bin`: those are other binaries, which the probe does not link,
+    // so an edit there is the same unsatisfiable case as the manifest's. Cargo
+    // answers the remedy with `Finished`, and the guard fails for good.
+    let binaries = manifest.join("src").join("bin");
     for source in sources(&manifest.join("src"))
         .into_iter()
+        .filter(|source| !source.starts_with(&binaries))
         .chain([manifest.join("examples/lifecycle_probe.rs")])
     {
         if let Some(time) = modified(&source) {

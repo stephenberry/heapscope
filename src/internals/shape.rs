@@ -270,6 +270,31 @@ impl Shapes {
         }
     }
 
+    /// Zeroes every count, for a run restarting its counts.
+    ///
+    /// Not atomic as a whole, and it does not need to be. These are counted
+    /// before the peak gate is taken, so no lock the restart could hold would
+    /// stop a request being counted while this runs, and every word only ever
+    /// grows: a concurrent increment lands either before its word is zeroed,
+    /// and is forgotten with the warm-up, or after, and is kept. Either way the
+    /// request is one that straddled the restart, the same window
+    /// [`Flush::shapes`](super::engine::Flush::shapes) documents for a snapshot.
+    pub fn clear(&self) {
+        let words = [
+            &self.observed,
+            &self.zeroed_blocks,
+            &self.zeroed_bytes,
+            &self.reallocs,
+            &self.reallocs_moved,
+            &self.bytes_copied,
+            &self.bytes_grown,
+            &self.bytes_shrunk,
+        ];
+        for word in words.into_iter().chain(&self.sizes).chain(&self.alignments) {
+            word.store(0, Ordering::Relaxed);
+        }
+    }
+
     /// Reads the current counts.
     pub fn snapshot(&self) -> ShapeStats {
         let mut stats = ShapeStats {
@@ -580,6 +605,32 @@ mod tests {
             shapes.record(Shape::of(size));
         }
         assert_eq!(shapes.snapshot().commonest_size(), Some((16, 31, 2)));
+    }
+
+    /// Every count, not most of them: the histograms each sum to the request
+    /// count, so a word left standing would break that sum for the window that
+    /// follows.
+    #[test]
+    fn clearing_forgets_every_count() {
+        let shapes = Shapes::new();
+        shapes.record(Shape::of(24).aligned(8).zeroed());
+        shapes.record(Shape::of(4096).aligned(64));
+        shapes.record_realloc(&Realloc {
+            old_address: 0x1000,
+            old_size: 64,
+            new_address: 0x2000,
+            new: Shape::of(128),
+        });
+        shapes.record_realloc(&Realloc {
+            old_address: 0x3000,
+            old_size: 128,
+            new_address: 0x3000,
+            new: Shape::of(64),
+        });
+        assert_ne!(shapes.snapshot(), ShapeStats::default());
+
+        shapes.clear();
+        assert_eq!(shapes.snapshot(), ShapeStats::default());
     }
 
     #[test]

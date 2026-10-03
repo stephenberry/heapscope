@@ -140,11 +140,14 @@ impl fmt::Debug for PpId {
 /// field.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Counters {
-    /// Bytes ever allocated here. DHAT's `tb`.
+    /// Bytes allocated here since the run started or its counts were last
+    /// restarted. DHAT's `tb`.
     pub total_bytes: u64,
-    /// Blocks ever allocated here. DHAT's `tbk`.
+    /// Blocks allocated here since the run started or its counts were last
+    /// restarted. DHAT's `tbk`.
     pub total_blocks: u64,
-    /// Summed lifetime of blocks freed here. DHAT's `tl`.
+    /// Summed lifetime of the blocks counted in `total_blocks` that have been
+    /// freed. DHAT's `tl`.
     ///
     /// Emitted but never validated by `dh_view.js`; omitting it renders every
     /// average-lifetime cell as `NaN` with no warning (PLAN.md section 3.1).
@@ -155,16 +158,39 @@ pub struct Counters {
     /// Blocks currently live. Becomes DHAT's `ebk`.
     pub curr_blocks: u64,
 
-    /// Greatest `curr_bytes` ever reached. DHAT's `mb`; see the module docs for
-    /// why this differs from Valgrind's.
+    /// Greatest `curr_bytes` reached since the run started or its counts were
+    /// last restarted, which starts it again from what the point held then.
+    /// DHAT's `mb`; see the module docs for why this differs from Valgrind's.
     pub max_bytes: u64,
-    /// Greatest `curr_blocks` ever reached. DHAT's `mbk`.
+    /// Greatest `curr_blocks` reached since the run started or its counts were
+    /// last restarted. DHAT's `mbk`.
     pub max_blocks: u64,
 
     /// Bytes live when the whole heap peaked. DHAT's `gb`.
     pub at_gmax_bytes: u64,
     /// Blocks live when the whole heap peaked. DHAT's `gbk`.
     pub at_gmax_blocks: u64,
+}
+
+impl Counters {
+    /// Whether this point has nothing to report.
+    ///
+    /// A point is worth a line in a profile once it has allocated, or once it
+    /// holds blocks that were live when the counts last restarted. The second
+    /// is what a [reset](super::engine::Engine::reset) adds: a warm-up's cache,
+    /// still live and allocated by a site that never allocates again, has no
+    /// blocks in the window's totals and is still part of what is live and of
+    /// what the heap held at its peak. Leaving it out would leave the at-peak
+    /// and at-end columns short of the totals they sum to.
+    ///
+    /// `max_blocks` is the test for the second because it bounds the other two
+    /// live figures: a point's running maximum is never below what it holds
+    /// now, nor below what it held at the peak, and a restart sets it to what
+    /// the point held then. In a run that never restarts it is non-zero only
+    /// where `total_blocks` is, so for that run this is the rule it always was.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.total_blocks == 0 && self.max_blocks == 0
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -234,6 +260,27 @@ impl Record {
             self.counters.at_gmax_blocks = self.counters.curr_blocks;
             self.snapshot_epoch = epoch;
         }
+    }
+
+    /// Restarts this record's counts at a peak that is happening now, at
+    /// `epoch`.
+    ///
+    /// What the point holds stays: its blocks are still live, and a later free
+    /// has to find them here. Everything cumulative starts again from zero, and
+    /// the two maxima start again from what the point holds, because that is
+    /// the most it has held *since*. The at-peak pair is set eagerly rather
+    /// than left to [`Record::refresh`], since the caller is walking every
+    /// record anyway and the restart is itself the peak the epoch names.
+    fn restart(&mut self, epoch: u64) {
+        let counters = &mut self.counters;
+        counters.total_bytes = 0;
+        counters.total_blocks = 0;
+        counters.total_lifetime = 0;
+        counters.max_bytes = counters.curr_bytes;
+        counters.max_blocks = counters.curr_blocks;
+        counters.at_gmax_bytes = counters.curr_bytes;
+        counters.at_gmax_blocks = counters.curr_blocks;
+        self.snapshot_epoch = epoch;
     }
 }
 
@@ -403,7 +450,7 @@ impl PpTable {
         //
         // The probability is what makes this acceptable rather than the
         // consequence. Two distinct frame arrays must collide across a full
-        // 64-bit hash (less two bits consumed by `usable_key`). The alternative,
+        // 64-bit hash (less the bit `usable_key` sets). The alternative,
         // chaining, would put a second indirection on the hot path to insure
         // against an event that will not occur.
         if state.intern.insert(arena, key, index_u32) == Insert::Full {
@@ -579,8 +626,11 @@ impl PpTable {
                 // because the live-block table was full — has never recorded a
                 // block. Emitting it would put a program point with every
                 // counter zero in the profile, and `dh_view.js` divides by the
-                // block count for its average columns.
-                if counters.total_blocks == 0 {
+                // block count for its average columns. So would a point whose
+                // only allocations preceded a restart of the counts and were
+                // all freed before it; one still holding blocks from then is
+                // kept, for the reason `Counters::is_empty` gives.
+                if counters.is_empty() {
                     continue;
                 }
                 let Some(id) = PpId::new(shard_index, index) else {
@@ -606,9 +656,38 @@ impl PpTable {
             record.refresh(epoch);
             record.counters
         };
-        if overflow.total_blocks > 0 {
+        if !overflow.is_empty() {
             visit(PpId::OVERFLOW, &[], &overflow);
         }
+    }
+
+    /// Restarts every record's counts, as of a peak happening now at `epoch`.
+    ///
+    /// See [`Record::restart`] for what each record keeps. `O(#program
+    /// points)`, which is the sweep the lazy-epoch scheme otherwise exists to
+    /// avoid. Affordable here, because a restart is something a program asks
+    /// for once, at a phase boundary, and never on the allocator path.
+    ///
+    /// The caller must hold the peak gate exclusively, for the reason
+    /// [`PpTable::flush_and_visit`] must: an update landing between two shards
+    /// would be half before the restart and half after it.
+    pub fn restart(&self, epoch: u64) {
+        for shard in &self.shards {
+            let _order = super::order::enter(super::order::Level::ProgramPointShard);
+            let _guard = shard.lock.lock();
+            // SAFETY: reached only while holding `shard.lock`.
+            let state = unsafe { &mut *shard.state.get() };
+            for index in 0..state.records.len() {
+                if let Some(record) = state.records.get_mut(index) {
+                    record.restart(epoch);
+                }
+            }
+        }
+
+        let _order = super::order::enter(super::order::Level::ProgramPointShard);
+        let _guard = self.overflow_lock.lock();
+        // SAFETY: reached only while holding `overflow_lock`.
+        unsafe { &mut *self.overflow.get() }.restart(epoch);
     }
 
     /// Number of interned program points, excluding the overflow point.
@@ -1095,6 +1174,85 @@ mod tests {
             at_gmax(untouched),
             700,
             "a record never touched after the peak was not flushed"
+        );
+    }
+
+    /// A restart keeps what each point holds and starts everything else again
+    /// from it: totals from zero, maxima and the at-peak pair from the live
+    /// figures, because the restart is itself the peak its epoch names.
+    #[test]
+    fn a_restart_keeps_what_is_live_and_forgets_the_rest() {
+        let (arena, table) = table();
+        let holding = table.intern(&arena, &[1usize]).id();
+        let drained = table.intern(&arena, &[2usize]).id();
+
+        table.update(holding, 0, |c| {
+            c.total_bytes = 900;
+            c.total_blocks = 9;
+            c.total_lifetime = 77;
+            c.curr_bytes = 300;
+            c.curr_blocks = 3;
+            c.max_bytes = 800;
+            c.max_blocks = 8;
+        });
+        table.update(drained, 0, |c| {
+            c.total_bytes = 50;
+            c.total_blocks = 1;
+            c.max_bytes = 50;
+            c.max_blocks = 1;
+        });
+        table.update(PpId::OVERFLOW, 0, |c| {
+            c.total_bytes = 64;
+            c.total_blocks = 1;
+            c.curr_bytes = 64;
+            c.curr_blocks = 1;
+        });
+
+        table.restart(5);
+
+        let held = table.counters(holding).unwrap();
+        assert_eq!(
+            held,
+            Counters {
+                total_bytes: 0,
+                total_blocks: 0,
+                total_lifetime: 0,
+                curr_bytes: 300,
+                curr_blocks: 3,
+                max_bytes: 300,
+                max_blocks: 3,
+                at_gmax_bytes: 300,
+                at_gmax_blocks: 3,
+            }
+        );
+        let overflow = table.counters(PpId::OVERFLOW).unwrap();
+        assert_eq!(overflow.total_blocks, 0);
+        assert_eq!((overflow.curr_bytes, overflow.at_gmax_bytes), (64, 64));
+
+        // A touch at the restart's own epoch must not re-snapshot: the at-peak
+        // pair already describes it, and a refresh would overwrite it with
+        // whatever the point holds after this change.
+        table.update(holding, 5, |c| c.curr_bytes -= 100);
+        let after = table.counters(holding).unwrap();
+        assert_eq!(
+            after.at_gmax_bytes, 300,
+            "the restart's peak was overwritten"
+        );
+        assert_eq!(after.max_bytes, 300, "a free raised the maximum");
+
+        // Only the point that still holds something is reported.
+        let mut emitted = Vec::new();
+        table.flush_and_visit(5, |id, _, counters| emitted.push((id, *counters)));
+        let ids: Vec<PpId> = emitted.iter().map(|(id, _)| *id).collect();
+        assert!(
+            ids.contains(&holding),
+            "a point holding carried blocks was left out, so the live and \
+             at-peak columns no longer sum to the totals"
+        );
+        assert!(ids.contains(&PpId::OVERFLOW));
+        assert!(
+            !ids.contains(&drained),
+            "a point with nothing in the window was reported"
         );
     }
 

@@ -18,8 +18,8 @@
 //! Locks must be acquired in strictly increasing [`Level`]. The levels are
 //! chosen so that the real code paths are naturally ordered:
 //!
-//! - `alloc` records counters under the gate, then releases it before inserting
-//!   into the live-block table.
+//! - `alloc` inserts into the live-block table first, releases that shard, and
+//!   only then takes the gate to apply the counters.
 //! - `dealloc` removes the live-block entry first, releases that shard, and only
 //!   then takes the gate to apply the counters.
 //!

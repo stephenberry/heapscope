@@ -13,6 +13,32 @@ Every profile records which path produced it, in `heapscope.shutdown`:
 
 The distinction is not bookkeeping. `atexit` handlers run last-in-first-out and share their list with C++ static destructors through `__cxa_atexit`, so a profile written from one is taken *after* whatever was registered later has already torn down. Two profiles of the same program taken by the two paths can legitimately differ, and the field is how you tell which you are holding.
 
+## Leaving a warm-up out
+
+A process records one run, and a stopped run does not start again: a second `Profiler::builder().build()` is refused with `StartError::AlreadyRecorded`. What a program can do instead is keep the one run going and restart its counts with `Profiler::reset` when the warm-up is done. Everything written afterwards describes the window since the last reset.
+
+| What | After a reset |
+|---|---|
+| Totals: bytes and blocks allocated, globally, per call site, per thread, per region; size and alignment histograms; reallocation copies; events refused | Start again from zero |
+| Live state: blocks and bytes live, globally and everywhere they are attributed | Kept. A block allocated before the reset and freed after it brings every figure down as it would have; a leak check still sees it |
+| Peaks: the global maximum and when it happened, each call site's maximum, and the bytes each held at the global peak | Start again from what is live, as though the peak had just happened |
+| Lifetimes | Count only blocks allocated after the reset. A block live across it is in none of the window's allocation counts (`totalBlocks`, DHAT's `tbk`), which an average lifetime is taken over, so it contributes no lifetime either. It is in the live and at-peak counts, because it is live |
+| Time | Not reset. The profile records when the reset happened, on the same axis as everything else |
+| Blocks the live-block table could not track, region entries, capture and overhead counters | Kept, over the whole run. A block the table turned away may still be live, and the overhead is the profiler's own |
+
+The outputs written afterwards say so:
+
+- `run.reset` in the native format, which is then version 2 (see [output formats](output-formats.md));
+- `heapscope.reset` and a note in `cmd` in the DHAT file;
+- a warning in the HTML page;
+- a `restarted` line in the text summary.
+
+Folded stacks cannot. The format is a stack and a number per line, with nowhere to put anything else, so a flame graph of a reset run is a flame graph of the window with nothing on it to say so. Ask for another output beside it where that matters.
+
+A reading taken before a reset is from another window, and `HeapStats::resets` is how code subtracting its totals can tell. Its live figures carry across, so a [leak check](testing.md) from it still answers.
+
+A reset is refused, and changes nothing, on a run that is not recording, in a `fork` child, on a poisoned profiler, from inside the profiler's own bookkeeping, and when other threads keep it from reaching a quiet point for as long as a shutdown waits. `Profiler` is neither `Send` nor `Sync`, so the reset is called from the thread that owns it, and it is safe while other threads allocate: it waits for a moment at which no counter is midway through moving and applies itself there in one step. An allocation in flight at that moment can still land on either side of it: for its lifetime, and for whether its size and alignment are in the window's histograms. A reset where the program is quiet gives an exact profile.
+
 ## The exits that write nothing
 
 **Nothing is written for `_exit`, `abort`, or a fatal signal.** Those bypass the `atexit` list by definition, and no handler can see them. This is a stated limitation with a test for each case rather than something to discover when a profile is missing.

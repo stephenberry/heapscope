@@ -44,6 +44,24 @@
 //! version moves only when the meaning of an existing field changes, which is
 //! the case a reader cannot detect for itself.
 //!
+//! ## Version 2, and why a run that was never restarted still writes 1
+//!
+//! The first bump came with [`Profiler::reset`](crate::Profiler::reset). In a
+//! restarted run, `totals`, every point's totals, maxima, at-peak figures and
+//! lifetimes, and every row's totals and maxima describe the window since
+//! `run.reset.at`, while the live figures still describe everything live,
+//! including what was allocated before it. So a point can hold more than it
+//! ever allocated, and the peak can exceed the bytes allocated. A reader that
+//! ignores `run.reset`, as the rule tells a version 1 reader to, would take
+//! those for figures over the whole run and could not tell that they are not.
+//! That is the change the rule says to bump for.
+//!
+//! The version is the one the file needs rather than the newest this writer
+//! knows. A run never restarted means by every field exactly what version 1
+//! means, so it still says 1: a reader that predates restarts keeps reading
+//! every profile it could read before, and refuses exactly the ones it would
+//! misread.
+//!
 //! # Numbers, and the one place they are strings
 //!
 //! Counts and sizes are JSON numbers. **Addresses are strings**, in `0x` hex,
@@ -66,9 +84,22 @@ use crate::symbol::{modules::Module, Resolved};
 /// this from a DHAT file without guessing from which keys are present.
 const FORMAT: &str = "heapscope-profile";
 
-/// The version this writer produces. See the module documentation for what a
-/// bump means.
+/// The version this writer produces for a run that was never restarted. See the
+/// module documentation for what a bump means.
 const FORMAT_VERSION: u64 = 1;
+
+/// The version a restarted run's profile carries, and what version 2 changed.
+const RESTARTED_FORMAT_VERSION: u64 = 2;
+
+/// The version `snapshot` has to be written as: the oldest whose meanings
+/// describe it. See the module documentation.
+fn format_version(snapshot: &Snapshot) -> u64 {
+    if snapshot.reset.is_some() {
+        RESTARTED_FORMAT_VERSION
+    } else {
+        FORMAT_VERSION
+    }
+}
 
 /// Writes `snapshot` as a native profile.
 pub(super) fn write<W: Write>(snapshot: &Snapshot, out: W) -> io::Result<()> {
@@ -77,7 +108,7 @@ pub(super) fn write<W: Write>(snapshot: &Snapshot, out: W) -> io::Result<()> {
 
     json.begin_object(Layout::Wrap)?;
     json.field_str("format", FORMAT)?;
-    json.field_u64("formatVersion", FORMAT_VERSION)?;
+    json.field_u64("formatVersion", format_version(snapshot))?;
     // Stated in the file, because a reader that has this file may not have this
     // documentation and the rule is what makes adding a field safe.
     json.field_str(
@@ -130,6 +161,37 @@ fn write_run<W: Write>(json: &mut JsonWriter<W>, snapshot: &Snapshot) -> io::Res
         json.field_u64("timeAtMax", snapshot.stats.time_at_max)?;
     }
     json.field_str("unwinder", snapshot.unwinder.as_str())?;
+    write_reset(json, snapshot)?;
+    json.end_object()
+}
+
+/// That the counts were restarted, when, and what was live then.
+///
+/// Absent from a run that was never restarted, the way `samplingInterval` is
+/// absent from one that never sampled: its presence is the signal, and it is
+/// what makes this a version 2 file.
+fn write_reset<W: Write>(json: &mut JsonWriter<W>, snapshot: &Snapshot) -> io::Result<()> {
+    let Some(reset) = &snapshot.reset else {
+        return Ok(());
+    };
+    json.key("reset")?;
+    json.begin_object(Layout::Inline)?;
+    json.field_u64("count", reset.count)?;
+    // On the run's own time axis, beside `timeAtEnd`: the window this file
+    // describes is the interval between the two.
+    json.field_u64("at", reset.at)?;
+    // What was live at the restart: allocated before the window, and still
+    // counted as live and toward its peaks. Omitted in a mode without live
+    // blocks, for the reason every other live figure is.
+    if snapshot.settings.mode.block_lifetimes() {
+        json.field_u64("carriedBytes", reset.carried_bytes)?;
+        json.field_u64("carriedBlocks", reset.carried_blocks)?;
+    }
+    // The part of `notRecorded.blocks` that predates the window. That count is
+    // over the whole run, because a block the table turned away may still be
+    // live; this is what a reader subtracts to hold the window's requests
+    // against its totals.
+    json.field_u64("notRecordedBlocks", reset.dropped_blocks)?;
     json.end_object()
 }
 
@@ -172,11 +234,13 @@ fn write_totals<W: Write>(json: &mut JsonWriter<W>, snapshot: &Snapshot) -> io::
         json.field_u64("currBlocks", stats.curr_blocks)?;
         json.field_u64("maxBytes", stats.max_bytes)?;
         json.field_u64("maxBlocks", stats.max_blocks)?;
-        // How many times the peak moved, which is also the epoch the lazy
-        // at-peak algorithm is on. A reader comparing two runs of the same
-        // workload can see from this whether they took the same path to the
-        // same maximum.
-        json.field_u64("peaks", stats.epoch)?;
+        // How many times the peak moved, which in a run never restarted is
+        // also the epoch the lazy at-peak algorithm is on. A reader comparing
+        // two runs of the same workload can see from this whether they took the
+        // same path to the same maximum. In a restarted run it counts from the
+        // restart, which sets the peak itself and is not counted as a move.
+        let since = snapshot.reset.map_or(0, |reset| reset.epoch);
+        json.field_u64("peaks", stats.epoch.saturating_sub(since))?;
     }
     json.end_object()?;
 
@@ -695,6 +759,42 @@ mod tests {
         assert!(text.contains(r#""format":"heapscope-profile""#), "{text}");
         assert!(text.contains(r#""formatVersion":1"#), "{text}");
         assert!(text.contains(r#""producer":"heapscope "#), "{text}");
+    }
+
+    /// A restarted run's figures mean something version 1 did not, so it says
+    /// 2 and says why; a run never restarted keeps saying 1, so a reader that
+    /// predates restarts goes on reading every profile it could before.
+    #[test]
+    fn a_restarted_run_declares_the_restart_and_the_version_that_means_it() {
+        let mut restarted = snapshot(vec![point(&[0x10], 100)]);
+        restarted.stats.epoch = 7;
+        restarted.reset = Some(crate::output::Reset {
+            count: 2,
+            at: 40,
+            carried_bytes: 512,
+            carried_blocks: 3,
+            dropped_blocks: 1,
+            epoch: 5,
+        });
+        let text = emit(&restarted);
+        assert!(text.contains(r#""formatVersion":2"#), "{text}");
+        assert!(
+            text.contains(
+                r#""reset":{"count":2,"at":40,"carriedBytes":512,"carriedBlocks":3,"notRecordedBlocks":1}"#
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(r#""peaks":2"#),
+            "the restart is the window's first peak, so only the two since it are counted: {text}"
+        );
+
+        let mut never = snapshot(vec![point(&[0x10], 100)]);
+        never.stats.epoch = 7;
+        let text = emit(&never);
+        assert!(text.contains(r#""formatVersion":1"#), "{text}");
+        assert!(!text.contains(r#""reset""#), "{text}");
+        assert!(text.contains(r#""peaks":7"#), "{text}");
     }
 
     /// The one place addresses are strings, and the reason is that
