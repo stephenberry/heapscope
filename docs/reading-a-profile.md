@@ -42,7 +42,7 @@ A real reading of `examples/lifecycle_probe`, which does that on its main thread
 
 ```text
 heapscope threads
-  #0 main       1.2 MiB in 444 blocks (98.0%), 0 B live, peak 1.1 MiB
+  #0 main       1.2 MiB in 445 blocks (98.0%), 0 B live, peak 1.1 MiB
   #1 hs-worker  25.6 KiB in 29 blocks (2.0%), 0 B live, peak 25.0 KiB
 
 heapscope regions
@@ -56,6 +56,41 @@ heapscope regions
 A region is scoped to the calling thread and nests to any depth. A process-wide "current phase" would be worse than either: it attributes whatever a background thread happens to be doing to whichever phase some other thread is in.
 
 Names are interned, so entering `"parsing"` a thousand times is one row that says it was entered a thousand times. Each row's peak is its own — the most that thread or region ever held at once, which may well have been at an instant when the whole heap was nowhere near its maximum. `region` costs two atomic loads and a branch when nothing is profiling, so instrumentation can be left in place.
+
+### What no region covered
+
+The last row of the regions section is what was allocated while no region was open on the allocating thread. The same probe again:
+
+```text
+heapscope regions
+  parsing/lexing  32.1 KiB in 16 blocks (2.5%), 0 B live, peak 2.0 KiB
+  parsing         28.0 KiB in 53 blocks (2.1%), 0 B live, peak 26.6 KiB
+  worker          25.6 KiB in 28 blocks (2.0%), 0 B live, peak 25.0 KiB
+  (no region)     1.1 MiB in 377 blocks (93.4%), 0 B live
+```
+
+It follows the same rule as every region row: a block belongs to whatever was innermost on its thread when it was allocated, and its free and every reallocation of it come back to that place, whichever thread performs them and whatever region is open by then. So with it, the rows partition the run, and four columns add up exactly to the run's own totals: bytes and blocks allocated, and bytes and blocks still live. The shared row for names past the region table's capacity is one of the rows being added.
+
+The peaks do not add up and are not meant to. Each region's is its own, reached at its own moment, and the `(no region)` row has none at all: it is the run's totals less the region rows, read at one instant, rather than a row the profiler keeps. Keeping one would put several more atomic operations on a single process-wide counter into nearly every allocation of every program, regions or not, and a peak is the only figure the subtraction cannot give.
+
+In the native format it is `outsideRegions`, a key of its own beside `regions` rather than an entry in it, so it can never be mistaken for a region the program happened to name `(no region)`, and a reader that predates it simply ignores it. The bundled viewer shows it as the last row of the region table, set apart.
+
+### Reading the regions from inside the program
+
+`heapscope::RegionBreakdown::get()` returns the same rows and remainder without taking a snapshot, which copies out every program point and every thread as well:
+
+```rust
+let breakdown = heapscope::RegionBreakdown::get()?;
+for region in &breakdown.regions {
+    println!("{:?}: {} allocations", region.name, region.counts.total_blocks);
+}
+println!("(no region): {} allocations", breakdown.outside_regions.total_blocks);
+let lexing = breakdown.region("parsing/lexing");
+```
+
+It refuses rather than returning zeros in the cases `HeapStats::get()` does: nothing recording, a poisoned profiler, a `fork` child, a sampled run (whose rows are estimates, like everything else in it). It answers in every mode, saying which, because a region row means the same thing in each, and it carries `dropped_blocks` and `refused_events` from the same reading: the rows still add up when the live-block table overflows, but they undercount, and those say by how much.
+
+Because the remainder is a subtraction, it reads the region rows and the totals at one instant, holding every recording thread still for as long as copying a few hundred rows takes. If something else holds the profiler that long, it refuses with `StatsError::NoQuietPoint` rather than subtracting across two moments. It allocates, so it is not for a signal handler, and a thread already inside the profiler is refused at once with `StatsError::InsideTheProfiler` rather than left to stall every other thread while it waits.
 
 ## What else is in there
 

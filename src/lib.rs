@@ -74,6 +74,11 @@
 //! parse();
 //! ```
 //!
+//! The region rows end with one for what no region covered, so together they
+//! add up to the run. [`RegionBreakdown::get`] reads them from inside the
+//! program without taking a whole snapshot, for a program that reports its own
+//! phases.
+//!
 //! # A number a test can fail on
 //!
 //! The other thing a profile is for is a budget that holds. [`HeapStats::get`]
@@ -168,7 +173,7 @@ pub use internals::engine::Mode;
 pub use output::{FoldedMetric, Snapshot};
 pub use profiler::{Output, Profiler, ProfilerBuilder, StartError, DEFAULT_OUTPUT_PATH};
 pub use region::{region, Region};
-pub use stats::{EventStats, HeapStats, StatsError};
+pub use stats::{EventStats, HeapStats, RegionBreakdown, StatsError};
 pub use symbol::demangle;
 
 // The bodies of the assertion macros. `#[macro_export]` puts a macro at the

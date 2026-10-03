@@ -376,11 +376,26 @@ fn write_threads<W: Write>(json: &mut JsonWriter<W>, snapshot: &Snapshot) -> io:
     json.end_array()
 }
 
-/// What for. One row per region name the program entered.
+/// What for. One row per region name the program entered, and then what was
+/// recorded outside all of them.
 ///
-/// Empty for a run that used no regions. Unlike the thread rows these do
-/// **not** sum to `totals`: an allocation made outside every region belongs to
-/// no row, which is where most allocations in most programs happen.
+/// Empty for a run that used no regions. The rows alone do not sum to `totals`,
+/// because an allocation made outside every region belongs to none of them —
+/// which is where most allocations in most programs happen. `outsideRegions`
+/// is that remainder, and with it the additive columns do sum to `totals`, on
+/// the same terms the thread rows do. The peaks are each row's own and sum to
+/// nothing.
+///
+/// # Why the remainder is not a row in the array
+///
+/// Because it is not a region. It has no id, no name, no entries and no peak,
+/// so as an element of `regions` it would be a row with four fields missing
+/// that every reader of the array — the bundled viewer of an older release
+/// among them — would list as a region, and a reader telling it apart by a
+/// reserved name would confuse it with a region the program gave that name. A
+/// key of its own is something an older reader simply ignores, which is the
+/// compatibility rule this format states, and what keeps this an addition
+/// rather than a `formatVersion` bump.
 fn write_regions<W: Write>(json: &mut JsonWriter<W>, snapshot: &Snapshot) -> io::Result<()> {
     json.key("regions")?;
     json.begin_array(Layout::Wrap)?;
@@ -404,7 +419,24 @@ fn write_regions<W: Write>(json: &mut JsonWriter<W>, snapshot: &Snapshot) -> io:
         write_tally(json, &region.counts, snapshot)?;
         json.end_object()?;
     }
-    json.end_array()
+    json.end_array()?;
+
+    // Written in every run, not only one that used regions. In a run that used
+    // none it repeats the totals, which is true and costs a line; leaving it
+    // out would make its absence mean two things — no regions, or a file from
+    // before the field existed — where a reader can now take absence to mean
+    // only the second.
+    let outside = &snapshot.outside_regions;
+    json.key("outsideRegions")?;
+    json.begin_object(Layout::Inline)?;
+    json.field_u64("totalBytes", outside.total_bytes)?;
+    json.field_u64("totalBlocks", outside.total_blocks)?;
+    // Omitted in a mode with no live blocks, as every row's are.
+    if snapshot.settings.mode.block_lifetimes() {
+        json.field_u64("currBytes", outside.curr_bytes)?;
+        json.field_u64("currBlocks", outside.curr_blocks)?;
+    }
+    json.end_object()
 }
 
 /// One row's counters, on the same terms as `totals`.

@@ -56,6 +56,47 @@ function everyNode(node, visit) {
   }
 }
 
+/**
+ * What the Regions tab decides to show for `profile`, held against the
+ * profile itself.
+ */
+function checkRegionSummary(HEAPSCOPE, profile, what) {
+  const summary = HEAPSCOPE.regionSummary(profile);
+  const regions = profile.regions || [];
+  const lifetimes = profile.totals && profile.totals.maxBytes !== undefined;
+  check(typeof summary.note === "string" && summary.note.length > 0, `${what}: the Regions tab has a note`);
+  const tells = summary.note.includes("The last row");
+  if (regions.length === 0) {
+    check(summary.remainder === null, `${what}: no regions, so no row for what no region covered`);
+    check(!tells, `${what}: no regions, so no sentence about a last row`);
+    check(!summary.note.includes("sum"), `${what}: no regions, so no claim about sums`);
+    return;
+  }
+  if (!profile.outsideRegions) {
+    check(summary.remainder === null, `${what}: no outsideRegions, so no row for it`);
+    check(summary.note.includes("do not sum"), `${what}: without the remainder, the rows are said not to sum`);
+    return;
+  }
+  check(summary.remainder === profile.outsideRegions, `${what}: the last row is the profile's outsideRegions`);
+  check(tells, `${what}: the note says what the last row is`);
+  check(summary.note.includes("unless a banner above says otherwise"), `${what}: the sum is qualified by the banners`);
+  check(!/allocat/.test(summary.note), `${what}: the wording is the same in every mode`);
+  check(summary.note.includes("Peaks do not") === Boolean(lifetimes), `${what}: peaks are mentioned exactly when there are any`);
+  // The promise the note makes, checked on the numbers it is made about —
+  // where the profile does not itself say the promise is off, which is what
+  // the banners the note defers to are for.
+  const run = profile.run || {};
+  const missed = profile.notRecorded || {};
+  if (run.exact === false || missed.attributionRows) return;
+  const sum = function (key) {
+    return regions.reduce(function (total, row) { return total + (row[key] || 0); }, profile.outsideRegions[key] || 0);
+  };
+  const columns = lifetimes ? ["totalBytes", "totalBlocks", "currBytes", "currBlocks"] : ["totalBytes", "totalBlocks"];
+  for (const key of columns) {
+    check(sum(key) === profile.totals[key], `${what}: the rows and the last row sum to totals.${key}`);
+  }
+}
+
 function checkPage(path) {
   console.log(`checking ${path}`);
   const page = readFileSync(path, "utf8");
@@ -226,6 +267,34 @@ function checkPage(path) {
     sampled === warnings.some(function (warning) { return warning.title.startsWith("Sampled run"); }),
     "a sampled run says so, and an unsampled one does not"
   );
+
+  // The Regions tab: the row for what no region covered, and the sentence that
+  // says what it is, appear exactly when there are regions for it to complete.
+  // The profiles recorded for this check use no regions, so the page's own
+  // profile covers the empty case and the synthetic ones below cover the rest;
+  // the decision is a pure function of the profile, so the shapes that matter
+  // can be stated rather than recorded.
+  checkRegionSummary(HEAPSCOPE, profile, "the page's own profile");
+  const regionRow = {
+    id: 0, firstSeen: 0, name: "parsing", entries: 1, active: 0,
+    totalBytes: 64, totalBlocks: 1, currBytes: 0, currBlocks: 0, maxBytes: 64, maxBlocks: 1,
+  };
+  const heapTotals = { totalBytes: 100, totalBlocks: 3, currBytes: 10, currBlocks: 1, maxBytes: 80, maxBlocks: 2 };
+  const heapOutside = { totalBytes: 36, totalBlocks: 2, currBytes: 10, currBlocks: 1 };
+  checkRegionSummary(HEAPSCOPE, {
+    totals: heapTotals, regions: [regionRow], outsideRegions: heapOutside,
+  }, "a heap run with a region");
+  checkRegionSummary(HEAPSCOPE, {
+    totals: heapTotals, regions: [], outsideRegions: { totalBytes: 100, totalBlocks: 3, currBytes: 10, currBlocks: 1 },
+  }, "a heap run with no region");
+  checkRegionSummary(HEAPSCOPE, {
+    totals: { totalBytes: 100, totalBlocks: 3 },
+    regions: [{ id: 0, firstSeen: 0, name: "retrying", entries: 1, active: 0, totalBytes: 64, totalBlocks: 1 }],
+    outsideRegions: { totalBytes: 36, totalBlocks: 2 },
+  }, "an event run with a region");
+  checkRegionSummary(HEAPSCOPE, {
+    totals: heapTotals, regions: [regionRow],
+  }, "a profile from before outsideRegions existed");
 
   // Shortening a label is exact: it removes the path the profile itself says
   // the frame's module was loaded from, and leaves every other label alone.

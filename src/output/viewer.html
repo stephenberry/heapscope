@@ -159,6 +159,7 @@
   th { color: var(--dim); font-weight: 600; font-size: .78rem; white-space: nowrap; }
   th:first-child, td:first-child { text-align: left; }
   tbody tr:hover { background: var(--panel); }
+  tfoot td { border-top: 2px solid var(--rule); }
   caption { caption-side: top; text-align: left; color: var(--dim); font-size: .82rem; padding-bottom: .5rem; }
 
   .empty { color: var(--dim); font-style: italic; padding: 1rem 0; }
@@ -460,6 +461,43 @@ const HEAPSCOPE = (function () {
     return { observed: observed, estimated: estimated, error: (estimated - observed) / observed };
   }
 
+  /// What the Regions tab says, decided here rather than while drawing it so
+  /// the headless check can read the decision: the note above the table, and
+  /// the row for what no region covered, or `null` where there is none.
+  ///
+  /// That row is its own key in the profile, `outsideRegions`, rather than an
+  /// entry of `regions`, because it is not a region: it has no name, no
+  /// entries and no peak. It is written in every run, so whether to show it
+  /// is decided by whether there are regions for it to complete — a run that
+  /// used none gets neither the row nor a sentence about it. A profile from
+  /// before the key existed lacks it, and the table is the regions alone, as
+  /// it always was.
+  ///
+  /// Mode-neutral wording, because an ad hoc or copy run records events, not
+  /// allocations, and has no live column to promise a sum for.
+  function regionSummary(profile) {
+    const regions = profile.regions || [];
+    const outside = profile.outsideRegions || null;
+    const lifetimes = Boolean(profile.totals && profile.totals.maxBytes !== undefined);
+    let note = "Phases of the run, marked by the program itself."
+      + " What a thread records belongs to the innermost region open on it at the time, and only to that one.";
+    if (regions.length === 0) {
+      return { note: note, remainder: null };
+    }
+    if (!outside) {
+      note += " These rows do not sum to the totals: what was recorded outside every region belongs to none of them.";
+      return { note: note, remainder: null };
+    }
+    note += " The last row is what was recorded with no region open, so the Total and Blocks columns"
+      + (lifetimes ? ", and the two at-end columns," : "")
+      + " each sum to the run's own, unless a banner above says otherwise.";
+    if (lifetimes) {
+      note += " Peaks do not: each region's is its own, reached at its own moment,"
+        + " and the last row has none because it is the remainder rather than a row the profiler kept.";
+    }
+    return { note: note, remainder: outside };
+  }
+
   /// Everything the run wants a reader warned about, in the order a reader
   /// should care. Each is a fact the profile states about itself; none is
   /// inferred.
@@ -539,6 +577,7 @@ const HEAPSCOPE = (function () {
     formatCount: formatCount,
     makeAmountFormatter: makeAmountFormatter,
     pointTotals: pointTotals,
+    regionSummary: regionSummary,
     samplingAccuracy: samplingAccuracy,
     shortenNames: shortenNames,
     sortTree: sortTree,
@@ -798,7 +837,10 @@ if (typeof document !== "undefined") {
 
     // ---- tables ----
 
-    function table(container, caption, columns, rows) {
+    // `footer`, if given, is rows that are not entries of the table but complete
+    // it: the region table's row for what no region covered, which is shown
+    // apart and styled as synthetic so it cannot be read as a region of that name.
+    function table(container, caption, columns, rows, footer) {
       const node = document.createElement("table");
       if (caption) {
         const captionNode = element("caption", null, caption);
@@ -816,6 +858,15 @@ if (typeof document !== "undefined") {
         body.appendChild(tr);
       });
       node.appendChild(body);
+      if (footer && footer.length > 0) {
+        const foot = document.createElement("tfoot");
+        footer.forEach(function (row) {
+          const tr = element("tr", "synthetic");
+          row.forEach(function (cell) { tr.appendChild(element("td", null, cell)); });
+          foot.appendChild(tr);
+        });
+        node.appendChild(foot);
+      }
       container.appendChild(node);
     }
 
@@ -863,20 +914,35 @@ if (typeof document !== "undefined") {
     // Regions.
     const regionsPanel = document.getElementById("panel-regions");
     regionsPanel.appendChild(element("h2", null, "Regions"));
-    regionsPanel.appendChild(element("p", "note",
-      "Phases of the run, marked by the program itself. These do not sum to the totals:"
-      + " an allocation made outside every region belongs to no row, which is where most allocations in most programs happen."));
+    const regionView = HEAPSCOPE.regionSummary(profile);
+    regionsPanel.appendChild(element("p", "note", regionView.note));
     const regions = profile.regions || [];
     if (regions.length === 0) {
       regionsPanel.appendChild(element("div", "empty", "This run used no regions."));
     } else {
+      const footer = [];
+      const outside = regionView.remainder;
+      if (outside) {
+        const cells = [
+          amount(outside.totalBytes || 0),
+          HEAPSCOPE.formatCount(outside.totalBlocks || 0),
+        ];
+        if (lifetimes) {
+          cells.push(
+            "—",
+            amount(outside.currBytes || 0),
+            HEAPSCOPE.formatCount(outside.currBlocks || 0)
+          );
+        }
+        footer.push(["(no region)", "—", "—"].concat(cells));
+      }
       table(regionsPanel, null, ["Region", "Entries", "Still open"].concat(TALLY_COLUMNS), regions.map(function (region) {
         return [
           region.name ? region.name + " (#" + region.id + ")" : "#" + region.id,
           HEAPSCOPE.formatCount(region.entries || 0),
           HEAPSCOPE.formatCount(region.active || 0),
         ].concat(tally(region));
-      }));
+      }), footer);
     }
 
     // Shapes.

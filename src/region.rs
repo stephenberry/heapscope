@@ -55,6 +55,12 @@ use crate::internals::site::RegionId;
 /// bytes, and two names that agree that far agree entirely as far as the
 /// profile is concerned.
 ///
+/// The rows are in every profile, beside one for what was recorded with no
+/// region open. To read them from the program itself — to print allocations
+/// per phase at the end of a run, say — use
+/// [`RegionBreakdown::get`](crate::RegionBreakdown::get), which reads the
+/// region table and nothing else.
+///
 /// # Example
 ///
 /// ```no_run
