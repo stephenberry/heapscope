@@ -99,7 +99,9 @@
 //! A mark is a reading from one window. Its totals and its peak are not
 //! comparable with anything read after a reset, which is what
 //! [`HeapStats::resets`] records: a program subtracting one reading's totals
-//! from another's compares that first. Its live figures are another matter,
+//! from another's compares that first, and
+//! [`assert_alloc_count!`](crate::assert_alloc_count)`(since: mark)` does, and
+//! refuses such a mark. Its live figures are another matter,
 //! because a reset carries them across unchanged, so
 //! `assert_no_leaks!(since: mark)` with a mark from before a reset is a
 //! legitimate question, whether setup and work together left anything behind,
@@ -664,12 +666,13 @@ impl AssertionFailure for Complaint {
                 mark_bytes: Some(_),
                 ..
             } => Scope::SinceMark,
-            // `MarkAhead` included: it is a complaint about the mark, not a
-            // measurement of anything after it.
+            // The two about the mark included: they are complaints about it,
+            // not measurements of anything after it.
             Complaint::Unavailable(_)
             | Complaint::Incomplete { .. }
             | Complaint::OverBudget { .. }
             | Complaint::MarkAhead { .. }
+            | Complaint::MarkFromAnotherWindow { .. }
             | Complaint::Leaked {
                 mark_bytes: None, ..
             } => Scope::WholeRun,
@@ -687,6 +690,7 @@ impl AssertionFailure for Complaint {
             | Complaint::Incomplete { .. }
             | Complaint::OverBudget { .. }
             | Complaint::MarkAhead { .. }
+            | Complaint::MarkFromAnotherWindow { .. }
             | Complaint::Leaked { .. } => Ranking::Bytes,
         }
     }
@@ -892,18 +896,24 @@ pub(crate) fn check_alloc_count(
 /// It is reachable. [`HeapStats`] is `#[non_exhaustive]`, which stops a caller
 /// *building* one but not changing one: its fields are public, so a mark read
 /// properly and then adjusted (`mark.total_blocks += 1_000`) arrives here
-/// ahead of the run. Totals that could restart would reach it a second way, from
-/// a mark read before the restart.
+/// ahead of the run.
 ///
-/// This check is not the whole of what a restart would need, and saying so
-/// matters: a mark from before one that happens to be *behind* the new run's
-/// total gives a plausible difference that measures nothing. Telling those apart
-/// needs the reading to carry which run it came from, which is what
-/// `#[non_exhaustive]` leaves room for.
+/// # A mark from before a reset is refused first, and for that
+///
+/// A [`Profiler::reset`](crate::Profiler::reset) sets the total back, so a mark
+/// read before one is ahead of the new total or behind it according to how
+/// many allocations each window happened to make. Ahead, it would be refused
+/// as `MarkAhead`, whose remedy, read the mark during this run, does not fit a
+/// mark that was. Behind, it would give a plausible difference that measures
+/// nothing, and pass. So the window is compared before anything is
+/// subtracted: one diagnosis for both halves, naming the call that moved the
+/// counts, and `MarkAhead` is left for the mark that was changed after
+/// reading.
 fn allocations_since(stats: &HeapStats, since: Option<HeapStats>) -> Result<u64, Complaint> {
     let Some(mark) = since else {
         return Ok(stats.total_blocks);
     };
+    same_window(stats, &mark)?;
     stats
         .total_blocks
         .checked_sub(mark.total_blocks)
@@ -948,16 +958,7 @@ pub(crate) fn check_no_leaks(engine: &Engine, since: Option<HeapStats>) -> Resul
 /// meaning, and whether it happens to come out negative is luck. A check of
 /// live figures, which carry across, does not ask.
 ///
-/// No caller yet: `assert_alloc_count!(since: mark)` is the first form that
-/// subtracts totals, and its check calls this before it subtracts.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the window check for `assert_alloc_count!(since:)`, which \
-                  arrives separately; this expectation fails once it is wired"
-    )
-)]
+/// [`allocations_since`] asks, for `assert_alloc_count!(since: mark)`.
 fn same_window(stats: &HeapStats, mark: &HeapStats) -> Result<(), Complaint> {
     if mark.resets != stats.resets {
         return Err(Complaint::MarkFromAnotherWindow {
@@ -1522,9 +1523,10 @@ macro_rules! assert_max_bytes {
 ///
 /// # Since a mark
 ///
-/// The bare forms count from when the profiler started, which in a test binary
-/// includes whatever the harness and any warm-up allocated. A budget for one
-/// stage counts from a [`HeapStats`] read immediately before it instead:
+/// The bare forms count from when the profiler started, or its counts were
+/// last [restarted](crate::Profiler::reset), which in a test binary includes
+/// whatever the harness and any warm-up allocated. A budget for one stage
+/// counts from a [`HeapStats`] read immediately before it instead:
 ///
 /// ```
 /// # #[global_allocator]
@@ -1548,6 +1550,12 @@ macro_rules! assert_max_bytes {
 /// since it is not zero but unknown, so the assertion fails rather than guess.
 /// A zero would pass every ceiling.
 ///
+/// A mark read before a [`Profiler::reset`](crate::Profiler::reset) is refused
+/// too, whichever side of the new total it falls: the reset set the total back,
+/// so the difference from the mark's would measure nothing.
+/// [`HeapStats::resets`] is how a mark is known to be from another window, and
+/// the failure says to read the mark after the reset.
+///
 /// It is a difference over the whole process, as
 /// [`assert_no_leaks!`](crate::assert_no_leaks)`(since: ..)` is, so an
 /// allocation made by another thread during the stage is counted into it. So is
@@ -1568,7 +1576,7 @@ macro_rules! assert_max_bytes {
 /// # Panics
 ///
 /// When the count differs or exceeds the ceiling, when the mark is ahead of the
-/// run, and when there are no numbers to check. And when the count or ceiling
+/// run or was read before a reset, and when there are no numbers to check. And when the count or ceiling
 /// is negative or larger than `u64::MAX`, because a ceiling of `-1` read as
 /// `u64::MAX` could not fail.
 #[macro_export]
@@ -2432,6 +2440,38 @@ mod tests {
             "a mark from before the reset passed the window check"
         );
         assert_eq!(same_window(&after, &after), Ok(()));
+        // And through the assertion that subtracts them. The mark's three
+        // allocations are ahead of the new window's none, which is the half
+        // `MarkAhead` would otherwise have claimed: the window diagnosis wins,
+        // because it names the cause.
+        let another_window = Err(Complaint::MarkFromAnotherWindow {
+            mark_resets: 0,
+            resets: 1,
+        });
+        assert_eq!(
+            check_alloc_count(&engine, Some(mark), Expected::AtMost(u64::MAX)),
+            another_window,
+            "a pre-reset mark ahead of the window was not refused as one"
+        );
+        // Behind the window, it would have given a difference that passes.
+        for address in [0x600, 0x700, 0x800, 0x900] {
+            record(&engine, address, 8);
+        }
+        assert_eq!(
+            check_alloc_count(&engine, Some(mark), Expected::Exactly(1)),
+            another_window,
+            "a pre-reset mark behind the window gave a difference"
+        );
+        let counted = HeapStats::of(&engine).unwrap();
+        record(&engine, 0xA00, 8);
+        assert_eq!(
+            check_alloc_count(&engine, Some(counted), Expected::Exactly(1)),
+            Ok(()),
+            "a mark from the window is counted from"
+        );
+        for address in [0x600, 0x700, 0x800, 0x900, 0xA00] {
+            engine.record_free(address, 8);
+        }
         // Live figures carry across, so a leak check from before the reset
         // asks a question with an answer: the fixture's two live blocks were
         // live at the mark too.
