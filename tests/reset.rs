@@ -133,12 +133,20 @@ fn a_reset_leaves_the_warm_up_out_of_everything_a_run_reports() {
     let leaked = black_box(vec![0u8; 64]);
     let message = failure_message(|| heapscope::assert_no_leaks!(since: warm));
     assert!(
-        message.contains("more blocks are live than at the mark"),
+        message.contains("1 more block is live than at the mark"),
         "a block allocated after a pre-reset mark went unseen: {message}"
     );
     drop(leaked);
+    // A count since it is refused, by name, wherever its total falls: the
+    // reset set the total back, so a difference from it measures nothing.
+    let message = failure_message(|| heapscope::assert_alloc_count!(since: warm, <= u64::MAX));
+    assert!(
+        message.contains("read before Profiler::reset"),
+        "a count since a pre-reset mark was not refused as one: {message}"
+    );
     let mark = HeapStats::get().expect("a running heap run has counters");
     steady_state(8);
+    heapscope::assert_alloc_count!(since: mark, 8);
     heapscope::assert_no_leaks!(since: mark);
 
     // ---- a call from inside the profiler is refused, and changes nothing ----
