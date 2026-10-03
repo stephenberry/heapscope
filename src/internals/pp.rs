@@ -403,7 +403,7 @@ impl PpTable {
         //
         // The probability is what makes this acceptable rather than the
         // consequence. Two distinct frame arrays must collide across a full
-        // 64-bit hash (less two bits consumed by `usable_key`). The alternative,
+        // 64-bit hash (less the bit `usable_key` sets). The alternative,
         // chaining, would put a second indirection on the hot path to insure
         // against an event that will not occur.
         if state.intern.insert(arena, key, index_u32) == Insert::Full {
