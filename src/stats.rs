@@ -37,6 +37,7 @@
 //! | The run counts something else | An ad hoc run has no heap peak, and a heap run has no event weights |
 //! | The profiler was poisoned | It stopped recording partway through and says so |
 //! | This process is a `fork` child | The counters were inherited and describe the parent's run |
+//! | The run samples | Its counters are estimates, which move between runs of the same program |
 //! | The run dropped blocks | The live-block table filled; the totals are missing however many it turned away |
 //!
 //! The last one is only a refusal for the *assertions*, not for [`HeapStats::get`]:
@@ -55,7 +56,7 @@
 //! rows covers, and for a while it was reachable: `assert_max_bytes!(64 * 1024)`
 //! passed in a program that had just allocated 10 MiB.
 //!
-//! It is not a sixth row, because a reading is the wrong place to catch it. By
+//! It is not another row, because a reading is the wrong place to catch it. By
 //! then the run is over and the answer is still zero. It is refused where the
 //! mistake is, at startup, by
 //! [`StartError::NotInstalled`](crate::StartError::NotInstalled) — so the only
@@ -77,8 +78,9 @@
 //! harness itself does on the profiled thread inside the counts.
 //!
 //! This is why [`assert_alloc_count!`](crate::assert_alloc_count) is usually
-//! written against a mark rather than against zero: read [`HeapStats::get`]
-//! immediately before the code under test, and assert `mark.total_blocks + n`.
+//! written against a mark rather than from the start of the run: read
+//! [`HeapStats::get`] immediately before the code under test, and assert
+//! `since: mark`.
 //!
 //! ## A finished run keeps answering
 //!
@@ -125,7 +127,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::internals::engine::{Engine, Mode, State};
-use crate::output::{count, Snapshot};
+use crate::output::{count, Ranking, Snapshot};
 
 /// What a heap run has recorded, as of now.
 ///
@@ -146,6 +148,14 @@ use crate::output::{count, Snapshot};
 /// subtracted two live counters produced "1 blocks totalling 0 bytes were never
 /// freed", which is a sentence that cannot be true, and it now reports each
 /// reading as the absolute figure it is.
+///
+/// The `since: mark` forms do subtract, and what they subtract is the reason
+/// they may: one counter from *the same counter* read earlier, never one
+/// counter from another. For [`total_blocks`](HeapStats::total_blocks), which
+/// only grows, that difference is a count of what happened between the two
+/// readings. For `curr_blocks` it is only a net change, which is why
+/// [`assert_no_leaks!`](crate::assert_no_leaks) reports blocks *beyond* the
+/// mark and gives the bytes as two absolute figures rather than a third.
 ///
 /// `#[non_exhaustive]`: sampling metadata joins this in M6.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -445,6 +455,68 @@ fn has_a_profile(engine: &Engine) -> bool {
     matches!(engine.state(), State::Running | State::Finished)
 }
 
+/// What a measurement covers: the whole run, or only what followed a mark.
+///
+/// Carried by the count complaints so that a failure says which of the two
+/// questions it answered, and read by [`report`] through [`AssertionFailure::scope`] so
+/// that it can say the profile it writes answers the wider one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Scope {
+    /// Everything since the profiler started.
+    WholeRun,
+    /// Everything since a [`HeapStats`] mark was read.
+    SinceMark,
+}
+
+impl Scope {
+    /// The scope of an assertion given its optional mark.
+    fn of(since: Option<HeapStats>) -> Scope {
+        match since {
+            None => Scope::WholeRun,
+            Some(_) => Scope::SinceMark,
+        }
+    }
+
+    /// The words a complaint inserts after "made". Nothing for the whole run,
+    /// because that is what the unqualified sentence already means.
+    fn phrase(self) -> &'static str {
+        match self {
+            Scope::WholeRun => "",
+            Scope::SinceMark => " since the mark",
+        }
+    }
+}
+
+/// What an allocation count is checked against.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Expected {
+    /// `assert_alloc_count!(n)`: exactly this many.
+    Exactly(u64),
+    /// `assert_alloc_count!(<= n)`: this many or fewer, zero included.
+    AtMost(u64),
+}
+
+/// What [`report`] needs to know about a failure beyond its sentence.
+///
+/// A trait rather than parameters to `report`, because both answers belong to
+/// the failure and not to the call site. A `since: mark` assertion that was
+/// refused for a sampled run measured nothing since the mark, and a note
+/// qualifying its profile as broader than the stage would be qualifying a
+/// measurement that was never made. Asked of the failure, the question cannot
+/// be answered for the wrong one.
+pub(crate) trait AssertionFailure: fmt::Display {
+    /// What the failing measurement covered. A refusal measured nothing, which
+    /// is the default: there is no narrower interval to warn about.
+    fn scope(&self) -> Scope {
+        Scope::WholeRun
+    }
+
+    /// Which figure the program points printed with the failure are ranked by.
+    fn ranking(&self) -> Ranking {
+        Ranking::Bytes
+    }
+}
+
 /// Why an assertion did not pass.
 ///
 /// Separated from the panic so that the decision is a value a test can examine.
@@ -459,7 +531,24 @@ pub(crate) enum Complaint {
     /// The peak was above the budget.
     OverBudget { peak: u64, limit: u64 },
     /// The allocation count was not the expected one.
-    WrongCount { counted: u64, expected: u64 },
+    WrongCount {
+        counted: u64,
+        expected: u64,
+        scope: Scope,
+    },
+    /// More allocations were made than the ceiling allows.
+    OverCeiling {
+        counted: u64,
+        ceiling: u64,
+        scope: Scope,
+    },
+    /// The mark records more allocations than the run it is compared against.
+    ///
+    /// [`total_blocks`](HeapStats::total_blocks) only grows, so a mark read from
+    /// these counters and passed on as read can never be ahead of a later
+    /// reading. One that is was read elsewhere or changed since, and either way
+    /// the count since it is not zero but unknown.
+    MarkAhead { mark: u64, now: u64 },
     /// Blocks were still live.
     ///
     /// The byte figures are absolute readings rather than a difference, and
@@ -476,6 +565,61 @@ pub(crate) enum Complaint {
         /// Live bytes at the mark, if there was one.
         mark_bytes: Option<u64>,
     },
+}
+
+impl AssertionFailure for Complaint {
+    fn scope(&self) -> Scope {
+        match self {
+            Complaint::WrongCount { scope, .. } | Complaint::OverCeiling { scope, .. } => *scope,
+            Complaint::Leaked {
+                mark_bytes: Some(_),
+                ..
+            } => Scope::SinceMark,
+            // `MarkAhead` included: it is a complaint about the mark, not a
+            // measurement of anything after it.
+            Complaint::Unavailable(_)
+            | Complaint::Incomplete { .. }
+            | Complaint::OverBudget { .. }
+            | Complaint::MarkAhead { .. }
+            | Complaint::Leaked {
+                mark_bytes: None, ..
+            } => Scope::WholeRun,
+        }
+    }
+
+    /// Blocks for a count that failed, because a count is about how many
+    /// allocations were made, and the sites that made the most are the ones
+    /// that answer it. Bytes for everything else, including a leak: what a leak
+    /// costs is the memory it holds.
+    fn ranking(&self) -> Ranking {
+        match self {
+            Complaint::WrongCount { .. } | Complaint::OverCeiling { .. } => Ranking::Blocks,
+            Complaint::Unavailable(_)
+            | Complaint::Incomplete { .. }
+            | Complaint::OverBudget { .. }
+            | Complaint::MarkAhead { .. }
+            | Complaint::Leaked { .. } => Ranking::Bytes,
+        }
+    }
+}
+
+/// `one` when `value` is exactly one, `many` otherwise.
+///
+/// For the nouns and verbs a complaint puts beside a number. A message is the
+/// whole of what a failing CI job shows, and "1 allocations were made" reads as
+/// a message nobody looked at, which invites the reader to doubt the number
+/// beside it as well.
+fn agreeing<'a>(value: u64, one: &'a str, many: &'a str) -> &'a str {
+    if value == 1 {
+        one
+    } else {
+        many
+    }
+}
+
+/// `value` grouped, followed by `one` or `many` to agree with it.
+fn counted(value: u64, one: &str, many: &str) -> String {
+    format!("{} {}", count(value), agreeing(value, one, many))
 }
 
 impl fmt::Display for Complaint {
@@ -496,11 +640,45 @@ impl fmt::Display for Complaint {
                 count(*peak),
                 count(*limit)
             ),
-            Complaint::WrongCount { counted, expected } => write!(
+            Complaint::WrongCount {
+                counted: made,
+                expected,
+                scope,
+            } => write!(
                 f,
-                "{} allocations were made, not {}",
-                count(*counted),
+                "{} {} made{}, not {}",
+                counted(*made, "allocation", "allocations"),
+                agreeing(*made, "was", "were"),
+                scope.phrase(),
                 count(*expected)
+            ),
+            Complaint::OverCeiling {
+                counted: made,
+                ceiling,
+                scope,
+            } => write!(
+                f,
+                "{} {} made{}, above the ceiling of {}",
+                counted(*made, "allocation", "allocations"),
+                agreeing(*made, "was", "were"),
+                scope.phrase(),
+                count(*ceiling)
+            ),
+            // Names the remedy for the reason `Incomplete` does, and says what
+            // the numbers imply rather than only what they are. It does not say
+            // *where* the mark came from, because the numbers cannot tell: a
+            // mark read from another run and one whose fields were changed after
+            // reading look identical here, and a message that guessed would send
+            // half its readers to look for the wrong mistake.
+            Complaint::MarkAhead { mark, now } => write!(
+                f,
+                "the mark records {} but this run has made {}, which a mark \
+                 read from this run and passed on unchanged cannot do, so the \
+                 number made since it cannot be known; read the mark with \
+                 HeapStats::get() during the run being asserted on, and pass it \
+                 as read",
+                counted(*mark, "allocation", "allocations"),
+                count(*now)
             ),
             // The remedy is named for the reason `Incomplete` names one: the
             // likeliest cause of this failing is not a leak but an assertion
@@ -513,11 +691,12 @@ impl fmt::Display for Complaint {
                 mark_bytes: None,
             } => write!(
                 f,
-                "{} blocks totalling {} bytes were never freed; if the program \
-                 holds memory of its own, take a mark with HeapStats::get() \
-                 first and assert `since: mark`",
-                count(*blocks),
-                count(*live_bytes)
+                "{} totalling {} {} never freed; if the program holds memory of \
+                 its own, take a mark with HeapStats::get() first and assert \
+                 `since: mark`",
+                counted(*blocks, "block", "blocks"),
+                counted(*live_bytes, "byte", "bytes"),
+                agreeing(*blocks, "was", "were")
             ),
             Complaint::Leaked {
                 blocks,
@@ -525,9 +704,11 @@ impl fmt::Display for Complaint {
                 mark_bytes: Some(mark),
             } => write!(
                 f,
-                "{} more blocks are live than at the mark, where live bytes \
-                 went from {} to {}",
+                "{} more {} {} live than at the mark, where live bytes went \
+                 from {} to {}",
                 count(*blocks),
+                agreeing(*blocks, "block", "blocks"),
+                agreeing(*blocks, "is", "are"),
                 count(*mark),
                 count(*live_bytes)
             ),
@@ -562,15 +743,70 @@ pub(crate) fn check_max_bytes(engine: &Engine, limit: u64) -> Result<(), Complai
     Ok(())
 }
 
-pub(crate) fn check_alloc_count(engine: &Engine, expected: u64) -> Result<(), Complaint> {
+pub(crate) fn check_alloc_count(
+    engine: &Engine,
+    since: Option<HeapStats>,
+    expected: Expected,
+) -> Result<(), Complaint> {
     let stats = assertable(engine)?;
-    if stats.total_blocks != expected {
-        return Err(Complaint::WrongCount {
-            counted: stats.total_blocks,
+    let counted = allocations_since(&stats, since)?;
+    let scope = Scope::of(since);
+    match expected {
+        Expected::Exactly(expected) if counted != expected => Err(Complaint::WrongCount {
+            counted,
             expected,
-        });
+            scope,
+        }),
+        Expected::AtMost(ceiling) if counted > ceiling => Err(Complaint::OverCeiling {
+            counted,
+            ceiling,
+            scope,
+        }),
+        Expected::Exactly(_) | Expected::AtMost(_) => Ok(()),
     }
-    Ok(())
+}
+
+/// Allocations made since `since`, or over the whole run without one.
+///
+/// A difference of one counter between two of its own readings, which is not
+/// the arithmetic [`HeapStats`] warns against: `total_blocks` only grows, so
+/// what lies between two readings of it is exactly the allocations made in
+/// between.
+///
+/// # A mark ahead of the reading is refused rather than saturated
+///
+/// `check_no_leaks` saturates its difference, and the reason does not transfer.
+/// There, a reading below the mark has an innocent cause — blocks live at the
+/// mark were freed — and its true answer, no leak, is the one saturating gives.
+/// Here there is no innocent cause: a counter that only grows cannot read below
+/// an earlier reading of itself, so a mark ahead of `stats` was not passed on as
+/// it was read from these counters, and the count since it is unknown.
+/// Saturating would report zero, which passes every ceiling and
+/// `since: mark, 0` — an answer invented in the direction of passing, which is
+/// the one this module exists to refuse.
+///
+/// It is reachable. [`HeapStats`] is `#[non_exhaustive]`, which stops a caller
+/// *building* one but not changing one: its fields are public, so a mark read
+/// properly and then adjusted (`mark.total_blocks += 1_000`) arrives here
+/// ahead of the run. Totals that could restart would reach it a second way, from
+/// a mark read before the restart.
+///
+/// This check is not the whole of what a restart would need, and saying so
+/// matters: a mark from before one that happens to be *behind* the new run's
+/// total gives a plausible difference that measures nothing. Telling those apart
+/// needs the reading to carry which run it came from, which is what
+/// `#[non_exhaustive]` leaves room for.
+fn allocations_since(stats: &HeapStats, since: Option<HeapStats>) -> Result<u64, Complaint> {
+    let Some(mark) = since else {
+        return Ok(stats.total_blocks);
+    };
+    stats
+        .total_blocks
+        .checked_sub(mark.total_blocks)
+        .ok_or(Complaint::MarkAhead {
+            mark: mark.total_blocks,
+            now: stats.total_blocks,
+        })
 }
 
 pub(crate) fn check_no_leaks(engine: &Engine, since: Option<HeapStats>) -> Result<(), Complaint> {
@@ -648,13 +884,14 @@ fn dump(
     engine: &Engine,
     _entered: &crate::internals::guard::Guard,
     path: &Path,
+    ranking: Ranking,
     summary: &mut dyn io::Write,
 ) -> String {
     // One reading, both destinations, for the reason `write_outputs` takes one:
     // a summary and a file that disagree about the same failure are two
     // readings of a program that kept running in between.
     let snapshot = Snapshot::of(engine);
-    let _ = snapshot.write_text_summary(summary, TOP_ON_FAILURE);
+    let _ = snapshot.write_text_summary_ranked(summary, TOP_ON_FAILURE, ranking);
 
     let named = screened(&path.display().to_string());
     match snapshot.save_dhat_v2(path) {
@@ -829,8 +1066,21 @@ pub(crate) fn is_off(setting: &std::ffi::OsStr) -> bool {
 /// measures — and it is worse here than in either of them: the numbers in the
 /// panic message have already been read, so the profile the reader is sent to
 /// would disagree with the message that sent them.
+///
+/// # A failure since a mark says what its profile covers
+///
+/// A measurement made `since: mark` is about an interval, and the profile
+/// written for it is not: a mark holds the run's totals and nothing per program
+/// point, so there is nothing to subtract the earlier sites from. Left unsaid,
+/// the heaviest sites printed for a stage's budget include whatever the warm-up
+/// before the mark allocated — the first place a reader looks for the stage's
+/// cost. The profile stays whole because it is still the evidence there is;
+/// the note is what keeps it from being read as something narrower.
 #[track_caller]
-pub(crate) fn report<E: fmt::Display>(outcome: Result<(), E>, context: Option<fmt::Arguments<'_>>) {
+pub(crate) fn report<E: AssertionFailure>(
+    outcome: Result<(), E>,
+    context: Option<fmt::Arguments<'_>>,
+) {
     let Err(complaint) = outcome else {
         // The passing path allocates nothing and takes nothing, which is what
         // lets an assertion sit inside a loop.
@@ -851,15 +1101,111 @@ pub(crate) fn report<E: fmt::Display>(outcome: Result<(), E>, context: Option<fm
     let dumped = match (&quiet, dump_target(engine)) {
         (Some(entered), Some(path)) => {
             let mut stderr = io::stderr().lock();
-            Some(dump(engine, entered, &path, &mut stderr))
+            Some(dump(
+                engine,
+                entered,
+                &path,
+                complaint.ranking(),
+                &mut stderr,
+            ))
         }
         _ => None,
     };
     if let Some(line) = dumped {
         message.push_str("\n  ");
         message.push_str(&line);
+        if complaint.scope() == Scope::SinceMark {
+            message.push_str("\n  ");
+            message.push_str(WHOLE_RUN_NOTE);
+        }
     }
     panic!("{message}");
+}
+
+/// Appended to a failure measured since a mark, wherever a dump was attempted.
+///
+/// Attempted rather than written, because the summary reaches stderr whether or
+/// not the file could be. Worded so that it is true either way: the line above
+/// it says which happened to the file.
+const WHOLE_RUN_NOTE: &str = "the program points printed to stderr, and any profile written, \
+                              cover the whole run, not only what followed the mark";
+
+/// The types a budget or a count can be given as: the integer primitives, and
+/// nothing else.
+///
+/// The bound was `TryInto<u64>`, which `bool` and `char` both satisfy. That
+/// made a comparison written where a count belongs compile, and run as a count
+/// of zero or one: `assert_alloc_count!(since: mark, used <= 4)` asserted that
+/// the stage made exactly one allocation whenever `used <= 4` held. A budget
+/// that type-checks as something it is not is the cannot-fail shape again, so
+/// the bound is this instead, and its impls are the twelve integer types and
+/// their `NonZero` forms. The `NonZero` impls are not a nicety: `NonZeroU64`
+/// satisfied the old bound, so a budget held in one compiled before the bound
+/// narrowed and has to compile after it.
+///
+/// Public only so that it can appear in the hidden entry points' signatures;
+/// it lives in a private module, so no caller can name it, let alone implement
+/// it for a type of their own.
+///
+/// ```compile_fail,E0277
+/// # #[global_allocator]
+/// # static ALLOC: heapscope::Alloc = heapscope::Alloc::system();
+/// # let _profiler = heapscope::Profiler::builder().no_output().build().unwrap();
+/// let mark = heapscope::HeapStats::get().unwrap();
+/// let used = 3usize;
+/// heapscope::assert_alloc_count!(since: mark, used <= 4);
+/// ```
+///
+/// ```compile_fail,E0277
+/// # #[global_allocator]
+/// # static ALLOC: heapscope::Alloc = heapscope::Alloc::system();
+/// # let _profiler = heapscope::Profiler::builder().no_output().build().unwrap();
+/// heapscope::assert_max_bytes!('k');
+/// ```
+mod integer {
+    use core::num::NonZero;
+
+    #[diagnostic::on_unimplemented(
+        message = "`{Self}` is not an integer count or byte budget",
+        label = "expected an integer here",
+        note = "a heapscope count or budget is an integer type, or the `NonZero` form of one; \
+                a `bool` here is usually a comparison written where the number belongs"
+    )]
+    pub trait Integer: Copy {
+        /// The value as a `u64`, or `None` when it is negative or too large.
+        fn to_u64(self) -> Option<u64>;
+    }
+
+    macro_rules! integers {
+        ($($integer:ty)*) => {
+            $(
+                impl Integer for $integer {
+                    fn to_u64(self) -> Option<u64> {
+                        u64::try_from(self).ok()
+                    }
+                }
+            )*
+        };
+    }
+
+    integers!(u8 u16 u32 u64 u128 usize i8 i16 i32 i64 i128 isize);
+
+    // A `NonZero` is a number that is already known not to be zero, so it
+    // converts through the integer it wraps: a negative `NonZero<i32>` is
+    // refused exactly as a negative `i32` is.
+    macro_rules! non_zero {
+        ($($integer:ty)*) => {
+            $(
+                impl Integer for NonZero<$integer> {
+                    fn to_u64(self) -> Option<u64> {
+                        self.get().to_u64()
+                    }
+                }
+            )*
+        };
+    }
+
+    non_zero!(u8 u16 u32 u64 u128 usize i8 i16 i32 i64 i128 isize);
 }
 
 /// A macro argument as the `u64` the engine keeps its counters in.
@@ -867,16 +1213,16 @@ pub(crate) fn report<E: fmt::Display>(outcome: Result<(), E>, context: Option<fm
 /// Generic rather than a plain `u64` parameter because **every size and count
 /// in Rust is a `usize`**: `assert_alloc_count!(items.len())` and a budget held
 /// in a `usize` are the ordinary call sites, and both are a type error against
-/// a `u64`. An integer literal still infers, because the fallback type
-/// satisfies the bound. There is no `From<usize> for u64`, so this is the
-/// conversion that exists.
+/// a `u64`. An integer literal still infers, because the fallback type, `i32`,
+/// is one of the integers. There is no `From<usize> for u64`, so the
+/// conversion is a fallible one.
 ///
 /// A value that does not fit — a negative one — panics rather than saturating.
 /// A budget of `-1` silently becoming `u64::MAX` is an assertion that cannot
 /// fail, which is the one outcome this module exists to prevent.
 #[track_caller]
-fn as_count<N: TryInto<u64>>(value: N) -> u64 {
-    value.try_into().unwrap_or_else(|_| {
+fn as_count<N: integer::Integer>(value: N) -> u64 {
+    value.to_u64().unwrap_or_else(|| {
         panic!(
             "heapscope: a negative or oversized number is not a byte count or an allocation count"
         )
@@ -887,19 +1233,48 @@ fn as_count<N: TryInto<u64>>(value: N) -> u64 {
 /// entry point.
 #[doc(hidden)]
 #[track_caller]
-pub fn __assert_max_bytes<N: TryInto<u64>>(limit: N, context: Option<fmt::Arguments<'_>>) {
+pub fn __assert_max_bytes<N: integer::Integer>(limit: N, context: Option<fmt::Arguments<'_>>) {
     report(check_max_bytes(crate::engine(), as_count(limit)), context);
 }
 
-/// The body of [`assert_alloc_count!`](crate::assert_alloc_count). Not a
-/// supported entry point.
+/// The body of [`assert_alloc_count!`](crate::assert_alloc_count) for a bare
+/// count. Not a supported entry point.
+///
+/// A `since:` with the count forgotten is a compile error that names the two
+/// shapes it could have been, rather than "no rules expected the token":
+///
+/// ```compile_fail
+/// # #[global_allocator]
+/// # static ALLOC: heapscope::Alloc = heapscope::Alloc::system();
+/// # let _profiler = heapscope::Profiler::builder().no_output().build().unwrap();
+/// let mark = heapscope::HeapStats::get().unwrap();
+/// heapscope::assert_alloc_count!(since: mark);
+/// ```
 #[doc(hidden)]
 #[track_caller]
-pub fn __assert_alloc_count<N: TryInto<u64>>(expected: N, context: Option<fmt::Arguments<'_>>) {
-    report(
-        check_alloc_count(crate::engine(), as_count(expected)),
-        context,
-    );
+pub fn __assert_alloc_count<N: integer::Integer>(
+    since: Option<HeapStats>,
+    expected: N,
+    context: Option<fmt::Arguments<'_>>,
+) {
+    let expected = Expected::Exactly(as_count(expected));
+    report(check_alloc_count(crate::engine(), since, expected), context);
+}
+
+/// The body of [`assert_alloc_count!`](crate::assert_alloc_count) for a
+/// `<= ceiling`. Not a supported entry point.
+///
+/// A function of its own rather than a flag on [`__assert_alloc_count`], so
+/// that what the macro expands to says which comparison it is.
+#[doc(hidden)]
+#[track_caller]
+pub fn __assert_alloc_count_at_most<N: integer::Integer>(
+    since: Option<HeapStats>,
+    ceiling: N,
+    context: Option<fmt::Arguments<'_>>,
+) {
+    let expected = Expected::AtMost(as_count(ceiling));
+    report(check_alloc_count(crate::engine(), since, expected), context);
 }
 
 /// The body of [`assert_no_leaks!`](crate::assert_no_leaks). Not a supported
@@ -917,10 +1292,12 @@ pub fn __assert_no_leaks(since: Option<HeapStats>, context: Option<fmt::Argument
 /// a memory budget is actually about — a program that allocates a gigabyte one
 /// kilobyte at a time, freeing as it goes, has a peak of a kilobyte.
 ///
-/// Takes any integer that fits a `u64`, so a budget held in a `usize` works
-/// without a cast. A trailing message is formatted as [`format_args!`] and
-/// printed with the failure, which is worth using when the same assertion runs
-/// over several fixtures.
+/// Takes any integer that fits a `u64`, or the `NonZero` form of one, so a
+/// budget held in a `usize` works without a cast. Only integers: the bound was
+/// once `TryInto<u64>`, which let a `bool` or a `char` through as a budget of
+/// zero, one, or a code point. A trailing message is formatted as
+/// [`format_args!`] and printed with the failure, which is worth using when
+/// the same assertion runs over several fixtures.
 ///
 /// ```
 /// # #[global_allocator]
@@ -931,11 +1308,26 @@ pub fn __assert_no_leaks(since: Option<HeapStats>, context: Option<fmt::Argument
 /// heapscope::assert_max_bytes!(64 * 1024, "while parsing {fixture}");
 /// ```
 ///
+/// # There is no `since:` form
+///
+/// [`assert_no_leaks!`](crate::assert_no_leaks) and
+/// [`assert_alloc_count!`](crate::assert_alloc_count) take a mark and this does
+/// not, because a peak since a mark cannot always be read off two readings of a
+/// running maximum. Often it can. A run whose peak is still within the limit
+/// passes, whatever the stage did, and a peak that rose after the mark was set
+/// by the stage. What two readings cannot settle is a peak above the limit that
+/// was reached before the mark and has not moved since: the stage's own peak is
+/// then anywhere from what was live at the mark up to that figure, and neither
+/// reading says which. A form that passed, failed or refused depending on when
+/// the warm-up happened to peak would be harder to trust than no form at all.
+///
 /// # Panics
 ///
 /// When the peak exceeded `limit`, and when there are no numbers to check — see
 /// the [module documentation](crate::stats) for that list. It does **not** pass
-/// quietly in either case.
+/// quietly in either case. And when `limit` is negative, because a budget of
+/// `-1` read as `u64::MAX` could not fail, and when it is larger than
+/// `u64::MAX`.
 #[macro_export]
 macro_rules! assert_max_bytes {
     ($limit:expr $(,)?) => {
@@ -949,27 +1341,8 @@ macro_rules! assert_max_bytes {
     };
 }
 
-/// Fails unless the run made exactly `expected` allocations.
-///
-/// An equality rather than a ceiling, because the name says count and because
-/// the other reading has a failure mode this crate refuses elsewhere: a budget
-/// spelled `assert_alloc_count!(3)` would pass a run that allocated nothing,
-/// which is precisely how a broken test goes green. Write the ceiling out where
-/// that is what you mean:
-///
-/// ```
-/// # #[global_allocator]
-/// # static ALLOC: heapscope::Alloc = heapscope::Alloc::system();
-/// # let _profiler = heapscope::Profiler::builder().no_output().build().unwrap();
-/// assert!(heapscope::HeapStats::get().unwrap().total_blocks <= 3);
-/// ```
-///
-/// A reallocation counts as an allocation, so a `Vec` that grows four times made
-/// five. See [`HeapStats::total_blocks`].
-///
-/// Takes any integer that fits a `u64`, so `items.len()` works without a cast.
-/// A trailing message is formatted as [`format_args!`] and printed with the
-/// failure:
+/// Fails unless the run made exactly `expected` allocations, or, written
+/// `<= ceiling`, at most that many.
 ///
 /// ```
 /// # #[global_allocator]
@@ -978,19 +1351,151 @@ macro_rules! assert_max_bytes {
 /// # let _profiler = heapscope::Profiler::builder().no_output().build().unwrap();
 /// let rows = [Box::new(1u8), Box::new(2u8), Box::new(3u8)];   // three allocations
 /// # std::hint::black_box(&rows);
-/// heapscope::assert_alloc_count!(3, "while parsing {fixture}");
+/// heapscope::assert_alloc_count!(3);
+/// heapscope::assert_alloc_count!(<= 4, "while parsing {fixture}");
 /// ```
+///
+/// A reallocation counts as an allocation, so a `Vec` that grows four times made
+/// five. See [`HeapStats::total_blocks`].
+///
+/// Takes any integer that fits a `u64`, or the `NonZero` form of one, so
+/// `items.len()` works without a cast. Only integers: the bound was once
+/// `TryInto<u64>`, which let a `bool` or a `char` through, so a comparison
+/// written where the count belongs, `assert_alloc_count!(used <= 4)`, ran as a
+/// count of zero or one. It is a type error now. Every form takes a trailing message, formatted as
+/// [`format_args!`] and printed with the failure, which is worth using when
+/// the same assertion runs over several fixtures.
+///
+/// # A bare count is an equality
+///
+/// `assert_alloc_count!(3)` means exactly three, not at most three. A ceiling
+/// read into a bare number has a failure mode this crate refuses elsewhere: it
+/// passes a run that allocated nothing, which is precisely how a broken test
+/// goes green, and nothing at the call site says that it would. Spelled
+/// `<= 3`, the ceiling is the reading written down, and a reviewer can see that
+/// zero passes it. The objection was never to ceilings; it was to a permission
+/// nobody could see.
+///
+/// # Since a mark
+///
+/// The bare forms count from when the profiler started, which in a test binary
+/// includes whatever the harness and any warm-up allocated. A budget for one
+/// stage counts from a [`HeapStats`] read immediately before it instead:
+///
+/// ```
+/// # #[global_allocator]
+/// # static ALLOC: heapscope::Alloc = heapscope::Alloc::system();
+/// # fn warm_up() -> Vec<u8> { Vec::with_capacity(4_096) }
+/// # let name = "parser";
+/// # let _profiler = heapscope::Profiler::builder().no_output().build().unwrap();
+/// let cache = warm_up();
+/// # std::hint::black_box(&cache);
+/// let mark = heapscope::HeapStats::get().unwrap();
+/// let rows = [Box::new(1u8), Box::new(2u8), Box::new(3u8)];   // three allocations
+/// # std::hint::black_box(&rows);
+/// heapscope::assert_alloc_count!(since: mark, 3);
+/// heapscope::assert_alloc_count!(since: mark, <= 4, "while compiling {name}");
+/// ```
+///
+/// [`total_blocks`](HeapStats::total_blocks) only grows, so the count since a
+/// mark is the difference between two readings of that one counter: every
+/// allocation made in between, and nothing else. A mark *ahead* of the reading
+/// therefore did not come unchanged from the counters being read, and the count
+/// since it is not zero but unknown, so the assertion fails rather than guess.
+/// A zero would pass every ceiling.
+///
+/// It is a difference over the whole process, as
+/// [`assert_no_leaks!`](crate::assert_no_leaks)`(since: ..)` is, so an
+/// allocation made by another thread during the stage is counted into it. So is
+/// one made by the assertion's own arguments: the count, the mark and the
+/// message's arguments are all evaluated before the counters are read, whether
+/// or not the assertion fails, so `"{}", path.display().to_string()` adds an
+/// allocation to the stage it is describing. A name captured by the format
+/// string, as `{name}` is above, is only formatted on failure and costs a
+/// passing assertion nothing.
+///
+/// The profile a failure writes still covers the whole run, because a mark
+/// holds the run's totals and nothing per program point; the failure says so,
+/// so that a site that allocated during the warm-up is not read as the stage's
+/// cost. What it can do is rank the sites by how many allocations they made
+/// rather than by bytes, which it does for every failing count, so that a
+/// stage of many small allocations is not listed under one large buffer.
 ///
 /// # Panics
 ///
-/// When the count differs, and when there are no numbers to check.
+/// When the count differs or exceeds the ceiling, when the mark is ahead of the
+/// run, and when there are no numbers to check. And when the count or ceiling
+/// is negative or larger than `u64::MAX`, because a ceiling of `-1` read as
+/// `u64::MAX` could not fail.
 #[macro_export]
 macro_rules! assert_alloc_count {
+    // The `since:` and `<=` arms come first, and neither can capture a call
+    // site that meant a bare count. `<=` cannot begin an expression, so a bare
+    // count never matches a `<=` arm; `since` can, but only followed by `:`,
+    // which no expression is — `since::N` is one `::` token, not two `:` — so
+    // a bare count that happens to be a variable named `since` falls through
+    // to the arms below.
+    (since: $mark:expr, <= $ceiling:expr $(,)?) => {
+        $crate::__assert_alloc_count_at_most(
+            ::core::option::Option::Some($mark),
+            $ceiling,
+            ::core::option::Option::None,
+        )
+    };
+    (since: $mark:expr, <= $ceiling:expr, $($arg:tt)+) => {
+        $crate::__assert_alloc_count_at_most(
+            ::core::option::Option::Some($mark),
+            $ceiling,
+            ::core::option::Option::Some(::core::format_args!($($arg)+)),
+        )
+    };
+    (since: $mark:expr, $expected:expr $(,)?) => {
+        $crate::__assert_alloc_count(
+            ::core::option::Option::Some($mark),
+            $expected,
+            ::core::option::Option::None,
+        )
+    };
+    (since: $mark:expr, $expected:expr, $($arg:tt)+) => {
+        $crate::__assert_alloc_count(
+            ::core::option::Option::Some($mark),
+            $expected,
+            ::core::option::Option::Some(::core::format_args!($($arg)+)),
+        )
+    };
+    // Anything else after `since:` is a mistake, the likeliest being a count
+    // left out. Without this it falls through to the bare arms and is reported
+    // as "no rules expected `:`", which names neither the problem nor the fix.
+    (since: $($rest:tt)*) => {
+        ::core::compile_error!(
+            "assert_alloc_count! takes a count after the mark: \
+             `since: mark, n` for exactly n, or `since: mark, <= n` for at most n"
+        )
+    };
+    (<= $ceiling:expr $(,)?) => {
+        $crate::__assert_alloc_count_at_most(
+            ::core::option::Option::None,
+            $ceiling,
+            ::core::option::Option::None,
+        )
+    };
+    (<= $ceiling:expr, $($arg:tt)+) => {
+        $crate::__assert_alloc_count_at_most(
+            ::core::option::Option::None,
+            $ceiling,
+            ::core::option::Option::Some(::core::format_args!($($arg)+)),
+        )
+    };
     ($expected:expr $(,)?) => {
-        $crate::__assert_alloc_count($expected, ::core::option::Option::None)
+        $crate::__assert_alloc_count(
+            ::core::option::Option::None,
+            $expected,
+            ::core::option::Option::None,
+        )
     };
     ($expected:expr, $($arg:tt)+) => {
         $crate::__assert_alloc_count(
+            ::core::option::Option::None,
             $expected,
             ::core::option::Option::Some(::core::format_args!($($arg)+)),
         )
@@ -1392,27 +1897,27 @@ mod tests {
         let _serial = serialized();
         let engine = distinct_figures();
 
-        assert_eq!(check_alloc_count(&engine, 4), Ok(()));
         assert_eq!(
-            check_alloc_count(&engine, 5),
-            Err(Complaint::WrongCount {
-                counted: 4,
-                expected: 5
-            })
+            check_alloc_count(&engine, None, Expected::Exactly(4)),
+            Ok(())
         );
-        assert_eq!(
-            check_alloc_count(&engine, 3),
-            Err(Complaint::WrongCount {
-                counted: 4,
-                expected: 3
-            })
-        );
+        for wrong in [5, 3, 0] {
+            assert_eq!(
+                check_alloc_count(&engine, None, Expected::Exactly(wrong)),
+                Err(Complaint::WrongCount {
+                    counted: 4,
+                    expected: wrong,
+                    scope: Scope::WholeRun
+                })
+            );
+        }
     }
 
     /// Allocations ever made, not blocks still live. On this run those are 4
     /// and 2, so a check reading the live figure would pass `2` — which is the
     /// "passes a run that allocated nothing" failure the equality exists to
-    /// prevent, one column over.
+    /// prevent, one column over. The ceiling reads the same column, and a
+    /// ceiling of `2` is where reading the wrong one would pass.
     #[test]
     fn the_count_is_of_allocations_rather_than_of_live_blocks() {
         let _serial = serialized();
@@ -1420,8 +1925,163 @@ mod tests {
         let stats = HeapStats::of(&engine).unwrap();
         assert!(stats.total_blocks > stats.curr_blocks);
 
-        assert_eq!(check_alloc_count(&engine, stats.total_blocks), Ok(()));
-        assert!(check_alloc_count(&engine, stats.curr_blocks).is_err());
+        assert_eq!(
+            check_alloc_count(&engine, None, Expected::Exactly(stats.total_blocks)),
+            Ok(())
+        );
+        assert!(check_alloc_count(&engine, None, Expected::Exactly(stats.curr_blocks)).is_err());
+        assert!(check_alloc_count(&engine, None, Expected::AtMost(stats.curr_blocks)).is_err());
+    }
+
+    /// A ceiling admits its own value and everything under it, and nothing
+    /// over. Pinned at the edge, because `<` for `<=` is the mutation a
+    /// ceiling invites and only the edge can see it.
+    #[test]
+    fn the_ceiling_passes_at_and_under_it_and_fails_above_it() {
+        let _serial = serialized();
+        let engine = distinct_figures();
+
+        for ceiling in [4, 5, u64::MAX] {
+            assert_eq!(
+                check_alloc_count(&engine, None, Expected::AtMost(ceiling)),
+                Ok(()),
+                "a ceiling of {ceiling} refused 4 allocations"
+            );
+        }
+        for ceiling in [3, 0] {
+            assert_eq!(
+                check_alloc_count(&engine, None, Expected::AtMost(ceiling)),
+                Err(Complaint::OverCeiling {
+                    counted: 4,
+                    ceiling,
+                    scope: Scope::WholeRun
+                })
+            );
+        }
+    }
+
+    /// The count since a mark is what the run made after it, in both forms, and
+    /// a complaint about it says that it was counted from the mark.
+    #[test]
+    fn a_mark_counts_only_what_followed_it() {
+        let _serial = serialized();
+        let engine = engine(Mode::Heap);
+        record(&engine, 0x100, 64);
+        record(&engine, 0x200, 64);
+        let mark = HeapStats::of(&engine).unwrap();
+
+        // Nothing made since: the reading equals the mark, which is a count of
+        // zero rather than a mark ahead of the run.
+        assert_eq!(
+            check_alloc_count(&engine, Some(mark), Expected::Exactly(0)),
+            Ok(())
+        );
+        assert_eq!(
+            check_alloc_count(&engine, Some(mark), Expected::AtMost(0)),
+            Ok(())
+        );
+
+        record(&engine, 0x300, 64);
+        record(&engine, 0x400, 64);
+        record(&engine, 0x500, 64);
+        assert_eq!(
+            check_alloc_count(&engine, Some(mark), Expected::Exactly(3)),
+            Ok(())
+        );
+        assert_eq!(
+            check_alloc_count(&engine, Some(mark), Expected::AtMost(3)),
+            Ok(())
+        );
+        // Five is the whole run's count, so passing it would mean the mark was
+        // ignored.
+        assert_eq!(
+            check_alloc_count(&engine, Some(mark), Expected::Exactly(5)),
+            Err(Complaint::WrongCount {
+                counted: 3,
+                expected: 5,
+                scope: Scope::SinceMark
+            })
+        );
+        assert_eq!(
+            check_alloc_count(&engine, Some(mark), Expected::AtMost(2)),
+            Err(Complaint::OverCeiling {
+                counted: 3,
+                ceiling: 2,
+                scope: Scope::SinceMark
+            })
+        );
+        assert_eq!(
+            check_alloc_count(&engine, None, Expected::Exactly(5)),
+            Ok(())
+        );
+    }
+
+    /// Allocations made since the mark, not the change in live blocks. Each
+    /// block made after the mark here is freed before the reading, so the live
+    /// figure is back where it started and a check reading it would find
+    /// nothing — passing `since: mark, 0` on a stage that allocated twice.
+    #[test]
+    fn a_mark_counts_allocations_rather_than_the_change_in_live_blocks() {
+        let _serial = serialized();
+        let engine = engine(Mode::Heap);
+        record(&engine, 0x100, 64);
+        let mark = HeapStats::of(&engine).unwrap();
+        record(&engine, 0x200, 32);
+        engine.record_free(0x200, 32);
+        record(&engine, 0x300, 32);
+        engine.record_free(0x300, 32);
+        assert_eq!(
+            HeapStats::of(&engine).unwrap().curr_blocks,
+            mark.curr_blocks
+        );
+
+        assert_eq!(
+            check_alloc_count(&engine, Some(mark), Expected::Exactly(2)),
+            Ok(())
+        );
+        assert!(check_alloc_count(&engine, Some(mark), Expected::Exactly(0)).is_err());
+        assert_eq!(
+            check_alloc_count(&engine, Some(mark), Expected::AtMost(1)),
+            Err(Complaint::OverCeiling {
+                counted: 2,
+                ceiling: 1,
+                scope: Scope::SinceMark
+            })
+        );
+    }
+
+    /// A mark ahead of the reading did not come from the counters being read,
+    /// so the count since it is unknown. Refused, not saturated to zero — zero
+    /// would pass `since: mark, 0` and every ceiling — and refused before any
+    /// comparison is made, which the widest ceiling there is shows.
+    ///
+    /// Two engines stand in for two runs, which one process cannot otherwise
+    /// produce: that is the only way to reach this, and why it is checked here
+    /// rather than through the macro.
+    #[test]
+    fn a_mark_ahead_of_the_run_is_refused_rather_than_saturated() {
+        let _serial = serialized();
+        let earlier = engine(Mode::Heap);
+        for address in [0x100, 0x200, 0x300, 0x400, 0x500] {
+            record(&earlier, address, 16);
+        }
+        let mark = HeapStats::of(&earlier).unwrap();
+        let later = engine(Mode::Heap);
+        record(&later, 0x100, 16);
+        record(&later, 0x200, 16);
+
+        for expected in [
+            Expected::Exactly(0),
+            Expected::Exactly(3),
+            Expected::AtMost(0),
+            Expected::AtMost(u64::MAX),
+        ] {
+            assert_eq!(
+                check_alloc_count(&later, Some(mark), expected),
+                Err(Complaint::MarkAhead { mark: 5, now: 2 }),
+                "{expected:?}"
+            );
+        }
     }
 
     #[test]
@@ -1522,7 +2182,7 @@ mod tests {
             }
         );
         let message = complaint.to_string();
-        assert!(message.contains("1 more blocks are live"), "{message}");
+        assert!(message.contains("1 more block is live"), "{message}");
         assert!(message.contains("65,536"), "{message}");
         assert!(message.contains("16"), "{message}");
         assert!(
@@ -1555,7 +2215,15 @@ mod tests {
             dropped_blocks: dropped,
         });
         assert_eq!(check_max_bytes(&engine, u64::MAX), incomplete);
-        assert_eq!(check_alloc_count(&engine, 0), incomplete);
+        // Every form of the count, and the widest ceiling from a mark equal to
+        // the reading in particular: that one passes unless the gate comes
+        // before the arithmetic.
+        let mark = HeapStats::of(&engine).unwrap();
+        for since in [None, Some(mark)] {
+            for expected in [Expected::Exactly(0), Expected::AtMost(u64::MAX)] {
+                assert_eq!(check_alloc_count(&engine, since, expected), incomplete);
+            }
+        }
         assert_eq!(check_no_leaks(&engine, None), incomplete);
         // `assert_baseline!` goes through the same gate, and used to not: it
         // called `HeapStats::of` directly, so the one assertion aimed at CI
@@ -1591,7 +2259,11 @@ mod tests {
             Err(Complaint::Unavailable(StatsError::Sampled))
         );
         assert_eq!(
-            check_alloc_count(&heap, 0),
+            check_alloc_count(&heap, None, Expected::Exactly(0)),
+            Err(Complaint::Unavailable(StatsError::Sampled))
+        );
+        assert_eq!(
+            check_alloc_count(&heap, None, Expected::AtMost(u64::MAX)),
             Err(Complaint::Unavailable(StatsError::Sampled))
         );
         assert_eq!(
@@ -1671,7 +2343,7 @@ mod tests {
         let guard = crate::internals::guard::enter().expect("not inside the profiler");
 
         let mut summary = Vec::new();
-        let line = dump(&engine, &guard, &path, &mut summary);
+        let line = dump(&engine, &guard, &path, Ranking::Bytes, &mut summary);
         drop(guard);
 
         let summary = String::from_utf8(summary).expect("the summary is text");
@@ -1703,7 +2375,7 @@ mod tests {
         let path = directory.path().join("no-such-directory").join("p.json");
         let guard = crate::internals::guard::enter().expect("not inside the profiler");
 
-        let line = dump(&engine, &guard, &path, &mut Vec::new());
+        let line = dump(&engine, &guard, &path, Ranking::Bytes, &mut Vec::new());
         drop(guard);
 
         assert!(line.contains("could not write a profile"), "{line}");
@@ -1721,7 +2393,7 @@ mod tests {
         let path = directory.path().join("run\u{1b}[2Kmasked.json");
         let guard = crate::internals::guard::enter().expect("not inside the profiler");
 
-        let line = dump(&engine, &guard, &path, &mut Vec::new());
+        let line = dump(&engine, &guard, &path, Ranking::Bytes, &mut Vec::new());
         drop(guard);
 
         assert!(!line.contains('\u{1b}'), "{line}");
@@ -1850,12 +2522,46 @@ mod tests {
         as_count(-1i64);
     }
 
+    /// The other way a value does not fit, which only the 128-bit types reach.
+    #[test]
+    #[should_panic(expected = "not a byte count")]
+    fn an_oversized_limit_is_refused_rather_than_truncated() {
+        as_count(u128::from(u64::MAX) + 1);
+    }
+
     #[test]
     fn a_limit_can_be_any_of_the_integer_types_a_call_site_has() {
-        assert_eq!(as_count(64usize), 64);
+        assert_eq!(as_count(64u8), 64);
+        assert_eq!(as_count(64u16), 64);
         assert_eq!(as_count(64u32), 64);
         assert_eq!(as_count(64u64), 64);
+        assert_eq!(as_count(64u128), 64);
+        assert_eq!(as_count(64usize), 64);
+        assert_eq!(as_count(64i8), 64);
+        assert_eq!(as_count(64i16), 64);
         assert_eq!(as_count(64i32), 64);
+        assert_eq!(as_count(64i64), 64);
+        assert_eq!(as_count(64i128), 64);
+        assert_eq!(as_count(64isize), 64);
+        assert_eq!(as_count(u64::MAX), u64::MAX);
+    }
+
+    /// `NonZeroU64` satisfied the old `TryInto<u64>` bound, so a budget held
+    /// in one has to keep compiling; the other widths come with it, and a
+    /// negative one is refused like the integer it wraps.
+    #[test]
+    fn a_limit_can_be_a_non_zero_integer() {
+        use std::num::NonZero;
+        assert_eq!(as_count(NonZero::<u64>::MAX), u64::MAX);
+        assert_eq!(as_count(NonZero::new(64usize).unwrap()), 64);
+        assert_eq!(as_count(NonZero::new(64i8).unwrap()), 64);
+        assert_eq!(as_count(NonZero::new(64u128).unwrap()), 64);
+    }
+
+    #[test]
+    #[should_panic(expected = "not a byte count")]
+    fn a_negative_non_zero_limit_is_refused() {
+        as_count(std::num::NonZero::new(-1i32).unwrap());
     }
 
     /// Every complaint has to read as a sentence naming both numbers, because it
@@ -1877,9 +2583,61 @@ mod tests {
         let wrong = Complaint::WrongCount {
             counted: 5,
             expected: 3,
+            scope: Scope::WholeRun,
         }
         .to_string();
         assert!(wrong.contains("5 allocations were made, not 3"), "{wrong}");
+
+        // A count since a mark has to say so, or a stage's count reads as the
+        // whole run's and the reader goes looking for allocations that were
+        // never in it.
+        let staged = Complaint::WrongCount {
+            counted: 5,
+            expected: 3,
+            scope: Scope::SinceMark,
+        }
+        .to_string();
+        assert!(
+            staged.contains("5 allocations were made since the mark, not 3"),
+            "{staged}"
+        );
+
+        let ceiling = Complaint::OverCeiling {
+            counted: 7,
+            ceiling: 4,
+            scope: Scope::WholeRun,
+        }
+        .to_string();
+        assert!(
+            ceiling.contains("7 allocations were made, above the ceiling of 4"),
+            "{ceiling}"
+        );
+        let staged_ceiling = Complaint::OverCeiling {
+            counted: 1_234,
+            ceiling: 4,
+            scope: Scope::SinceMark,
+        }
+        .to_string();
+        assert!(
+            staged_ceiling
+                .contains("1,234 allocations were made since the mark, above the ceiling of 4"),
+            "{staged_ceiling}"
+        );
+
+        let ahead = Complaint::MarkAhead {
+            mark: 1_000,
+            now: 900,
+        }
+        .to_string();
+        assert!(ahead.contains("records 1,000 allocations"), "{ahead}");
+        assert!(ahead.contains("this run has made 900"), "{ahead}");
+        assert!(
+            ahead.contains("HeapStats::get()"),
+            "a refusal has to name the remedy: {ahead}"
+        );
+        // The numbers cannot say whether the mark came from another run or
+        // was edited after it was read, so the message must not pick one.
+        assert!(!ahead.contains("was not taken from"), "{ahead}");
 
         let leaked = Complaint::Leaked {
             blocks: 2,
@@ -1887,12 +2645,24 @@ mod tests {
             mark_bytes: None,
         }
         .to_string();
-        assert!(leaked.contains("2 blocks"), "{leaked}");
-        assert!(leaked.contains("96 bytes"), "{leaked}");
+        assert!(
+            leaked.contains("2 blocks totalling 96 bytes were never freed"),
+            "{leaked}"
+        );
         assert!(
             leaked.contains("since: mark"),
             "the likeliest cause of this is an assertion written without a \
              mark, so it has to name that: {leaked}"
+        );
+        let staged_leak = Complaint::Leaked {
+            blocks: 2,
+            live_bytes: 96,
+            mark_bytes: Some(64),
+        }
+        .to_string();
+        assert!(
+            staged_leak.contains("2 more blocks are live than at the mark"),
+            "{staged_leak}"
         );
 
         let incomplete = Complaint::Incomplete { dropped_blocks: 7 }.to_string();
@@ -1904,6 +2674,189 @@ mod tests {
 
         let unavailable = Complaint::Unavailable(StatsError::NotRecording).to_string();
         assert!(unavailable.contains("start one"), "{unavailable}");
+    }
+
+    /// One of anything is singular, and so is its verb. Checked for every
+    /// complaint that puts a noun beside a number that can be one, because
+    /// each builds its sentence separately and fixing one fixes none of the
+    /// others.
+    #[test]
+    fn a_count_of_one_reads_as_one() {
+        let sentences = [
+            (
+                Complaint::WrongCount {
+                    counted: 1,
+                    expected: 0,
+                    scope: Scope::SinceMark,
+                },
+                "1 allocation was made since the mark, not 0",
+            ),
+            (
+                Complaint::WrongCount {
+                    counted: 1,
+                    expected: 2,
+                    scope: Scope::WholeRun,
+                },
+                "1 allocation was made, not 2",
+            ),
+            (
+                Complaint::OverCeiling {
+                    counted: 1,
+                    ceiling: 0,
+                    scope: Scope::WholeRun,
+                },
+                "1 allocation was made, above the ceiling of 0",
+            ),
+            (
+                Complaint::MarkAhead { mark: 1, now: 0 },
+                "the mark records 1 allocation but this run has made 0",
+            ),
+            (
+                Complaint::Leaked {
+                    blocks: 1,
+                    live_bytes: 1,
+                    mark_bytes: None,
+                },
+                "1 block totalling 1 byte was never freed",
+            ),
+            (
+                Complaint::Leaked {
+                    blocks: 1,
+                    live_bytes: 16,
+                    mark_bytes: Some(8),
+                },
+                "1 more block is live than at the mark",
+            ),
+        ];
+        for (complaint, sentence) in sentences {
+            let message = complaint.to_string();
+            assert!(message.contains(sentence), "{message}");
+        }
+
+        // Zero is plural in English, which is the one case a `> 1` test gets
+        // wrong.
+        let none = Complaint::OverCeiling {
+            counted: 0,
+            ceiling: 0,
+            scope: Scope::WholeRun,
+        }
+        .to_string();
+        assert!(none.contains("0 allocations were made"), "{none}");
+    }
+
+    /// The note that a profile covers the whole run belongs to a measurement
+    /// made since a mark, and to nothing else: not to a whole-run failure,
+    /// where it would teach readers to skip it, and not to a refusal, which
+    /// measured nothing. `MarkAhead` is the case that matters, because it
+    /// comes only from a `since:` assertion and is about the mark rather than
+    /// about anything after it.
+    #[test]
+    fn only_a_measurement_since_a_mark_qualifies_its_profile() {
+        let since_a_mark = [
+            Complaint::WrongCount {
+                counted: 2,
+                expected: 1,
+                scope: Scope::SinceMark,
+            },
+            Complaint::OverCeiling {
+                counted: 2,
+                ceiling: 1,
+                scope: Scope::SinceMark,
+            },
+            Complaint::Leaked {
+                blocks: 1,
+                live_bytes: 8,
+                mark_bytes: Some(0),
+            },
+        ];
+        for complaint in since_a_mark {
+            assert_eq!(complaint.scope(), Scope::SinceMark, "{complaint:?}");
+        }
+
+        let whole_run = [
+            Complaint::MarkAhead { mark: 5, now: 2 },
+            Complaint::Unavailable(StatsError::Sampled),
+            Complaint::Incomplete { dropped_blocks: 1 },
+            Complaint::OverBudget { peak: 2, limit: 1 },
+            Complaint::WrongCount {
+                counted: 2,
+                expected: 1,
+                scope: Scope::WholeRun,
+            },
+            Complaint::Leaked {
+                blocks: 1,
+                live_bytes: 8,
+                mark_bytes: None,
+            },
+        ];
+        for complaint in whole_run {
+            assert_eq!(complaint.scope(), Scope::WholeRun, "{complaint:?}");
+        }
+    }
+
+    /// A failing count lists the sites that made the most allocations; every
+    /// other failure lists the sites that allocated the most bytes.
+    #[test]
+    fn a_failing_count_ranks_its_sites_by_allocations() {
+        for scope in [Scope::WholeRun, Scope::SinceMark] {
+            let wrong = Complaint::WrongCount {
+                counted: 2,
+                expected: 1,
+                scope,
+            };
+            let over = Complaint::OverCeiling {
+                counted: 2,
+                ceiling: 1,
+                scope,
+            };
+            assert_eq!(wrong.ranking(), Ranking::Blocks);
+            assert_eq!(over.ranking(), Ranking::Blocks);
+        }
+        for complaint in [
+            Complaint::OverBudget { peak: 2, limit: 1 },
+            Complaint::MarkAhead { mark: 5, now: 2 },
+            Complaint::Leaked {
+                blocks: 1,
+                live_bytes: 8,
+                mark_bytes: Some(0),
+            },
+        ] {
+            assert_eq!(complaint.ranking(), Ranking::Bytes, "{complaint:?}");
+        }
+    }
+
+    /// A ranking chosen by the complaint has to reach the summary a failure
+    /// prints, or choosing it changes nothing a reader sees.
+    #[test]
+    #[cfg_attr(miri, ignore = "writes a profile, and Miri has no filesystem")]
+    fn a_dump_ranks_its_summary_as_asked() {
+        let _serial = serialized();
+        let engine = distinct_figures();
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let guard = crate::internals::guard::enter().expect("not inside the profiler");
+
+        let mut by_blocks = Vec::new();
+        dump(
+            &engine,
+            &guard,
+            &directory.path().join("blocks.json"),
+            Ranking::Blocks,
+            &mut by_blocks,
+        );
+        let mut by_bytes = Vec::new();
+        dump(
+            &engine,
+            &guard,
+            &directory.path().join("bytes.json"),
+            Ranking::Bytes,
+            &mut by_bytes,
+        );
+        drop(guard);
+
+        let by_blocks = String::from_utf8(by_blocks).expect("the summary is text");
+        let by_bytes = String::from_utf8(by_bytes).expect("the summary is text");
+        assert!(by_blocks.contains("by blocks allocated"), "{by_blocks}");
+        assert!(by_bytes.contains("by bytes allocated"), "{by_bytes}");
     }
 
     /// Asking a heap run for event statistics is a mistake in the test, and the

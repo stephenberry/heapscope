@@ -405,6 +405,11 @@ enum Failure {
     },
 }
 
+/// A baseline is compared over the whole run, and a regression can be in any
+/// of its six figures, so neither the scope nor the ranking departs from the
+/// defaults. `Stats` is a refusal, which measured nothing to qualify.
+impl crate::stats::AssertionFailure for Failure {}
+
 impl fmt::Display for Failure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

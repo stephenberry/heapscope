@@ -26,7 +26,7 @@
 //! claimed it was all of it. A failing assertion also writes a program-point
 //! summary straight to file descriptor 2, which no panic hook and no test
 //! harness intercepts: a green run of this file printed 57 lines of profile.
-//! So dumping is **off by default here** and switched on only around the two
+//! So dumping is **off by default here** and switched on only around the
 //! failures that are about the dump. That also keeps the ordinals predictable,
 //! because a dump that is turned off never claims one.
 
@@ -148,10 +148,21 @@ fn the_testing_api_gates_a_real_program() {
     );
     assert_eq!(after.dropped_blocks, 0, "the ceiling was reached");
 
-    // ---- an exact count, written against a mark, is the usable form ----
+    // ---- a bare count is an exact count of the whole run ----
     heapscope::assert_alloc_count!(mark.total_blocks + 1);
     let wrong = failure_message(|| heapscope::assert_alloc_count!(mark.total_blocks));
-    assert!(wrong.contains("allocations were made, not"), "{wrong}");
+    // Built from the mark rather than written out, because what the harness
+    // allocated before it is not this test's to know; and through
+    // `allocations_made`, because in practice it allocated nothing, so the
+    // count is one and the sentence is singular.
+    assert!(
+        wrong.contains(&format!(
+            "{}, not {}",
+            allocations_made(mark.total_blocks + 1),
+            thousands(mark.total_blocks)
+        )),
+        "{wrong}"
+    );
 
     // A `usize` is what a call site has — `items.len()`, a budget computed from
     // a size — and a macro taking `u64` rejects every one of them. Read fresh:
@@ -159,12 +170,120 @@ fn the_testing_api_gates_a_real_program() {
     let counted = HeapStats::get().unwrap().total_blocks as usize;
     heapscope::assert_alloc_count!(counted);
     heapscope::assert_max_bytes!(usize::MAX);
+    // `NonZeroU64` met the bound these macros used to have, so it has to meet
+    // the narrower one too.
+    heapscope::assert_max_bytes!(std::num::NonZeroU64::MAX);
 
     // Each macro's trailing message, exercised once. Only `assert_max_bytes!`
     // had a test, so the wiring in the other two could be deleted rule by rule
     // with everything green.
     let annotated = failure_message(|| heapscope::assert_alloc_count!(0, "fixture {}", 7));
     assert!(annotated.contains("fixture 7"), "{annotated}");
+    assert!(annotated.contains(" made, not 0"), "{annotated}");
+
+    // ---- every form of the count, through the macro ----
+    // Each arm is its own expansion, so each is exercised passing, with a
+    // trailing comma and with a message: a rule miswired to the wrong body, or
+    // a `since:` arm swallowing a bare count, would otherwise compile and pass.
+    // Every ceiling arm passes at least once strictly *under* its ceiling,
+    // because a ceiling arm wired to the equality passes at the ceiling.
+    // One allocation is made after the mark, and nothing after it allocates
+    // before the assertions do, because a passing assertion allocates nothing.
+    let stage = HeapStats::get().unwrap();
+    let staged = one_block();
+    let whole = HeapStats::get().unwrap().total_blocks;
+    let one = [0u8];
+    heapscope::assert_alloc_count!(since: stage, 1);
+    heapscope::assert_alloc_count!(since: stage, 1,);
+    heapscope::assert_alloc_count!(since: stage, one.len());
+    heapscope::assert_alloc_count!(since: stage, 1, "stage {}", 1);
+    heapscope::assert_alloc_count!(since: stage, <= 1);
+    heapscope::assert_alloc_count!(since: stage, <= 2,);
+    heapscope::assert_alloc_count!(since: stage, <= one.len());
+    heapscope::assert_alloc_count!(since: stage, <= 1, "stage {}", 1,);
+    heapscope::assert_alloc_count!(since: stage, <= 2, "stage {}", 1);
+    heapscope::assert_alloc_count!(<= whole);
+    heapscope::assert_alloc_count!(<= whole,);
+    heapscope::assert_alloc_count!(<= whole + 1);
+    heapscope::assert_alloc_count!(<= whole as usize);
+    heapscope::assert_alloc_count!(<= whole, "whole run {}", 1);
+    heapscope::assert_alloc_count!(<= whole + 1, "whole run {}", 1);
+    heapscope::assert_alloc_count!(whole,);
+    // A count held in a variable named `since` is still a bare count. The
+    // `since:` arms need the colon after it, and no expression has one there.
+    let since = whole;
+    heapscope::assert_alloc_count!(since);
+    heapscope::assert_alloc_count!(since, "counted {}", "since");
+
+    // And failing, with what was counted and from where. Each is read fresh,
+    // because the message `failure_message` copies out is an allocation the
+    // next count includes.
+    // Exactly one so far, which is also the case the grammar has to get right.
+    let made = HeapStats::get().unwrap().total_blocks - stage.total_blocks;
+    assert_eq!(made, 1, "something allocated between the stage and here");
+    let wrong_since = failure_message(|| heapscope::assert_alloc_count!(since: stage, 0));
+    assert!(
+        wrong_since.contains("1 allocation was made since the mark, not 0"),
+        "{wrong_since}"
+    );
+    let made = HeapStats::get().unwrap().total_blocks - stage.total_blocks;
+    let over_since = failure_message(
+        || heapscope::assert_alloc_count!(since: stage, <= 0, "while compiling {}", "stage-7"),
+    );
+    assert!(
+        over_since.contains(&format!(
+            "{} since the mark, above the ceiling of 0",
+            allocations_made(made)
+        )),
+        "{over_since}"
+    );
+    assert!(
+        over_since.contains("while compiling stage-7"),
+        "{over_since}"
+    );
+    let made = HeapStats::get().unwrap().total_blocks;
+    let over_run = failure_message(|| heapscope::assert_alloc_count!(<= 0));
+    assert!(
+        over_run.contains(&format!(
+            "{}, above the ceiling of 0",
+            allocations_made(made)
+        )),
+        "{over_run}"
+    );
+    // The wording as well as the message, because the message alone is the
+    // same whichever body the arm calls.
+    let annotated = failure_message(|| heapscope::assert_alloc_count!(<= 0, "fixture {}", 8));
+    assert!(annotated.contains("fixture 8"), "{annotated}");
+    assert!(annotated.contains("above the ceiling of 0"), "{annotated}");
+    let annotated =
+        failure_message(|| heapscope::assert_alloc_count!(since: stage, 0, "fixture {}", 9));
+    assert!(annotated.contains("fixture 9"), "{annotated}");
+    assert!(annotated.contains("since the mark, not 0"), "{annotated}");
+
+    // A mark ahead of the run is refused, through the macro, even against the
+    // widest ceiling there is. The fields are public, so a mark can be edited
+    // after it is read, and that is all it takes; zero would pass this.
+    let mut edited = HeapStats::get().unwrap();
+    edited.total_blocks += 1_000;
+    let ahead = failure_message(|| heapscope::assert_alloc_count!(since: edited, <= u64::MAX));
+    assert!(ahead.contains("the mark records"), "{ahead}");
+    assert!(ahead.contains("cannot be known"), "{ahead}");
+    // The note about the profile's scope belongs to a profile, and dumping is
+    // off here.
+    assert!(!over_since.contains("whole run"), "{over_since}");
+
+    // A negative count or ceiling is refused in every form. Converted, `-1`
+    // would be `u64::MAX`, a ceiling that cannot fail.
+    for refused in [
+        failure_message(|| heapscope::assert_alloc_count!(<= -1)),
+        failure_message(|| heapscope::assert_alloc_count!(since: stage, <= -1)),
+        failure_message(|| heapscope::assert_alloc_count!(since: stage, -1)),
+    ] {
+        assert!(
+            refused.contains("not a byte count or an allocation count"),
+            "{refused}"
+        );
+    }
 
     // ---- a budget is about the peak, and survives the memory being freed ----
     let held = hold(256 * 1024);
@@ -180,12 +299,30 @@ fn the_testing_api_gates_a_real_program() {
 
     heapscope::assert_max_bytes!(peak);
 
-    // Dumping on for exactly these two failures. Everything else in this file
+    // Dumping on for exactly these failures. Everything else in this file
     // fails with it off, which is what keeps a green run quiet.
     std::env::set_var(heapscope::stats::DUMP_VARIABLE, &dumps);
     let first = failure_message(|| heapscope::assert_alloc_count!(0));
     let over = failure_message(|| heapscope::assert_max_bytes!(peak - 1));
+    // `staged` is still live, so both fail.
+    let staged_count = failure_message(|| heapscope::assert_alloc_count!(since: stage, <= 0));
+    let staged_leak = failure_message(|| heapscope::assert_no_leaks!(since: stage));
     std::env::set_var(heapscope::stats::DUMP_VARIABLE, "off");
+    drop(staged);
+
+    // ---- a failure since a mark says its profile covers the whole run ----
+    // A mark holds totals and no program points, so the profile cannot be
+    // narrowed to the interval; what it can be is labelled. Whole-run failures
+    // have nothing to qualify, and saying it there too would teach readers to
+    // skip it.
+    const WHOLE_RUN: &str = "cover the whole run, not only what followed the mark";
+    for message in [&staged_count, &staged_leak] {
+        assert!(message.contains("profile written to"), "{message}");
+        assert!(message.contains(WHOLE_RUN), "{message}");
+    }
+    for whole_run in [&first, &over] {
+        assert!(!whole_run.contains(WHOLE_RUN), "{whole_run}");
+    }
 
     assert!(over.contains("peak live bytes reached"), "{over}");
     assert!(
@@ -218,8 +355,17 @@ fn the_testing_api_gates_a_real_program() {
         first_dump, second_dump,
         "the second dump landed on the first"
     );
+    let staged_count_dump = dumped_profile(&staged_count);
+    let staged_leak_dump = dumped_profile(&staged_leak);
+    assert_eq!(staged_count_dump, directory.path().join("assert.3.json"));
+    assert_eq!(staged_leak_dump, directory.path().join("assert.4.json"));
 
-    for dump in [&first_dump, &second_dump] {
+    for dump in [
+        &first_dump,
+        &second_dump,
+        &staged_count_dump,
+        &staged_leak_dump,
+    ] {
         let text = std::fs::read_to_string(dump).expect("a dumped profile");
         dhat::assert_valid(&text);
     }
@@ -254,7 +400,7 @@ fn the_testing_api_gates_a_real_program() {
     let leaked = one_block();
     let leak = failure_message(|| heapscope::assert_no_leaks!(since: mark));
     assert!(
-        leak.contains("more blocks are live than at the mark"),
+        leak.contains("1 more block is live than at the mark"),
         "{leak}"
     );
     drop(leaked);
@@ -449,6 +595,18 @@ fn thousands(value: u64) -> String {
         grouped.push(digit);
     }
     grouped
+}
+
+/// "N allocations were made", agreeing with N the way the failure messages do.
+///
+/// Written out here rather than reached through the crate, for the reason
+/// [`thousands`] is.
+fn allocations_made(count: u64) -> String {
+    if count == 1 {
+        String::from("1 allocation was made")
+    } else {
+        format!("{} allocations were made", thousands(count))
+    }
 }
 
 /// The smallest whole percentage that lets every figure of `now` through
