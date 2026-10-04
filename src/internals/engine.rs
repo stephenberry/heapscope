@@ -61,7 +61,9 @@ use super::guard::Guard;
 use super::live::{LiveBlock, LiveBlocks};
 use super::pp::{Counters, PpId, PpTable};
 use super::shape::{Realloc, Shape, ShapeStats, Shapes};
-use super::site::{Name, RegionId, Regions, Site, ThreadId, Threads, MAX_NAME};
+use super::site::{
+    Name, OutsideRegions, RegionId, RegionView, Regions, Site, ThreadId, Threads, MAX_NAME,
+};
 
 /// What a run counts.
 ///
@@ -343,6 +345,13 @@ pub struct Flush {
     /// crate spends its effort keeping empty in order to make exact an equality
     /// only a validator reads.
     pub shapes: ShapeStats,
+    /// What was recorded while no region was open, read in the same window.
+    ///
+    /// In the window because it is a difference between two things the window
+    /// exists to read together — the totals above and the region rows — and a
+    /// difference taken across two instants is not a measurement of anything.
+    /// See [`Engine::outside_regions`].
+    pub outside_regions: OutsideRegions,
     /// Whether exclusive access was obtained.
     ///
     /// When `false`, an event may have landed between the per-point snapshot
@@ -1793,13 +1802,91 @@ impl Engine {
         // `a_snapshot_of_a_running_engine_still_sums` covers.
         self.threads.visit(visit_thread);
         self.regions.visit(visit_region);
+        let outside_regions = self.outside_regions(&stats, exclusive);
         drop(guard);
 
         Flush {
             stats,
             shapes,
+            outside_regions,
             exclusive,
         }
+    }
+
+    /// Visits the region rows and reports what was recorded outside all of
+    /// them, with the global counters they were read against, in one exclusive
+    /// window — or, if the window could not be had within `timeout`, visits
+    /// nothing and returns `None`.
+    ///
+    /// The counters come back so that what a caller reports beside the rows —
+    /// how many blocks went unrecorded, how many events were refused — is from
+    /// the same instant as the rows, rather than from a second read that
+    /// includes whatever happened since.
+    ///
+    /// The counterpart of [`Engine::flush_and_visit`] for a caller that wants
+    /// the regions and nothing else, which is a few hundred rows at most rather
+    /// than every program point the run has. It takes the gate for the same
+    /// reason that does: the row outside every region is the totals less the
+    /// region rows, and both have to come from one instant for the difference
+    /// to mean anything. Read without the gate, a free that had moved the
+    /// totals and not yet its region row would make that row briefly hold a
+    /// block more than the run did, and the subtraction would report a block
+    /// with no bytes in it — the impossible reading [`HeapStats`] documents
+    /// meeting once already.
+    ///
+    /// Where `flush_and_visit` degrades to a reading it marks as inexact, this
+    /// refuses: a profile written at `exit` is better partial than absent, but a
+    /// program asking a question mid-run can be told it was not answerable and
+    /// ask again.
+    ///
+    /// The visitor must not allocate, for the reason `flush_and_visit` gives.
+    ///
+    /// [`HeapStats`]: crate::HeapStats
+    pub fn visit_regions(
+        &self,
+        timeout: Duration,
+        visit_region: impl FnMut(RegionView),
+    ) -> Option<(GlobalStats, OutsideRegions)> {
+        let _order = super::order::enter(super::order::Level::PeakGate);
+        let _guard = self.gate.write_for(timeout)?;
+        let stats = self.stats();
+        self.regions.visit(visit_region);
+        let outside = self.outside_regions(&stats, true);
+        Some((stats, outside))
+    }
+
+    /// The totals in `stats` less everything the region table accounts for.
+    ///
+    /// Exact when `exclusive`, because every gated path moves a region row in
+    /// the same critical section as the totals it is a share of (see
+    /// [`Engine::attribute`]): an event outside every region moves only the
+    /// totals, and one inside moves both by the same amount. So under exclusion
+    /// a region table holding more than the totals is not a race but a broken
+    /// invariant, and it poisons the engine the way a counter going negative
+    /// does, rather than being clamped into a plausible zero.
+    ///
+    /// Without exclusion the two may come from either side of an event in
+    /// flight, so the difference is clamped at zero and the reading is already
+    /// marked inexact by whoever asked for it.
+    fn outside_regions(&self, stats: &GlobalStats, exclusive: bool) -> OutsideRegions {
+        let attributed = self.regions.attributed();
+        let mut overdrawn = false;
+        let mut less = |total: u64, part: u64| {
+            total.checked_sub(part).unwrap_or_else(|| {
+                overdrawn = true;
+                0
+            })
+        };
+        let outside = OutsideRegions {
+            total_bytes: less(stats.total_bytes, attributed.total_bytes),
+            total_blocks: less(stats.total_blocks, attributed.total_blocks),
+            curr_bytes: less(stats.curr_bytes, attributed.curr_bytes),
+            curr_blocks: less(stats.curr_blocks, attributed.curr_blocks),
+        };
+        if overdrawn && exclusive {
+            super::diagnostic::poison("the region rows recorded more than the run did");
+        }
+        outside
     }
 
     /// How long the shutdown flush waits for in-flight events to finish.
@@ -2326,6 +2413,355 @@ mod tests {
              holding bytes the program no longer has"
         );
         assert_eq!(rows[0].max_bytes, 4_096);
+    }
+
+    /// Opens `id` on the calling thread the way `crate::region` does, returning
+    /// the region it displaced for [`close`] to restore.
+    fn open(engine: &Engine, id: RegionId) -> RegionId {
+        let held = super::super::guard::enter().expect("not inside the profiler");
+        let previous = super::super::guard::enter_region(&held, id);
+        drop(held);
+        engine.regions().enter(id);
+        previous
+    }
+
+    /// Closes what [`open`] opened.
+    fn close(engine: &Engine, id: RegionId, previous: RegionId) {
+        super::super::guard::leave_region(previous);
+        engine.regions().leave(id);
+    }
+
+    /// The region rows plus what was outside them, per additive column.
+    fn regions_plus(engine: &Engine, outside: OutsideRegions) -> OutsideRegions {
+        let mut sum = outside;
+        engine.regions().visit(|row| {
+            sum.total_bytes += row.counts.total_bytes;
+            sum.total_blocks += row.counts.total_blocks;
+            sum.curr_bytes += row.counts.curr_bytes;
+            sum.curr_blocks += row.counts.curr_blocks;
+        });
+        sum
+    }
+
+    /// For each additive column, the region rows, the overflow row and what was
+    /// recorded outside every region sum to the run — through every path that
+    /// can move a row, each crossing a region boundary in the direction that
+    /// would catch an attribution taken from the wrong place.
+    ///
+    /// The remainder is asserted as figures and not only as a sum. A sum alone
+    /// is satisfied by any remainder computed as "totals less rows", including
+    /// one that charged a resize to whichever region the resize happened in;
+    /// the figures are what say each event landed where its block was born.
+    #[test]
+    fn the_regions_and_what_was_outside_them_add_up_to_the_run() {
+        let engine = engine();
+        let parsing = engine.intern_region("parsing");
+        let lexing = engine.intern_region("lexing");
+        // Filled to capacity, so the next name lands in the shared row and the
+        // sum is shown to need it. The fillers are never entered, so they are
+        // never visited — and hold nothing, so the remainder must not either
+        // count them or miss them.
+        for index in 2..super::super::site::MAX_REGIONS {
+            engine.intern_region(&format!("filler {index}"));
+        }
+        let overflow = engine.intern_region("one too many");
+        assert_eq!(overflow, RegionId::OVERFLOW);
+
+        // Outside every region.
+        engine.record_alloc_guarded(0x1000, Shape::of(100), &[0xA1]);
+
+        let outer = open(&engine, parsing);
+        engine.record_alloc_guarded(0x2000, Shape::of(1_000), &[0xA2]);
+        let inner = open(&engine, lexing);
+        engine.record_alloc_guarded(0x3000, Shape::of(300), &[0xA3]);
+        // A block born outside, grown inside a region: the resize is the
+        // block's, so it stays outside.
+        let taken = engine.live_blocks().remove(0x1000);
+        engine.record_realloc_guarded(taken, grew(0x1000, 100, 0x1100, 150), &[0xA4]);
+        // A block born in the outer region, freed inside the inner one.
+        engine.record_free(0x2000, 1_000);
+        close(&engine, lexing, inner);
+        engine.record_alloc_guarded(0x4000, Shape::of(40), &[0xA5]);
+        close(&engine, parsing, outer);
+
+        // A block born in a region, shrunk outside every region.
+        let taken = engine.live_blocks().remove(0x3000);
+        engine.record_realloc_guarded(taken, grew(0x3000, 300, 0x3100, 200), &[0xA6]);
+        engine.record_alloc_guarded(0x5000, Shape::of(7), &[0xA7]);
+
+        // Another thread, while this one is inside a region: what it allocates
+        // is outside, and a region block it frees comes off the region.
+        let outer = open(&engine, parsing);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                engine.record_alloc_guarded(0x6000, Shape::of(64), &[0xA8]);
+                engine.record_free(0x4000, 40);
+            });
+        });
+        close(&engine, parsing, outer);
+
+        let shared = open(&engine, overflow);
+        engine.record_alloc_guarded(0x7000, Shape::of(9), &[0xA9]);
+        close(&engine, overflow, shared);
+
+        let flush = engine.flush_and_visit(Engine::FLUSH_TIMEOUT, |_, _, _| {}, |_| {}, |_| {});
+        assert!(flush.exclusive);
+        let outside = flush.outside_regions;
+        assert_eq!(
+            outside,
+            OutsideRegions {
+                total_bytes: 100 + 150 + 7 + 64,
+                total_blocks: 4,
+                curr_bytes: 150 + 7 + 64,
+                curr_blocks: 3,
+            },
+            "something recorded outside every region was charged to a region, \
+             or the other way round"
+        );
+
+        let stats = flush.stats;
+        let sum = regions_plus(&engine, outside);
+        assert_eq!(sum.total_bytes, stats.total_bytes);
+        assert_eq!(sum.total_blocks, stats.total_blocks);
+        assert_eq!(sum.curr_bytes, stats.curr_bytes);
+        assert_eq!(sum.curr_blocks, stats.curr_blocks);
+        assert_eq!(
+            stats.total_bytes, 1_870,
+            "the fixture is not the run it says"
+        );
+
+        // The cheaper reading agrees with the full one, and visits the same rows.
+        let mut visited = 0;
+        let (cheap_stats, cheap) = engine
+            .visit_regions(Engine::FLUSH_TIMEOUT, |_| visited += 1)
+            .expect("nothing else holds the gate");
+        assert_eq!(cheap, outside);
+        assert_eq!(cheap_stats, stats);
+        assert_eq!(visited, 3, "parsing, lexing and the shared row");
+    }
+
+    /// The remainder is exact while other threads are recording, which is what
+    /// reading it under the gate is for.
+    ///
+    /// Every worker records only inside a region, so the remainder must not
+    /// move at all, however many readings are taken. Read without the gate, a
+    /// reading landing between a worker moving the totals and moving its row
+    /// sees the totals ahead of the rows, and the remainder jumps by however
+    /// many events that caught — so this fails on the first reading that lands
+    /// in such a window, rather than on a sum that happens to stay close.
+    ///
+    /// A race detector, so a probability rather than a proof: with the gate
+    /// removed from `visit_regions`, ten runs in ten failed at 500 readings. With
+    /// it, none can.
+    #[test]
+    fn the_remainder_holds_still_while_threads_record_inside_regions() {
+        // Bounded under Miri for the reasons the running-snapshot test gives.
+        #[cfg(miri)]
+        const READINGS: usize = 3;
+        #[cfg(not(miri))]
+        const READINGS: usize = 500;
+        #[cfg(miri)]
+        const ROUNDS: usize = 32;
+        #[cfg(not(miri))]
+        const ROUNDS: usize = usize::MAX;
+
+        let engine = engine();
+        let working = engine.intern_region("working");
+        engine.record_alloc_guarded(0x10, Shape::of(4_000), &[0xB0]);
+        engine.record_alloc_guarded(0x20, Shape::of(96), &[0xB0]);
+        engine.record_free(0x20, 96);
+        let (_, before) = engine
+            .visit_regions(Engine::FLUSH_TIMEOUT, |_| {})
+            .expect("nothing else holds the gate");
+        assert_eq!(before.total_bytes, 4_096);
+        assert_eq!(before.curr_bytes, 4_000);
+
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let started = std::sync::atomic::AtomicUsize::new(0);
+        const WORKERS: usize = 4;
+        std::thread::scope(|scope| {
+            for worker in 0..WORKERS {
+                let engine = &engine;
+                let stop = &stop;
+                let started = &started;
+                scope.spawn(move || {
+                    let previous = open(engine, working);
+                    started.fetch_add(1, Ordering::Relaxed);
+                    let base = 0x1_0000_0000usize + worker * 0x1000_0000;
+                    let mut round = 0usize;
+                    while !stop.load(Ordering::Relaxed) && round < ROUNDS {
+                        let address = base + (round % 512) * 128;
+                        let size = 64 + round % 256;
+                        engine.record_alloc_guarded(address, Shape::of(size), &[0xB1 + worker]);
+                        if round.is_multiple_of(3) {
+                            engine.record_free(address, size);
+                        }
+                        round += 1;
+                    }
+                    close(engine, working, previous);
+                });
+            }
+            let _release = StopOnDrop(&stop);
+            // Readings taken before the workers are recording would pass
+            // whether or not the gate were taken, which is how the first
+            // version of this test passed with it removed.
+            while started.load(Ordering::Relaxed) < WORKERS {
+                std::thread::yield_now();
+            }
+
+            for _ in 0..READINGS {
+                // Summed in the visitor, which may not allocate, so that the
+                // rows checked are the rows read in the window.
+                let (mut bytes, mut blocks) = (0u64, 0u64);
+                let Some((stats, now)) = engine.visit_regions(Engine::FLUSH_TIMEOUT, |row| {
+                    bytes += row.counts.total_bytes;
+                    blocks += row.counts.total_blocks;
+                }) else {
+                    continue;
+                };
+                assert_eq!(
+                    now, before,
+                    "the remainder moved while every thread recording was inside \
+                     a region"
+                );
+                assert_eq!(bytes + now.total_bytes, stats.total_bytes);
+                assert_eq!(blocks + now.total_blocks, stats.total_blocks);
+            }
+        });
+    }
+
+    /// Where the gate cannot be had, the cheap reading refuses and visits
+    /// nothing, rather than reporting a difference taken across two instants.
+    #[test]
+    fn the_region_reading_refuses_rather_than_reading_without_the_gate() {
+        let engine = engine();
+        let parsing = engine.intern_region("parsing");
+        let previous = open(&engine, parsing);
+        engine.record_alloc_guarded(0x1000, Shape::of(64), &[0xC0]);
+        close(&engine, parsing, previous);
+
+        let held = std::sync::Barrier::new(2);
+        let release = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let _reader = engine.gate.read();
+                held.wait();
+                release.wait();
+            });
+            held.wait();
+            let mut visited = 0;
+            let reading = engine.visit_regions(Duration::from_millis(20), |_| visited += 1);
+            release.wait();
+            assert_eq!(reading, None);
+            assert_eq!(visited, 0, "a refused reading still visited rows");
+        });
+    }
+
+    /// A region table holding more than the run is a broken invariant when it
+    /// is read under exclusion, and a race when it is not, and the two are
+    /// handled differently: the first poisons, the second is clamped and
+    /// marked inexact by whoever asked.
+    ///
+    /// The overdraft is made by moving a region's row directly, which no
+    /// recording path does — that is the point of it being an invariant.
+    #[test]
+    fn a_region_table_holding_more_than_the_run_poisons_only_under_exclusion() {
+        // The poison flag is process-wide, so this holds the lock every test
+        // that sets or reads it holds, and clears the flag however it ends.
+        let _serial = super::super::diagnostic::POISON_TESTS.lock();
+        struct ClearPoison;
+        impl Drop for ClearPoison {
+            fn drop(&mut self) {
+                super::super::diagnostic::reset();
+            }
+        }
+        let _clear = ClearPoison;
+        super::super::diagnostic::reset();
+        super::super::diagnostic::set_quiet(true);
+
+        let engine = engine();
+        let parsing = engine.intern_region("parsing");
+        engine.record_alloc_guarded(0x1000, Shape::of(64), &[0xD0]);
+        engine
+            .regions()
+            .tally(parsing)
+            .expect("an interned region has a row")
+            .apply(100, 1, 100, 1);
+
+        // Not exclusive: a reader holds the gate shared for the whole wait.
+        let held = std::sync::Barrier::new(2);
+        let release = std::sync::Barrier::new(2);
+        let flush = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let _reader = engine.gate.read();
+                held.wait();
+                release.wait();
+            });
+            held.wait();
+            let flush =
+                engine.flush_and_visit(Duration::from_millis(20), |_, _, _| {}, |_| {}, |_| {});
+            release.wait();
+            flush
+        });
+        assert!(!flush.exclusive);
+        assert_eq!(
+            flush.outside_regions.total_bytes, 0,
+            "an overdraft read without exclusion is clamped at zero"
+        );
+        assert!(
+            !super::super::diagnostic::is_poisoned(),
+            "a difference taken across two instants poisoned the engine, which \
+             is reporting a race as a defect"
+        );
+
+        // Exclusive: the same overdraft is now a defect, and says so.
+        let flush = engine.flush_and_visit(Engine::FLUSH_TIMEOUT, |_, _, _| {}, |_| {}, |_| {});
+        assert!(flush.exclusive);
+        assert_eq!(flush.outside_regions.total_bytes, 0);
+        assert!(
+            super::super::diagnostic::is_poisoned(),
+            "a region table holding more than the run, read under exclusion, \
+             was clamped quietly rather than reported"
+        );
+    }
+
+    /// An event outside every region is outside, in its own units, and nothing
+    /// in a run with no live blocks is ever live — outside the regions included.
+    #[test]
+    fn an_event_outside_every_region_is_outside_and_never_live() {
+        let engine = Engine::with_limits(1 << 12, 1 << 14);
+        assert!(
+            engine.start(TimeSource::Events, || engine.configure(Settings {
+                mode: Mode::AdHoc,
+                ..Settings::default()
+            }))
+        );
+        let retrying = engine.intern_region("retrying");
+
+        let guard = super::super::guard::enter().expect("not inside the profiler");
+        engine.record_event(&guard, 700, &[0xAA]);
+        drop(guard);
+        let previous = open(&engine, retrying);
+        let guard = super::super::guard::enter().expect("not inside the profiler");
+        engine.record_event(&guard, 70, &[0xAA]);
+        drop(guard);
+        close(&engine, retrying, previous);
+
+        let (_, outside) = engine
+            .visit_regions(Engine::FLUSH_TIMEOUT, |_| {})
+            .expect("nothing else holds the gate");
+        assert_eq!(
+            outside,
+            OutsideRegions {
+                total_bytes: 700,
+                total_blocks: 1,
+                curr_bytes: 0,
+                curr_blocks: 0,
+            }
+        );
+        let sum = regions_plus(&engine, outside);
+        assert_eq!(sum.total_bytes, engine.stats().total_bytes);
+        assert_eq!(sum.total_blocks, engine.stats().total_blocks);
     }
 
     /// An ad hoc event has a thread and a region like anything else, and

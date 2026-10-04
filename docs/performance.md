@@ -27,7 +27,7 @@ let profiler = heapscope::Profiler::builder()
 
 Sample points fall on the stream of allocated *bytes*, not on the sequence of allocations, so an allocation of `s` bytes is caught with probability `1 - exp(-s / interval)`. A 100 MiB buffer is therefore caught however large the interval is, and a sampled allocation is scaled by the reciprocal of its own probability rather than by one global factor — the large allocations a profile exists to find are not the ones sampling drops. The same scale applies to block lifetimes, so the average-lifetime column still means what it did.
 
-Two things to know before turning it on. **Every figure becomes an estimate, including the peak**, so [`HeapStats::get`](testing.md) refuses a sampled run rather than let an assertion compare a budget against a draw from a distribution. And **the interval to pick is the one that gives you enough sample points**, not a number of bytes: divide what your program allocates in total by the interval, and aim for a thousand or more.
+Two things to know before turning it on. **Every figure becomes an estimate, including the peak**, so [`HeapStats::get`](testing.md) and `RegionBreakdown::get` refuse a sampled run rather than let an assertion compare a budget against a draw from a distribution. And **the interval to pick is the one that gives you enough sample points**, not a number of bytes: divide what your program allocates in total by the interval, and aim for a thousand or more.
 
 ## Measured so far
 

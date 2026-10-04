@@ -340,10 +340,17 @@ fn skip_item(lines: &[&str], i: &mut usize) {
 }
 
 /// Advances past a braced block whose closing `}` is at column zero.
+///
+/// Or `};`, which is how a braced item that is a *statement* closes: a `use`
+/// list or a `static` initializer rustfmt has broken over several lines. Only
+/// `}` was recognised once, so such an item was followed on to the next item's
+/// closing brace and everything between dropped from the surface — which is
+/// how a private `use super::site::{` in `engine.rs` made `Mode` and all its
+/// variants vanish from the snapshot, with the rewrite agreeing.
 fn skip_block(lines: &[&str], i: &mut usize) {
     *i += 1;
     while *i < lines.len() {
-        if lines[*i] == "}" {
+        if lines[*i] == "}" || lines[*i] == "};" {
             *i += 1;
             return;
         }

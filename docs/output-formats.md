@@ -17,7 +17,7 @@ Four formats, one reading. Ask for as many as you want: they come from a single 
 | Block lifetimes | one `tl`, the two summed | freed and still-alive kept apart |
 | Sizes, alignments, zeroed, realloc cost | in the extension block | yes |
 | Arena and table occupancy, capture cost | in the extension block | yes |
-| Thread and region attribution | no field for it | one row each, with names |
+| Thread and region attribution | no field for it | one row each, with names, and what no region covered |
 
 Addresses are hexadecimal *strings* there. A JSON number is a double in JavaScript, exact only to 2^53, so `JSON.parse` would silently round a 64-bit address — and an address wrong in its low bits names the wrong line of the wrong function with nothing about it looking wrong.
 

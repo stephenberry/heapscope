@@ -321,3 +321,54 @@ fn the_page_and_the_dhat_file_name_frames_the_same_way() {
         );
     }
 }
+
+/// The page carries what its Regions tab needs to show the row for what no
+/// region covered: the remainder, beside the regions it completes, with the
+/// figures the snapshot had.
+///
+/// Whether the tab then *shows* it — the row and its sentence when there are
+/// regions, neither when there are none — is a decision `regionSummary` makes
+/// in the page's pure half, and `ci/check-bundled-viewer.mjs` holds that
+/// decision against both shapes of profile. A Rust test has no JavaScript to
+/// run it with, so what it can hold the page to is the data.
+#[test]
+fn the_page_carries_what_no_region_covered() {
+    let mut snapshot = snapshot();
+    let stats = snapshot.stats;
+    snapshot.regions = vec![heapscope::output::RegionStats {
+        id: 0,
+        overflow: false,
+        name: Some(String::from("parsing")),
+        first_seen: 1,
+        entries: 1,
+        active: 0,
+        counts: heapscope::output::TallyStats {
+            total_bytes: 2048,
+            total_blocks: 4,
+            ..heapscope::output::TallyStats::default()
+        },
+    }];
+    snapshot.outside_regions.total_bytes = stats.total_bytes - 2048;
+    snapshot.outside_regions.total_blocks = stats.total_blocks - 4;
+    snapshot.outside_regions.curr_bytes = stats.curr_bytes;
+    snapshot.outside_regions.curr_blocks = stats.curr_blocks;
+
+    let profile = parsed(&page_of(&snapshot), PROFILE_BLOCK);
+    let regions = profile.get("regions").unwrap().as_array().unwrap();
+    assert_eq!(regions.len(), 1);
+    let outside = profile
+        .get("outsideRegions")
+        .expect("the page carries the remainder its Regions tab shows");
+    assert_eq!(
+        outside.get("totalBytes").and_then(|v| v.as_u64()),
+        Some(stats.total_bytes - 2048)
+    );
+    assert_eq!(
+        outside.get("currBlocks").and_then(|v| v.as_u64()),
+        Some(stats.curr_blocks)
+    );
+    assert!(
+        outside.get("maxBytes").is_none(),
+        "the remainder carries a peak nothing measured"
+    );
+}

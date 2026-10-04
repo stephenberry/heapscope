@@ -52,7 +52,7 @@ use crate::symbol::{FunctionNames, Symbolized, Trimmed};
 pub use crate::internals::engine::{GlobalStats, Settings, Shutdown};
 pub use crate::internals::pp::Counters;
 pub use crate::internals::shape::{Realloc, Shape, ShapeStats};
-pub use crate::internals::site::TallyStats;
+pub use crate::internals::site::{OutsideRegions, TallyStats};
 pub use dhat_v2::{FrameFormat, RawAddresses};
 pub use folded::FoldedMetric;
 
@@ -157,6 +157,12 @@ pub struct ThreadStats {
 }
 
 /// One region, as it stood when the snapshot was taken.
+///
+/// What was recorded while *no* region was open is not one of these. It has no
+/// name, no entries and no peak of its own, so it is
+/// [`OutsideRegions`] instead: a different type rather than a row with a
+/// reserved name, which a program could enter by naming a region the same
+/// thing. See [`Snapshot::outside_regions`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RegionStats {
     /// Which row, in the order the names were first entered.
@@ -178,6 +184,27 @@ pub struct RegionStats {
     /// What was allocated while it was the innermost open region on some
     /// thread.
     pub counts: TallyStats,
+}
+
+impl RegionStats {
+    /// An owned row from the engine's copy of one.
+    ///
+    /// Shared by [`Snapshot::capture`] and
+    /// [`RegionBreakdown::get`](crate::RegionBreakdown::get), so that the two
+    /// ways of reading a region cannot come to disagree about what a row is.
+    /// Called after the gate is released: the name becomes a `String` here, and
+    /// that allocates.
+    pub(crate) fn of_view(row: &crate::internals::site::RegionView) -> RegionStats {
+        RegionStats {
+            id: row.id.as_u16(),
+            overflow: row.id.is_overflow(),
+            name: name_of(row.name.as_bytes()),
+            first_seen: row.first_seen,
+            entries: row.entries,
+            active: row.active,
+            counts: row.counts,
+        }
+    }
 }
 
 /// What a program point stands for.
@@ -346,6 +373,23 @@ pub struct Snapshot {
     /// entered them. Empty for a run that used no regions, which is most of
     /// them.
     pub regions: Vec<RegionStats>,
+    /// What was recorded while no region was open on the recording thread.
+    ///
+    /// The row that makes [`Snapshot::regions`] add up. For each of its four
+    /// columns, these figures plus the region rows (the shared overflow row
+    /// among them) equal [`Snapshot::stats`] exactly whenever
+    /// [`Snapshot::exact`] is true and [`Snapshot::rows_dropped`] is zero —
+    /// worked out by the engine in the same window as both, from every row it
+    /// holds, so a row that did not fit in the snapshot is not counted here as
+    /// though it had been outside every region.
+    ///
+    /// The peaks do not add up and are not meant to: each region's is its own,
+    /// reached at its own moment. See [`OutsideRegions`] for why this row has
+    /// none.
+    ///
+    /// In a run that used no regions this is simply the totals, and the
+    /// summaries leave it out.
+    pub outside_regions: OutsideRegions,
     /// Attribution rows that appeared while the snapshot was being taken and
     /// did not fit in the space reserved for them.
     ///
@@ -394,6 +438,7 @@ impl Default for Snapshot {
             metrics: SelfMetrics::default(),
             threads: Vec::new(),
             regions: Vec::new(),
+            outside_regions: OutsideRegions::default(),
             rows_dropped: 0,
         }
     }
@@ -541,18 +586,7 @@ impl Snapshot {
                 counts: row.counts,
             })
             .collect();
-        let regions: Vec<RegionStats> = region_rows
-            .iter()
-            .map(|row| RegionStats {
-                id: row.id.as_u16(),
-                overflow: row.id.is_overflow(),
-                name: name_of(row.name.as_bytes()),
-                first_seen: row.first_seen,
-                entries: row.entries,
-                active: row.active,
-                counts: row.counts,
-            })
-            .collect();
+        let regions: Vec<RegionStats> = region_rows.iter().map(RegionStats::of_view).collect();
 
         Snapshot {
             stats: flush.stats,
@@ -604,6 +638,7 @@ impl Snapshot {
             },
             threads,
             regions,
+            outside_regions: flush.outside_regions,
             rows_dropped,
         }
     }
