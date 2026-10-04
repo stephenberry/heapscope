@@ -315,7 +315,8 @@ fn the_testing_api_gates_a_real_program() {
     // narrowed to the interval; what it can be is labelled. Whole-run failures
     // have nothing to qualify, and saying it there too would teach readers to
     // skip it.
-    const WHOLE_RUN: &str = "cover the whole run, not only what followed the mark";
+    const WHOLE_RUN: &str = "cover everything since the run started or its counts last \
+                             restarted, not only what followed the mark";
     for message in [&staged_count, &staged_leak] {
         assert!(message.contains("profile written to"), "{message}");
         assert!(message.contains(WHOLE_RUN), "{message}");

@@ -798,7 +798,8 @@ fn has_a_profile(engine: &Engine) -> bool {
 /// that it can say the profile it writes answers the wider one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Scope {
-    /// Everything since the profiler started.
+    /// Everything since the profiler started, or since its counts were last
+    /// [restarted](crate::Profiler::reset).
     WholeRun,
     /// Everything since a [`HeapStats`] mark was read.
     SinceMark,
@@ -1514,8 +1515,14 @@ pub(crate) fn report<E: AssertionFailure>(
 /// Attempted rather than written, because the summary reaches stderr whether or
 /// not the file could be. Worded so that it is true either way: the line above
 /// it says which happened to the file.
+///
+/// "Since the counts last restarted" rather than "the whole run", because after
+/// a [`Profiler::reset`](crate::Profiler::reset) the profile's totals are the
+/// window's, and a reader told "the whole run" would look in it for the
+/// warm-up.
 const WHOLE_RUN_NOTE: &str = "the program points printed to stderr, and any profile written, \
-                              cover the whole run, not only what followed the mark";
+                              cover everything since the run started or its counts last \
+                              restarted, not only what followed the mark";
 
 /// The types a budget or a count can be given as: the integer primitives, and
 /// nothing else.

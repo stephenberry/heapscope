@@ -4499,6 +4499,81 @@ mod tests {
         assert_eq!(child.stats(), before);
     }
 
+    /// A restart keeps what is live in each region and outside them, and
+    /// starts every total again, so the region rows and what was outside them
+    /// still add up to the run.
+    ///
+    /// The remainder is not a row the engine keeps, so nothing restarts it. It
+    /// is right after a restart only because the rows and the totals it is the
+    /// difference of restart together, under the same gate, which is what this
+    /// pins: a carried block on either side, one freed after the restart from
+    /// the region it was born in, and new allocations in both.
+    #[test]
+    fn after_a_restart_the_regions_and_the_remainder_still_add_up() {
+        let _quiet = quiet();
+        let engine = engine();
+        let parsing = engine.intern_region("parsing");
+        engine.record_alloc_guarded(0x1000, Shape::of(100), &[0xA1]);
+        let outer = open(&engine, parsing);
+        engine.record_alloc_guarded(0x2000, Shape::of(1_000), &[0xA2]);
+        engine.record_alloc_guarded(0x3000, Shape::of(300), &[0xA3]);
+        engine.record_free(0x3000, 300);
+        close(&engine, parsing, outer);
+
+        reset(&engine);
+
+        let (_, outside) = engine
+            .visit_regions(Engine::FLUSH_TIMEOUT, |_| {})
+            .expect("a quiet engine can be read");
+        assert_eq!(
+            outside,
+            OutsideRegions {
+                total_bytes: 0,
+                total_blocks: 0,
+                curr_bytes: 100,
+                curr_blocks: 1,
+            },
+            "the restart moved what was live outside every region, or kept a total"
+        );
+
+        // The carried region block comes off the region it was born in.
+        engine.record_free(0x2000, 1_000);
+        let outer = open(&engine, parsing);
+        engine.record_alloc_guarded(0x4000, Shape::of(40), &[0xA4]);
+        close(&engine, parsing, outer);
+        engine.record_alloc_guarded(0x5000, Shape::of(7), &[0xA5]);
+
+        let (stats, outside) = engine
+            .visit_regions(Engine::FLUSH_TIMEOUT, |_| {})
+            .expect("a quiet engine can be read");
+        assert_eq!(
+            outside,
+            OutsideRegions {
+                total_bytes: 7,
+                total_blocks: 1,
+                curr_bytes: 107,
+                curr_blocks: 2,
+            }
+        );
+        let sum = regions_plus(&engine, outside);
+        assert_eq!(
+            (
+                sum.total_bytes,
+                sum.total_blocks,
+                sum.curr_bytes,
+                sum.curr_blocks
+            ),
+            (
+                stats.total_bytes,
+                stats.total_blocks,
+                stats.curr_bytes,
+                stats.curr_blocks
+            ),
+            "the regions and the remainder do not add up to the run after a restart"
+        );
+        assert!(!super::super::diagnostic::is_poisoned());
+    }
+
     /// A poisoned profiler is not restarted: what is live is what it keeps,
     /// and the failure was in what it holds.
     #[test]
