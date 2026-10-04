@@ -9,9 +9,10 @@
 //!
 //! Open addressing with linear probing and power-of-two capacity. A removal
 //! closes its gap by shifting entries back rather than leaving a tombstone;
-//! [`RawMap::remove`] says why. Linear probing rather than anything cleverer because the keys
-//! are already well-distributed — pointers are hashed, and program-point keys
-//! are hashes to begin with — so the cache locality of a linear scan wins.
+//! [`RawMap::remove`] says why. Linear probing rather than anything cleverer
+//! because the keys are already well-distributed — pointers are hashed, and
+//! program-point keys are hashes to begin with — so the cache locality of a
+//! linear scan wins.
 //!
 //! # Capacity is a hard limit, not a suggestion
 //!
@@ -44,8 +45,9 @@ const MIN_CAPACITY: usize = 1024;
 /// # Partial initialization
 ///
 /// `key` is initialized for every slot as soon as the table is allocated;
-/// `value` is initialized **only** in slots whose key is not [`EMPTY`]. Every read must therefore examine `key` first and reach
-/// `value` only through a live key. Reading a whole `Entry` — even to discard
+/// `value` is initialized **only** in slots whose key is not [`EMPTY`]. Every
+/// read must therefore examine `key` first and reach `value` only through a
+/// live key. Reading a whole `Entry` — even to discard
 /// it — constructs a `V` from uninitialized memory, which is undefined
 /// behaviour for any type with validity constraints, and is not hypothetical:
 /// Miri caught exactly this in `grow` and `for_each`.
@@ -100,8 +102,11 @@ pub enum Insert {
 ///   gate, it releases them, and says the child's inherited tables may be
 ///   mid-update. A map the child inherits mid-shift holds one entry twice, or
 ///   the removed one still, so a snapshot taken in that child can count one
-///   block twice. That case already allowed a map inherited mid-growth, which
-///   is missing every entry not yet rehashed, and is no worse for this.
+///   block twice. A move is a plain 24-byte copy, not an atomic one, so the
+///   child can also inherit a slot torn partway through one: one entry's key
+///   beside part of another's value. That case already allowed a map
+///   inherited mid-growth, which is missing every entry not yet rehashed and
+///   copies entries the same way, and is no worse for this.
 ///
 /// # The reserved key
 ///
@@ -270,9 +275,12 @@ impl<V: Copy> RawMap<V> {
             // would sit before its own home, where no probe for it starts.
             let home = mix(next) as usize & mask;
             if index.wrapping_sub(home) & mask >= index.wrapping_sub(gap) & mask {
-                // SAFETY: both indices are below `capacity` and distinct, and
-                // the key at `index` is live, so the whole entry there is
-                // initialized and may be read as one.
+                // SAFETY: both indices are below `capacity`, and the key at
+                // `index` is live, so the whole entry there is initialized and
+                // may be read as one. The two differ in any table of more than
+                // one slot; in a table of one, `index` wraps back to `gap` and
+                // this copies an entry onto itself, which `read` before
+                // `write` makes sound.
                 unsafe { self.slot(gap).write(self.slot(index).read()) };
                 gap = index;
             }
@@ -658,47 +666,137 @@ mod tests {
         }
     }
 
-    /// Closing a gap moves entries, and a move to the wrong slot hides an entry
-    /// from every later probe. So every operation is checked against a model,
-    /// in a table small and full enough that clusters are long and wrap past
-    /// its end, which is where the arithmetic of "passes through the gap" is
-    /// easiest to get wrong.
-    #[test]
-    fn removals_and_insertions_agree_with_a_model() {
-        use std::collections::HashMap;
-
-        // Below the load factor of the smallest table, so that nothing is
-        // refused and every difference from the model is a lost entry.
-        const KEYS: u64 = (MIN_CAPACITY as u64) * 15 / 32;
-        let operations = miri_scale(200_000) as u64;
-        let (arena, mut m) = map(MIN_CAPACITY);
-        let mut model: HashMap<u64, u32> = HashMap::new();
-
-        for step in 0..operations {
-            let draw = mix(step);
-            let key = draw % KEYS + 1;
-            if draw >> 63 == 0 {
-                let expected = if model.insert(key, step as u32).is_some() {
-                    Insert::Replaced
-                } else {
-                    Insert::Added
-                };
-                assert_eq!(m.insert(&arena, key, step as u32), expected, "step {step}");
-            } else {
-                assert_eq!(m.remove(key), model.remove(&key), "step {step}");
+    /// Fails unless `m` is a table every lookup can trust: each entry
+    /// reachable from its home slot through occupied slots, no key twice, `len`
+    /// the number of occupied slots, and an empty slot somewhere, which is what
+    /// ends a probe for an absent key.
+    ///
+    /// Checked on the slots rather than through `get`, because `get` only sees
+    /// the entries it is asked about, and a misplaced entry is invisible until
+    /// its own key is looked up.
+    fn assert_well_formed(m: &RawMap<u32>, context: At) {
+        if m.capacity == 0 {
+            assert_eq!(m.len, 0, "an unallocated table holds entries, {context}");
+            return;
+        }
+        let mask = m.capacity - 1;
+        let keys: Vec<u64> = (0..m.capacity)
+            // SAFETY: `index < capacity`, and every key is initialized.
+            .map(|index| unsafe { std::ptr::addr_of!((*m.slot(index)).key).read() })
+            .collect();
+        let occupied = keys.iter().filter(|&&key| key != EMPTY).count();
+        assert_eq!(occupied, m.len, "len is not the occupied count, {context}");
+        assert!(occupied < m.capacity, "no slot is empty, {context}");
+        let mut held: Vec<u64> = keys.iter().copied().filter(|&key| key != EMPTY).collect();
+        held.sort_unstable();
+        if let Some(pair) = held.windows(2).find(|pair| pair[0] == pair[1]) {
+            panic!("key {} is held twice, {context}", pair[0]);
+        }
+        for (index, &key) in keys.iter().enumerate() {
+            if key == EMPTY {
+                continue;
             }
-            if step % 97 == 0 {
-                assert_eq!(m.len(), model.len(), "step {step}");
-                for key in 1..=KEYS {
-                    assert_eq!(
-                        m.get(key),
-                        model.get(&key).copied(),
-                        "key {key}, step {step}"
-                    );
-                }
+            let mut probe = mix(key) as usize & mask;
+            while probe != index {
+                assert_ne!(
+                    keys[probe],
+                    EMPTY,
+                    "key {key} at slot {index} is cut off from its home at slot \
+                     {} by the empty slot {probe}, {context}",
+                    mix(key) as usize & mask
+                );
+                probe = (probe + 1) & mask;
             }
         }
-        assert_eq!(m.capacity(), MIN_CAPACITY, "the table grew");
+    }
+
+    /// Where a failure in the model test happened, formatted only if one does.
+    ///
+    /// A `String` built for every operation was most of the test's cost under
+    /// Miri, which interprets the formatting as it does everything else.
+    #[derive(Clone, Copy)]
+    struct At {
+        slots: usize,
+        step: u64,
+    }
+
+    impl fmt::Display for At {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "{} slots, step {}", self.slots, self.step)
+        }
+    }
+
+    /// Closing a gap moves entries, and a move to the wrong slot hides an entry
+    /// from every later probe. So every operation is checked against a model,
+    /// and the table's structure after every one, in tables kept at their
+    /// ceiling.
+    ///
+    /// The shape is what makes it a test of the shift. In a large table at low
+    /// load, clusters are a slot or two and seldom reach the end of the table,
+    /// so a condition that ignored wrapping passed the version of this that
+    /// ran there. Here three draws in four insert, from keys whose homes cover
+    /// every slot, so the table sits at its load factor refusing new keys:
+    /// clusters are long, and often wrap past the end.
+    #[test]
+    fn removals_and_insertions_agree_with_a_model() {
+        use std::collections::BTreeMap;
+
+        // Both mis-shifts this was checked against, a condition that ignores
+        // wrapping and `>` for `>=`, fail within the first 120 operations at 8
+        // slots. Miri runs the two smallest tables for a few times that, which
+        // still catches both; the 64-slot table cost it most of two minutes.
+        #[cfg(miri)]
+        const TABLES: &[usize] = &[8, 16];
+        #[cfg(not(miri))]
+        const TABLES: &[usize] = &[8, 16, 64];
+        #[cfg(miri)]
+        const OPERATIONS: u64 = 300;
+        #[cfg(not(miri))]
+        const OPERATIONS: u64 = 50_000;
+
+        for &slots in TABLES {
+            let (arena, mut m) = map(slots);
+            // Drawn from a range far wider than the table, so that every slot
+            // is some key's home, and removed from a pool of the most recent
+            // keys inserted, so that most removals find a key present.
+            let mut pool: Vec<u64> = Vec::new();
+            let mut model: BTreeMap<u64, u32> = BTreeMap::new();
+
+            for step in 0..OPERATIONS {
+                let draw = mix(step ^ ((slots as u64) << 32));
+                let context = At { slots, step };
+                if draw >> 62 != 0 || pool.is_empty() {
+                    let key = mix(draw) % (slots as u64 * 64) + 1;
+                    // What `insert` must answer: a key present is replaced,
+                    // and a new one is refused once the table is at its load
+                    // factor, since it cannot grow past `slots`.
+                    let expected = if model.contains_key(&key) {
+                        Insert::Replaced
+                    } else if (model.len() + 1) * MAX_LOAD_DEN > slots * MAX_LOAD_NUM {
+                        Insert::Full
+                    } else {
+                        Insert::Added
+                    };
+                    if expected != Insert::Full {
+                        model.insert(key, step as u32);
+                        pool.push(key);
+                        if pool.len() > slots {
+                            pool.remove(0);
+                        }
+                    }
+                    assert_eq!(m.insert(&arena, key, step as u32), expected, "{context}");
+                } else {
+                    let key = pool[(draw % pool.len() as u64) as usize];
+                    assert_eq!(m.remove(key), model.remove(&key), "{context}");
+                    assert_eq!(m.get(key), None, "{context}");
+                }
+                assert_well_formed(&m, context);
+                for (&key, &value) in &model {
+                    assert_eq!(m.get(key), Some(value), "key {key}, {context}");
+                }
+            }
+            assert_eq!(m.capacity(), slots, "the table grew past its ceiling");
+        }
     }
 
     #[test]

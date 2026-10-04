@@ -64,34 +64,59 @@ fn uncontended_lock(c: &mut Criterion) {
 /// One free and one allocation against the live-block table, at a steady
 /// population: the pair a program that churns pays for every allocation.
 ///
+/// Twice, because the cost depends on how full the table is. A removal walks
+/// to the end of its cluster, and probes lengthen with load, so the same pair
+/// costs more in a table near its ceiling than in a roomy one:
+///
+/// - `sparse`: 4,096 blocks in a table sized for the default 4 Mi, so each
+///   shard is a few percent full. What a program with a modest live set pays.
+/// - `near_ceiling`: 80% of the blocks a 64 Ki table allows, about 40% of its
+///   slots, which is close to the load factor every shard is held under.
+///   What a program pays once its live set approaches the configured limit.
+///
 /// Addresses are recycled from a ring twice the live population, as an
 /// allocator recycles freed blocks, so the table settles at a fixed size and a
-/// run of any length measures the same thing. With addresses that never
-/// repeat, a table that leaked capacity on removal would reach its ceiling
-/// partway through and start refusing inserts, which is cheaper than
-/// accepting them and would read as a speed-up.
+/// run of any length measures the same thing. Any insert the table refuses is
+/// counted and fails the benchmark, because a refusal is cheaper than an
+/// insert and would read as a speed-up.
 fn live_table_churn(c: &mut Criterion) {
-    const LIVE: usize = 4_096;
-    const RING: usize = 2 * LIVE;
-    let address = |i: usize| 0x6000_0000_0000 + (i % RING) * 48;
-    let block = LiveBlock::unattributed(0, PpId::OVERFLOW);
-
     let mut group = c.benchmark_group("live_table");
     group.measurement_time(Duration::from_secs(3));
-
-    let arena = Arena::new();
-    let table = LiveBlocks::new();
-    for i in 0..LIVE {
-        assert!(table.insert(&arena, address(i), block));
-    }
-    let mut next = LIVE;
-    group.bench_function("remove_then_insert_steady", |b| {
-        b.iter(|| {
-            black_box(table.remove(address(next - LIVE)));
-            black_box(table.insert(&arena, address(next), block));
-            next += 1;
+    for (name, max_blocks, live) in [
+        (
+            "sparse",
+            heapscope::internals::live::DEFAULT_MAX_LIVE_BLOCKS,
+            4_096,
+        ),
+        ("near_ceiling", 1 << 16, (1 << 16) * 4 / 5),
+    ] {
+        let ring = 2 * live;
+        let address = move |i: usize| 0x6000_0000_0000 + (i % ring) * 48;
+        let block = LiveBlock::unattributed(0, PpId::OVERFLOW);
+        let arena = Arena::new();
+        let table = LiveBlocks::with_capacity(max_blocks);
+        for i in 0..live {
+            assert!(
+                table.insert(&arena, address(i), block),
+                "{name}: setup refused"
+            );
+        }
+        let mut next = live;
+        let mut refused = 0u64;
+        group.bench_function(name, |b| {
+            b.iter(|| {
+                black_box(table.remove(address(next - live)));
+                if !table.insert(&arena, address(next), black_box(block)) {
+                    refused += 1;
+                }
+                next += 1;
+            });
         });
-    });
+        assert_eq!(
+            refused, 0,
+            "{name}: the table refused inserts, so it measured refusals"
+        );
+    }
     group.finish();
 }
 
