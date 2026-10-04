@@ -169,7 +169,7 @@ pub use alloc::{engine, Alloc, CAPTURE_DEPTH};
 pub use baseline::{Baseline, Regression, Tolerance};
 pub use event::{copied, event};
 pub use internals::clock::TimeSource;
-pub use internals::engine::Mode;
+pub use internals::engine::{Mode, ResetError};
 pub use output::{FoldedMetric, Snapshot};
 pub use profiler::{Output, Profiler, ProfilerBuilder, StartError, DEFAULT_OUTPUT_PATH};
 pub use region::{region, Region};

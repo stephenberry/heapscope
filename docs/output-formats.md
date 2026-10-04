@@ -30,6 +30,16 @@ let profiler = Profiler::builder()
     .build()?;
 ```
 
+## Versions, and a restarted run
+
+The native profile states its own compatibility rule: a reader ignores fields it does not know and refuses a `formatVersion` it does not know. Fields are added without a bump; the version moves only when an existing field changes meaning.
+
+A run whose counts were [restarted](lifecycle.md#leaving-a-warm-up-out) by `Profiler::reset` is written as version 2. Its totals, maxima, at-peak figures and lifetimes describe the window since `run.reset.at`, while its live figures still include what was allocated before, so a point can hold more than it allocated and the peak can exceed the bytes allocated. A version 1 reader would take those for figures over the whole run, which is the change the rule bumps for. A run that was never restarted means by every field what version 1 means, so it still says 1, and every reader that predates restarts goes on reading it.
+
+`run.reset` carries the number of restarts, when the last one happened, what was live then (`carriedBytes`, `carriedBlocks`), and how much of `notRecorded.blocks` predates the window. The DHAT file has no version to move, so it carries the same figures in `heapscope.reset` and says the counts were restarted in `cmd`, the one line of free text `dh_view.html` displays. One key differs, following each file's own spelling for blocks the table turned away: the native `notRecordedBlocks` is `droppedBlocks` in the DHAT file, as `notRecorded.blocks` is `heapscope.droppedBlocks`.
+
+Folded stacks cannot say a run was restarted, having nowhere to say it; see [leaving a warm-up out](lifecycle.md#leaving-a-warm-up-out).
+
 ## The bundled viewer
 
 Valgrind does not exist on Windows and does not support Apple Silicon, so on two of the four supported platforms `dh_view.html` is not something you can be assumed to have. `Output::html` is the answer to that: one file, double-click to open, nothing fetched, no build step anywhere in its making.

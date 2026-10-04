@@ -49,7 +49,7 @@ use crate::internals::pp::PpId;
 use crate::symbol::modules::{self, Module};
 use crate::symbol::{FunctionNames, Symbolized, Trimmed};
 
-pub use crate::internals::engine::{GlobalStats, Settings, Shutdown};
+pub use crate::internals::engine::{GlobalStats, Reset, Settings, Shutdown};
 pub use crate::internals::pp::Counters;
 pub use crate::internals::shape::{Realloc, Shape, ShapeStats};
 pub use crate::internals::site::{OutsideRegions, TallyStats};
@@ -401,6 +401,18 @@ pub struct Snapshot {
     /// window — one fewer than the slack, because the shared overflow row is
     /// also emitted.
     pub rows_dropped: u64,
+    /// The most recent restart of the counts, or `None` for a run that was
+    /// never restarted.
+    ///
+    /// Where this is present the totals, the peaks and the lifetimes describe
+    /// the window since [`Reset::at`], and the live figures still describe
+    /// everything live, including what was allocated before it. So a point may
+    /// hold more than it allocated, and the peak may exceed the bytes allocated
+    /// in the window. The native, DHAT, HTML and text emitters say so where
+    /// their reader will see it, because nothing in the numbers themselves
+    /// would. Folded stacks cannot: see [`Snapshot::write_folded`]. Read in the
+    /// same window as [`Snapshot::stats`].
+    pub reset: Option<Reset>,
 }
 
 /// Extra attribution rows a snapshot reserves room for.
@@ -440,6 +452,7 @@ impl Default for Snapshot {
             regions: Vec::new(),
             outside_regions: OutsideRegions::default(),
             rows_dropped: 0,
+            reset: None,
         }
     }
 }
@@ -567,7 +580,9 @@ impl Snapshot {
             match index.binary_search_by_key(&block.pp.as_u32(), |&(id, _)| id) {
                 Ok(at) => {
                     let point = &mut points[index[at].1 as usize];
-                    let lifetime = time_at_end.saturating_sub(block.birth);
+                    // Zero for a block carried across a restart of the counts,
+                    // which is in none of this point's block counts.
+                    let lifetime = block.lifetime_at(time_at_end);
                     point.unretired_lifetime = point.unretired_lifetime.saturating_add(lifetime);
                 }
                 Err(_) => unattributed_blocks += 1,
@@ -640,6 +655,7 @@ impl Snapshot {
             regions,
             outside_regions: flush.outside_regions,
             rows_dropped,
+            reset: flush.reset,
         }
     }
 
@@ -810,6 +826,16 @@ impl Snapshot {
     /// refused in a mode that has none rather than written as zeroes — see
     /// [`FoldedMetric::needs_block_lifetimes`], which is the check that predicts
     /// this.
+    ///
+    /// # A run whose counts were restarted
+    ///
+    /// Written like any other, and without saying so: the format is a stack and
+    /// a number per line, with no header and nowhere for a note a flame graph
+    /// tool would not take for a stack. The totals are the window's, as they
+    /// are everywhere, and [`FoldedMetric::PeakBytes`] and
+    /// [`FoldedMetric::LiveBytes`] include what was carried into it. A reader
+    /// who needs to know whether a file is of a window reads
+    /// [`Snapshot::reset`], or another output of the same run.
     pub fn write_folded<W: Write>(&self, out: W, metric: FoldedMetric) -> io::Result<()> {
         let names = FunctionNames::new(&self.modules);
         if self.settings.trim_frames {
@@ -1556,6 +1582,53 @@ mod tests {
             "the block was alive for the eight allocation events that followed"
         );
         assert_eq!(held.total_lifetime(), 8);
+    }
+
+    /// A block live across a restart of the counts is in none of the window's
+    /// block counts, so it has no lifetime to contribute at the end either:
+    /// the sweep that retires live blocks has to agree with the free path, or a
+    /// warm-up's cache inflates the average lifetime of the site that built it
+    /// in exactly the profile that was meant to leave the warm-up out.
+    #[test]
+    fn a_block_carried_across_a_restart_has_no_lifetime_at_the_end() {
+        // For the whole test: a restart refuses a poisoned profiler, and a
+        // snapshot of one says so, and the flag is process-wide.
+        let _quiet = crate::internals::diagnostic::POISON_TESTS.lock();
+        static ENGINE: Engine = Engine::new();
+        ENGINE.start(TimeSource::Events, || {});
+        ENGINE.record_alloc_guarded(0x1000, Shape::of(64), &[0xAA]);
+        ENGINE
+            .reset_guarded()
+            .expect("a running engine restarts its counts");
+        ENGINE.record_alloc_guarded(0x2000, Shape::of(16), &[0xBB]);
+        for address in 0..4 {
+            ENGINE.record_alloc_guarded(0x3000 + address * 16, Shape::of(16), &[0xCC]);
+        }
+        let snapshot = Snapshot::of(&ENGINE);
+        ENGINE.stop(crate::internals::engine::Shutdown::Explicit);
+
+        let point = |frames: [usize; 1]| {
+            snapshot
+                .points
+                .iter()
+                .find(|p| p.frames == frames)
+                .expect("the point is in the snapshot")
+        };
+        assert_eq!(point([0xAA]).unretired_lifetime, 0);
+        assert_eq!(point([0xAA]).counters.curr_bytes, 64);
+        assert_eq!(
+            point([0xBB]).unretired_lifetime,
+            4,
+            "a block of the window's own lived through the four allocations after it"
+        );
+        let reset = snapshot
+            .reset
+            .expect("the snapshot says the counts restarted");
+        assert_eq!(
+            (reset.count, reset.carried_bytes, reset.carried_blocks),
+            (1, 64, 1)
+        );
+        assert_eq!(snapshot.stats.total_bytes, 16 + 4 * 16);
     }
 
     #[test]

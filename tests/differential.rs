@@ -34,6 +34,14 @@
 //! instant as its peak still agrees with itself about it. So the third test
 //! gives the run a peak whose value is fixed by the *shape* of the workload
 //! rather than by the schedule, and asks whether that is the one recorded.
+//!
+//! # Restarts
+//!
+//! `Profiler::reset` is in the generated traces too, because it is the one
+//! operation that moves every at-peak column at once without the heap moving:
+//! the restart is a peak at whatever level the heap is at, which the engine
+//! honours through the same lazy epoch it uses for every other peak. The model
+//! does it eagerly, by hand, which is what makes the two worth comparing.
 
 use std::collections::BTreeMap;
 
@@ -49,8 +57,10 @@ use proptest::prelude::*;
 /// every peak, and no concurrency at all.
 #[derive(Default)]
 struct ReferenceTracker {
-    /// Live blocks: address to (frames, size, birth).
-    live: BTreeMap<usize, (Vec<usize>, usize, u64)>,
+    /// Live blocks: address to (frames, size, birth). A birth of `None` is a
+    /// block carried across a restart, which the window did not allocate and
+    /// so gives no lifetime to.
+    live: BTreeMap<usize, (Vec<usize>, usize, Option<u64>)>,
     /// Per-program-point counters, keyed by the frames themselves.
     points: BTreeMap<Vec<usize>, Counters>,
 
@@ -60,6 +70,10 @@ struct ReferenceTracker {
     max_blocks: u64,
     total_bytes: u64,
     total_blocks: u64,
+    /// When the peak was reached, on the clock below.
+    time_at_max: u64,
+    /// New peaks since the run started or was last restarted.
+    peaks: u64,
 
     /// Mirrors the engine's clock exactly: incremented once per allocation and
     /// once per reallocation, and read without incrementing on a free.
@@ -86,11 +100,45 @@ impl ReferenceTracker {
         if self.curr_bytes >= self.max_bytes {
             self.max_bytes = self.curr_bytes;
             self.max_blocks = self.curr_blocks;
+            self.time_at_max = self.events;
+            self.peaks += 1;
             for counters in self.points.values_mut() {
                 counters.at_gmax_bytes = counters.curr_bytes;
                 counters.at_gmax_blocks = counters.curr_blocks;
             }
         }
+    }
+
+    /// The restart, as its documentation states it: every total back to zero,
+    /// everything live kept, and every peak started again from what is live.
+    ///
+    /// The peak is set here rather than by `note_peak`, because a restart is
+    /// not a new peak by the `>=` rule: live bytes have usually fallen since
+    /// the old maximum, and the restart lowers the maximum to meet them.
+    fn reset(&mut self) {
+        self.total_bytes = 0;
+        self.total_blocks = 0;
+        self.max_bytes = self.curr_bytes;
+        self.max_blocks = self.curr_blocks;
+        self.time_at_max = self.events;
+        self.peaks = 0;
+        for counters in self.points.values_mut() {
+            counters.total_bytes = 0;
+            counters.total_blocks = 0;
+            counters.total_lifetime = 0;
+            counters.max_bytes = counters.curr_bytes;
+            counters.max_blocks = counters.curr_blocks;
+            counters.at_gmax_bytes = counters.curr_bytes;
+            counters.at_gmax_blocks = counters.curr_blocks;
+        }
+        for (_, _, birth) in self.live.values_mut() {
+            *birth = None;
+        }
+    }
+
+    /// How long a block born at `birth` has lived, ending at `end`.
+    fn lifetime(birth: Option<u64>, end: u64) -> u64 {
+        birth.map_or(0, |birth| end - birth)
     }
 
     fn alloc(&mut self, address: usize, size: usize, frames: &[usize]) {
@@ -101,7 +149,8 @@ impl ReferenceTracker {
             // intervening free.
             return;
         }
-        self.live.insert(address, (frames.to_vec(), size, birth));
+        self.live
+            .insert(address, (frames.to_vec(), size, Some(birth)));
 
         self.curr_bytes += size as u64;
         self.curr_blocks += 1;
@@ -140,7 +189,7 @@ impl ReferenceTracker {
         let Some((frames, size, birth)) = self.live.remove(&address) else {
             return;
         };
-        let lifetime = self.events - birth;
+        let lifetime = Self::lifetime(birth, self.events);
 
         self.curr_bytes -= size as u64;
         self.curr_blocks -= 1;
@@ -162,8 +211,9 @@ impl ReferenceTracker {
         // because the reallocation also counts as a block, and counting a block
         // without its lifetime deflates the average-lifetime column at exactly
         // the sites a reader looks at first.
-        let old_lifetime = birth - old_birth;
-        self.live.insert(new, (old_frames.clone(), new_size, birth));
+        let old_lifetime = Self::lifetime(old_birth, birth);
+        self.live
+            .insert(new, (old_frames.clone(), new_size, Some(birth)));
 
         self.curr_bytes = self.curr_bytes - old_size as u64 + new_size as u64;
         self.total_bytes += new_size as u64;
@@ -181,8 +231,16 @@ impl ReferenceTracker {
     }
 
     /// The end-of-run state, keyed the way the engine reports it.
+    ///
+    /// A point that neither allocated in the window nor held anything in it is
+    /// left out, as the engine leaves it out. One that only holds what it
+    /// carried across a restart is kept, because its live and at-peak columns
+    /// are part of the run's.
     fn finish(self) -> BTreeMap<Vec<usize>, Counters> {
         self.points
+            .into_iter()
+            .filter(|(_, counters)| counters.total_blocks != 0 || counters.max_blocks != 0)
+            .collect()
     }
 }
 
@@ -214,6 +272,8 @@ enum Op {
         weight: u64,
         site: usize,
     },
+    /// `Profiler::reset`.
+    Reset,
 }
 
 /// Slots stand in for addresses, so the generator can produce well-formed
@@ -267,12 +327,17 @@ fn size() -> impl Strategy<Value = usize> {
 
 fn operation() -> impl Strategy<Value = Op> {
     prop_oneof![
-        3 => (0..SLOTS, size(), 0..SITES)
+        30 => (0..SLOTS, size(), 0..SITES)
             .prop_map(|(slot, size, site)| Op::Alloc { slot, size, site }),
-        2 => (0..SLOTS).prop_map(|slot| Op::Free { slot }),
-        1 => (0..SLOTS, size(), 0..SITES)
+        20 => (0..SLOTS).prop_map(|slot| Op::Free { slot }),
+        10 => (0..SLOTS, size(), 0..SITES)
             .prop_map(|(slot, new_size, site)| Op::Realloc { slot, new_size, site }),
-        1 => (0u64..4096, 0..SITES).prop_map(|(weight, site)| Op::Event { weight, site }),
+        10 => (0u64..4096, 0..SITES).prop_map(|(weight, site)| Op::Event { weight, site }),
+        // About one operation in seventy: rare enough that a window after a
+        // restart usually grows, shrinks and peaks again before the next, and
+        // common enough that a trace of a few hundred operations restarts a
+        // few times, carried blocks and all.
+        1 => Just(Op::Reset),
     ]
 }
 
@@ -349,6 +414,12 @@ fn compare(ops: &[Op]) -> Result<(), String> {
                 engine.record_event(&guard, weight, &frames);
                 reference.event(weight, &frames);
             }
+            Op::Reset => {
+                engine
+                    .reset(&guard)
+                    .map_err(|error| format!("the engine refused a restart: {error}"))?;
+                reference.reset();
+            }
         }
     }
 
@@ -397,6 +468,22 @@ fn compare(ops: &[Op]) -> Result<(), String> {
         return Err(format!(
             "blocks at peak: engine {} vs reference {}",
             stats.max_blocks, reference.max_blocks
+        ));
+    }
+    if stats.time_at_max != reference.time_at_max {
+        return Err(format!(
+            "time of the peak: engine {} vs reference {}",
+            stats.time_at_max, reference.time_at_max
+        ));
+    }
+    // The epoch counts peaks over the whole run, and the restart's own is not
+    // one the window reached; this is the figure the profile reports.
+    let since = engine.last_reset().map_or(0, |reset| reset.epoch);
+    if stats.epoch - since != reference.peaks {
+        return Err(format!(
+            "peaks in the window: engine {} vs reference {}",
+            stats.epoch - since,
+            reference.peaks
         ));
     }
 
@@ -597,6 +684,160 @@ fn hand_written_epoch_hazards_match_the_reference() {
                 },
             ],
         ),
+        (
+            "a restart below the old peak, which lowers the peak to what is live",
+            vec![
+                Op::Alloc {
+                    slot: 0,
+                    size: 4000,
+                    site: 0,
+                },
+                Op::Alloc {
+                    slot: 1,
+                    size: 100,
+                    site: 1,
+                },
+                Op::Free { slot: 0 },
+                Op::Reset,
+            ],
+        ),
+        (
+            "a point untouched after a restart, whose at-peak figures only the \
+             restart's epoch can refresh",
+            vec![
+                Op::Alloc {
+                    slot: 0,
+                    size: 4000,
+                    site: 0,
+                },
+                Op::Alloc {
+                    slot: 1,
+                    size: 100,
+                    site: 1,
+                },
+                Op::Free { slot: 1 },
+                Op::Alloc {
+                    slot: 2,
+                    size: 50,
+                    site: 1,
+                },
+                Op::Reset,
+                Op::Alloc {
+                    slot: 3,
+                    size: 50,
+                    site: 2,
+                },
+            ],
+        ),
+        (
+            "a carried block freed after the restart, which has no lifetime",
+            vec![
+                Op::Alloc {
+                    slot: 0,
+                    size: 256,
+                    site: 0,
+                },
+                Op::Alloc {
+                    slot: 1,
+                    size: 64,
+                    site: 0,
+                },
+                Op::Reset,
+                Op::Alloc {
+                    slot: 2,
+                    size: 64,
+                    site: 1,
+                },
+                Op::Free { slot: 0 },
+                Op::Free { slot: 2 },
+            ],
+        ),
+        (
+            "a carried block reallocated after the restart, whose new block is \
+             the window's",
+            vec![
+                Op::Alloc {
+                    slot: 0,
+                    size: 256,
+                    site: 0,
+                },
+                Op::Reset,
+                Op::Realloc {
+                    slot: 0,
+                    new_size: 1024,
+                    site: 1,
+                },
+                Op::Alloc {
+                    slot: 1,
+                    size: 16,
+                    site: 2,
+                },
+                Op::Free { slot: 0 },
+            ],
+        ),
+        (
+            "a point whose carried blocks are all freed after the restart",
+            vec![
+                Op::Alloc {
+                    slot: 0,
+                    size: 256,
+                    site: 0,
+                },
+                Op::Reset,
+                Op::Free { slot: 0 },
+            ],
+        ),
+        (
+            "an equal peak right after a restart, where the latest must win",
+            vec![
+                Op::Alloc {
+                    slot: 0,
+                    size: 128,
+                    site: 0,
+                },
+                Op::Reset,
+                Op::Free { slot: 0 },
+                Op::Alloc {
+                    slot: 1,
+                    size: 128,
+                    site: 1,
+                },
+            ],
+        ),
+        (
+            "two restarts with nothing between them",
+            vec![
+                Op::Alloc {
+                    slot: 0,
+                    size: 512,
+                    site: 0,
+                },
+                Op::Reset,
+                Op::Reset,
+                Op::Alloc {
+                    slot: 1,
+                    size: 32,
+                    site: 1,
+                },
+            ],
+        ),
+        (
+            "an event straddled by restarts, which moves totals and no peak",
+            vec![
+                Op::Alloc {
+                    slot: 0,
+                    size: 512,
+                    site: 0,
+                },
+                Op::Reset,
+                Op::Event {
+                    weight: 900,
+                    site: 1,
+                },
+                Op::Reset,
+                Op::Event { weight: 7, site: 2 },
+            ],
+        ),
     ];
 
     for (name, ops) in cases {
@@ -709,6 +950,287 @@ fn concurrent_traces_preserve_the_summation_invariants() {
             "attempt {attempt}: the peak is below the final live bytes"
         );
     }
+}
+
+/// Whether every row and point of `engine` sums to its run, read at a quiet
+/// point, naming the first figure that does not.
+///
+/// What a restart that raced a recording thread breaks for good: the restart
+/// zeroes the run's totals and each point's and row's, and a thread caught
+/// between its update of one and of the other leaves them apart, by an amount
+/// nothing after it ever takes back out.
+fn sums_agree(engine: &Engine) -> Result<heapscope::internals::engine::GlobalStats, String> {
+    let mut points = Counters::default();
+    let (mut thread_bytes, mut thread_blocks, mut thread_live) = (0u64, 0u64, 0u64);
+    let mut over_peak = 0usize;
+    let flush = engine.flush_and_visit(
+        Engine::FLUSH_TIMEOUT,
+        |_id, _frames, counters| {
+            points.total_bytes += counters.total_bytes;
+            points.total_blocks += counters.total_blocks;
+            points.curr_bytes += counters.curr_bytes;
+            points.curr_blocks += counters.curr_blocks;
+            points.at_gmax_bytes += counters.at_gmax_bytes;
+            points.at_gmax_blocks += counters.at_gmax_blocks;
+            if counters.curr_bytes > counters.max_bytes {
+                over_peak += 1;
+            }
+        },
+        |thread| {
+            thread_bytes += thread.counts.total_bytes;
+            thread_blocks += thread.counts.total_blocks;
+            thread_live += thread.counts.curr_bytes;
+        },
+        |_| {},
+    );
+    if !flush.exclusive {
+        return Err(String::from("the flush could not reach a quiet point"));
+    }
+    let stats = flush.stats;
+    let figures = [
+        ("points' bytes", points.total_bytes, stats.total_bytes),
+        ("points' blocks", points.total_blocks, stats.total_blocks),
+        ("points' live bytes", points.curr_bytes, stats.curr_bytes),
+        ("points' live blocks", points.curr_blocks, stats.curr_blocks),
+        (
+            "points' bytes at the peak",
+            points.at_gmax_bytes,
+            stats.max_bytes,
+        ),
+        (
+            "points' blocks at the peak",
+            points.at_gmax_blocks,
+            stats.max_blocks,
+        ),
+        ("threads' bytes", thread_bytes, stats.total_bytes),
+        ("threads' blocks", thread_blocks, stats.total_blocks),
+        ("threads' live bytes", thread_live, stats.curr_bytes),
+    ];
+    for (what, parts, whole) in figures {
+        if parts != whole {
+            return Err(format!("{what} sum to {parts}, and the run says {whole}"));
+        }
+    }
+    if over_peak > 0 {
+        return Err(format!(
+            "{over_peak} point(s) hold more than their own peak"
+        ));
+    }
+    if stats.max_bytes < stats.curr_bytes {
+        return Err(String::from("the peak is below what is live"));
+    }
+    Ok(stats)
+}
+
+/// Clears a flag when dropped, so that the threads waiting on it are let go
+/// however the thread holding this ends.
+///
+/// The restarting thread in the race tests holds one. If it panicked, on a
+/// refused restart or a failed check, without one, the threads waiting for it
+/// to finish would spin forever and a CI runner would report a timeout with no
+/// message instead of the panic.
+struct ClearOnDrop<'a>(&'a std::sync::atomic::AtomicBool);
+
+impl Drop for ClearOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// A restart lands wherever another thread happens to be, so it has to leave
+/// the counters as coherent as it found them whatever was in flight.
+///
+/// This is the test the restart's locking exists for. Workers allocate and free
+/// for real, on the shared path and the exclusive one, while another thread
+/// restarts the counts over and over, and checks after every restart that the
+/// parts still sum to the whole ([`sums_agree`]). Nothing else about the result
+/// is fixed by the schedule, and what is checked at the end is what must hold
+/// under every schedule: the sums again, the live figures equal to what the
+/// workers still hold (which a restart that touched a live counter, or a free
+/// of a carried block that went negative, would break), nothing poisoned, and
+/// every restart accepted.
+///
+/// # Why after every restart, and why the workers outlive them
+///
+/// The first version of this stopped the workers and then reset once more, so
+/// the one window it checked began at a quiet point and ended with nothing in
+/// it: every total was zero, the epoch had not moved since the restart, and
+/// every sum compared zero with zero. A restart that skipped the peak gate
+/// passed it. Each restart wipes the totals the one before it got wrong, so a
+/// check at the end sees only the last; checking after each one gives every
+/// restart its own chance to be caught. And the workers run until the
+/// restarting thread is done and then for a tail more, so the last window has
+/// allocations, frees and peaks of its own.
+///
+/// "Lands on running threads" is arranged rather than hoped for. The
+/// restarting thread holds every lock while it restarts and checks, back to
+/// back, and the platform locks are not fair, so left to itself it starved the
+/// workers: one run in seven saw fewer rounds than restarts. So before each
+/// restart it waits for the workers to finish another round apiece.
+///
+/// **Measured:** with the peak gate taken out of `Engine::reset`, this fails
+/// in 20 runs of 20, where checking only at the end failed 2 of 20.
+#[test]
+fn restarts_racing_with_allocating_threads_keep_the_counters_coherent() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    #[cfg(miri)]
+    const RESETS: usize = 3;
+    #[cfg(not(miri))]
+    const RESETS: usize = 300;
+    #[cfg(miri)]
+    const TAIL: usize = 12;
+    #[cfg(not(miri))]
+    const TAIL: usize = 2_000;
+    const THREADS: usize = 6;
+    /// The most a worker keeps live while the restarts land, so that the table
+    /// a restart sweeps stays the size it is however long they take.
+    const HELD: usize = 64;
+    // A restart sweeps every slot of both tables, which is nothing natively and
+    // most of the run under Miri. So there the tables are as small as the
+    // workload allows.
+    #[cfg(miri)]
+    const LIMITS: (usize, usize) = (1 << 10, 1 << 12);
+    #[cfg(not(miri))]
+    const LIMITS: (usize, usize) = (1 << 14, 1 << 18);
+
+    let engine = Engine::with_limits(LIMITS.0, LIMITS.1);
+    assert!(engine.start(TimeSource::Events, || {}));
+    let started = AtomicUsize::new(0);
+    let restarting = AtomicBool::new(true);
+    let raced = AtomicUsize::new(0);
+    let violation: Mutex<Option<String>> = Mutex::new(None);
+
+    let held: Vec<Vec<(usize, usize)>> = std::thread::scope(|s| {
+        let (engine, started, restarting) = (&engine, &started, &restarting);
+        let (raced, violation) = (&raced, &violation);
+        s.spawn(move || {
+            let _release_the_workers = ClearOnDrop(restarting);
+            // Not before every worker is running, so that even the first
+            // restart lands on threads that are recording.
+            while started.load(Ordering::Acquire) < THREADS {
+                std::thread::yield_now();
+            }
+            for restart in 1..=RESETS {
+                // A round per worker since the last restart, in aggregate.
+                let rounds = raced.load(Ordering::Acquire);
+                while raced.load(Ordering::Acquire) < rounds + THREADS {
+                    std::thread::yield_now();
+                }
+                let guard = heapscope::internals::guard::enter()
+                    .expect("the restarting thread is not inside the profiler");
+                engine
+                    .reset(&guard)
+                    .expect("a running engine restarts its counts");
+                drop(guard);
+                if let Err(difference) = sums_agree(engine) {
+                    *violation.lock().unwrap() =
+                        Some(format!("after restart {restart}: {difference}"));
+                    break;
+                }
+            }
+        });
+
+        let workers: Vec<_> = (0..THREADS)
+            .map(|t| {
+                s.spawn(move || {
+                    let base = 0x5_0000_0000usize + t * 0x1000_0000;
+                    let mut live: std::collections::VecDeque<(usize, usize)> =
+                        std::collections::VecDeque::new();
+                    let mut round = |i: usize, capped: bool| {
+                        let address = base + i * 128;
+                        let size = 32 + (i * 7 + t) % 512;
+                        guarded_alloc(
+                            engine,
+                            address,
+                            Shape::of(size),
+                            &frames_for((i + t) % SITES),
+                        );
+                        live.push_back((address, size));
+                        // Frees of blocks old and new, so that blocks carried
+                        // across a restart are freed after it as well as ones
+                        // the window allocated.
+                        if i.is_multiple_of(3) {
+                            if let Some((address, size)) = live.pop_back() {
+                                engine.record_free(address, size);
+                            }
+                        }
+                        if i.is_multiple_of(11) || (capped && live.len() > HELD) {
+                            if let Some((address, size)) = live.pop_front() {
+                                engine.record_free(address, size);
+                            }
+                        }
+                    };
+
+                    started.fetch_add(1, Ordering::Release);
+                    let mut i = 0;
+                    while restarting.load(Ordering::Acquire) {
+                        round(i, true);
+                        raced.fetch_add(1, Ordering::Relaxed);
+                        i += 1;
+                    }
+                    // The tail: uncapped, so the heap grows past where the last
+                    // restart left the peak and the window has peaks of its own.
+                    for _ in 0..TAIL {
+                        round(i, false);
+                        i += 1;
+                    }
+                    live.into_iter().collect()
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .map(|worker| worker.join().expect("a worker panicked"))
+            .collect()
+    });
+
+    if let Some(difference) = violation.lock().unwrap().take() {
+        panic!("a restart racing with allocations left the counters apart {difference}");
+    }
+    assert!(
+        !heapscope::internals::diagnostic::is_poisoned(),
+        "a restart racing with allocations poisoned the profiler"
+    );
+    assert_eq!(engine.resets(), RESETS as u64);
+    // By construction, and checked so that a change to the waiting above
+    // cannot quietly make the restarts race nothing.
+    assert!(
+        raced.load(Ordering::Relaxed) >= RESETS * THREADS,
+        "only {} rounds ran while {RESETS} restarts landed",
+        raced.load(Ordering::Relaxed)
+    );
+
+    let stats = sums_agree(&engine).unwrap_or_else(|difference| panic!("at the end: {difference}"));
+    let reset = engine.last_reset().expect("the run was restarted");
+    assert_eq!(reset.count, RESETS as u64);
+
+    // Every allocation was tracked. Each worker keeps a few dozen blocks live
+    // in a table sized for hundreds of thousands, so a drop here is the table
+    // refusing keys it has room for, which is what the live table once did
+    // once churn had used up its empty slots: on a loaded runner, where the
+    // workers run millions of rounds, it dropped all but the first, and every
+    // check after this one failed for a reason that was not the restart's.
+    assert_eq!(stats.dropped_blocks, 0, "the live table refused blocks");
+    // The last window is not empty, or the sums above compare zero with zero.
+    assert!(
+        stats.total_blocks > 0,
+        "nothing was allocated after the last restart"
+    );
+    assert!(
+        stats.epoch > reset.epoch,
+        "the heap never peaked after the last restart"
+    );
+    assert!(
+        stats.time_at_max >= reset.at,
+        "the window's peak is before the restart that opened it"
+    );
+
+    let live_bytes: u64 = held.iter().flatten().map(|&(_, size)| size as u64).sum();
+    let live_blocks = held.iter().map(Vec::len).sum::<usize>() as u64;
+    assert_eq!(stats.curr_bytes, live_bytes, "live bytes");
+    assert_eq!(stats.curr_blocks, live_blocks, "live blocks");
 }
 
 /// The peak a run reached must be the peak it recorded, when the threads
@@ -973,6 +1495,11 @@ fn a_peak_reached_by_racing_threads_is_the_one_recorded() {
 /// site than allocated, and sizes drawn from a small recurring set so that live
 /// bytes returns to values it has held before, are what make those two
 /// mutations detectable here.
+///
+/// One thread also restarts the counts now and then, under the same lock, so
+/// that blocks allocated on one thread before a restart are freed and
+/// reallocated on others after it, and the restart's sweep over every shard of
+/// the live table meets the pointer-sharded access pattern it has to survive.
 #[test]
 fn concurrent_threads_agree_with_the_reference_tracker() {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -986,6 +1513,10 @@ fn concurrent_threads_agree_with_the_reference_tracker() {
     /// A small recurring set, so equal peaks actually occur. Equal peaks are the
     /// only place the epoch's `>=` rule differs from `>`.
     const SIZES: [usize; 4] = [64, 128, 256, 512];
+    /// How often thread 0 restarts the counts: a handful of times a run, so
+    /// each window is long enough to grow and peak again in.
+    /// Once under Miri, where it sweeps tables of a quarter of a million slots.
+    const RESET_EVERY: usize = if cfg!(miri) { 15 } else { 211 };
 
     let engine = Engine::with_limits(1 << 14, 1 << 18);
     assert!(engine.start(TimeSource::Events, || {}));
@@ -1000,14 +1531,28 @@ fn concurrent_threads_agree_with_the_reference_tracker() {
     let reallocs = AtomicUsize::new(0);
     let frees = AtomicUsize::new(0);
     let equal_peaks = AtomicUsize::new(0);
+    let resets = AtomicUsize::new(0);
 
     std::thread::scope(|s| {
         for t in 0..THREADS {
             let (engine, model, pool) = (&engine, &model, &pool);
             let (next_address, reallocs, frees) = (&next_address, &reallocs, &frees);
-            let equal_peaks = &equal_peaks;
+            let (equal_peaks, resets) = (&equal_peaks, &resets);
             s.spawn(move || {
                 for i in 0..ROUNDS {
+                    if t == 0 && i % RESET_EVERY == RESET_EVERY / 2 {
+                        let guard = heapscope::internals::guard::enter()
+                            .expect("a worker thread is not inside the profiler");
+                        let mut model = model.lock().unwrap();
+                        engine
+                            .reset(&guard)
+                            .expect("a running engine restarts its counts");
+                        model.reset();
+                        drop(model);
+                        resets.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+
                     if i % 3 == 0 {
                         let taken = pool.lock().unwrap().pop();
                         if let Some((address, size)) = taken {
@@ -1185,6 +1730,10 @@ fn concurrent_threads_agree_with_the_reference_tracker() {
          distinguish the epoch's `>=` rule from `>`",
         equal_peaks.load(Ordering::Relaxed)
     );
+    assert!(
+        resets.load(Ordering::Relaxed) > 0,
+        "the run never restarted, so it says nothing about restarts"
+    );
 
     let mut actual: BTreeMap<Vec<usize>, Counters> = BTreeMap::new();
     let flush = engine.flush_and_visit(
@@ -1208,6 +1757,9 @@ fn concurrent_threads_agree_with_the_reference_tracker() {
     );
     assert_eq!(stats.max_bytes, reference.max_bytes, "peak bytes");
     assert_eq!(stats.max_blocks, reference.max_blocks, "blocks at peak");
+    assert_eq!(stats.time_at_max, reference.time_at_max, "time of the peak");
+    let since = engine.last_reset().map_or(0, |reset| reset.epoch);
+    assert_eq!(stats.epoch - since, reference.peaks, "peaks in the window");
 
     let expected = reference.finish();
     for (frames, want) in &expected {

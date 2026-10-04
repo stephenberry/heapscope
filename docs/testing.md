@@ -34,7 +34,7 @@ compile(FIXTURE);
 heapscope::assert_alloc_count!(since: mark, <= 4, "while compiling {name}");
 ```
 
-A mark recording more allocations than the run has made did not come unchanged from that run, and the count since it is unknown, so the assertion fails instead of counting zero. A failure since a mark still writes a profile of the whole run, because a mark holds totals and no program points, and its message says so; the sites it prints for a failing count are ranked by how many allocations they made rather than by bytes. The count, the mark and the message's arguments are evaluated before the counters are read, so an argument that allocates, such as `path.display().to_string()`, is counted into the stage. A name captured in the format string, like `{name}` above, costs nothing unless the assertion fails.
+A mark recording more allocations than the run has made did not come unchanged from that run, and the count since it is unknown, so the assertion fails instead of counting zero. A failure since a mark still writes a profile of everything since the run started or its counts were last restarted, because a mark holds totals and no program points, and its message says so; the sites it prints for a failing count are ranked by how many allocations they made rather than by bytes. The count, the mark and the message's arguments are evaluated before the counters are read, so an argument that allocates, such as `path.display().to_string()`, is counted into the stage. A name captured in the format string, like `{name}` above, costs nothing unless the assertion fails.
 
 `assert_max_bytes!` takes no mark. Two readings of a running maximum often settle a budget for a stage: a peak still within the limit passes, and a peak that rose after the mark was the stage's. They cannot settle a peak above the limit that was reached before the mark and has not moved, because the stage's own peak could be anything up to it, and an assertion that only sometimes knows the answer is not offered.
 
@@ -49,3 +49,21 @@ The file is a handful of `key value` lines, recorded by running with `HEAPSCOPE_
 One constraint worth knowing before you write the second such test: there is one profiler per process, and it measures the whole process for as long as it is alive. `cargo test` runs a binary's tests concurrently, so budgets belong in an integration test of their own containing one `#[test]`.
 
 Sampled runs are refused here rather than accommodated. [Every figure a sampled run produces is an estimate](performance.md#paying-less-on-purpose), including the peak, and comparing a budget against a draw from a distribution is a flaky test wearing a threshold.
+
+## A budget for the steady state, without the warm-up
+
+`Profiler::reset` restarts the counts and keeps what is live, so a bare `assert_max_bytes!` after it measures the peak *since the reset*: how high the work climbed on top of what setup left behind, with setup's own transient peak forgotten. That is usually the budget that was meant, and nothing read before the reset is needed:
+
+```rust
+let profiler = heapscope::Profiler::builder().no_output().build().unwrap();
+let cache = build_cache();          // setup, left out of the budget
+profiler.reset().unwrap();
+let after_setup = heapscope::HeapStats::get().unwrap().curr_bytes;
+
+serve(REQUESTS);
+heapscope::assert_max_bytes!(after_setup + 64 * 1024);
+```
+
+The peak starts again from what is live, so the budget includes what setup left live, which is why it is written on top of the live bytes read right after the reset. `assert_alloc_count!` counts from the reset too.
+
+A mark read before the reset is from another window: its totals and its peak cannot be compared with anything read afterwards. `assert_alloc_count!(since: mark)` refuses one and says to read the mark after the reset, and `HeapStats::resets` counts the resets a reading has seen, for code that subtracts one reading from another. Its live figures carry across the reset unchanged, so `assert_no_leaks!(since: mark)` with a mark from before the reset is a fair question, whether setup and the work together left anything behind, and is answered.

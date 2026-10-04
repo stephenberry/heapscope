@@ -80,7 +80,7 @@ musl / Alpine is not supported and never will be. All four targets run the suite
 - [Symbolization](docs/symbolization.md) — resolving offline, and the `heapscope-symbolize` tool
 - [Performance](docs/performance.md) — what profiling costs, measured, and how to pay less
 - [Stack capture](docs/stack-capture.md) — which unwinder, why, and how much to trust the frames
-- [When the profile gets written](docs/lifecycle.md) — exits, `fork`, signals
+- [When the profile gets written](docs/lifecycle.md) — exits, `fork`, signals, leaving a warm-up out
 - [Platforms and requirements](docs/platforms.md) — where this is verified, and the MSRV
 - [Design decisions](docs/design.md) — the zero-dependency rule, non-goals, and where we diverge from Valgrind
 

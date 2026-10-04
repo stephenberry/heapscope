@@ -18,14 +18,36 @@
 //!   to prevent.
 //! - **A mode carries only what it measured.** Same rule as the DHAT
 //!   validator's: block lifetimes are omitted, not zeroed, where there are none.
+//! - **A restart is declared, and only a restart relaxes anything.** After
+//!   `Profiler::reset` the totals describe a window and the live figures do not,
+//!   so a few rules of the form "cannot hold more than it allocated" stop being
+//!   true. Each is relaxed only where `run.reset` says so, and to the bound that
+//!   still holds rather than to nothing.
 
 #![allow(dead_code)]
 
 use super::json::{self, Value};
 
-/// The version this crate writes. A file claiming any other version is one this
-/// validator's rules were not written against.
+/// The version this crate writes for a run that was never restarted. A file
+/// claiming a version other than this or [`RESTARTED_FORMAT_VERSION`] is one
+/// this validator's rules were not written against.
 const FORMAT_VERSION: u64 = 1;
+
+/// The version a restarted run is written at, and the only one it may be: the
+/// figures of a restarted run mean something a version 1 reader would misread.
+const RESTARTED_FORMAT_VERSION: u64 = 2;
+
+/// What `run.reset` declares, for the rules a restart changes.
+#[derive(Debug, Default, Clone, Copy)]
+struct Restart {
+    /// Bytes live at the restart, which the window counts as live without
+    /// having allocated them.
+    carried_bytes: u64,
+    /// Blocks live at the restart. See `carried_bytes`.
+    carried_blocks: u64,
+    /// The part of `notRecorded.blocks` from before the window.
+    dropped_blocks: u64,
+}
 
 /// Per-point fields that exist only where blocks have lifetimes.
 const LIFETIME_FIELDS: [&str; 8] = [
@@ -62,11 +84,12 @@ pub fn problems(text: &str) -> Vec<String> {
         )),
         None => problems.push(String::from("missing top-level `format`")),
     }
-    match root.get("formatVersion").and_then(Value::as_u64) {
-        Some(FORMAT_VERSION) => {}
+    let version = root.get("formatVersion").and_then(Value::as_u64);
+    match version {
+        Some(FORMAT_VERSION | RESTARTED_FORMAT_VERSION) => {}
         Some(other) => problems.push(format!(
-            "`formatVersion` is {other}, not {FORMAT_VERSION}; these rules were \
-             written against {FORMAT_VERSION}"
+            "`formatVersion` is {other}, not {FORMAT_VERSION} or \
+             {RESTARTED_FORMAT_VERSION}; these rules were written against those"
         )),
         None => problems.push(String::from("missing integer `formatVersion`")),
     }
@@ -86,9 +109,23 @@ pub fn problems(text: &str) -> Vec<String> {
         problems.push(String::from("missing string `producer`"));
     }
 
-    let lifetimes = check_run(root, &mut problems);
+    let (lifetimes, restart) = check_run(root, &mut problems);
+    // Both directions. A restarted file at version 1 is the one a reader that
+    // predates restarts would misread; a file never restarted at version 2 is
+    // one that reader refuses for nothing.
+    match (version, restart.is_some()) {
+        (Some(FORMAT_VERSION), true) => problems.push(String::from(
+            "the run was restarted and the file says version 1, so a reader that \
+             predates restarts would take the window's totals for the run's",
+        )),
+        (Some(RESTARTED_FORMAT_VERSION), false) => problems.push(String::from(
+            "the file says version 2 and declares no restart, so a reader that \
+             predates restarts refuses a file it could have read",
+        )),
+        _ => {}
+    }
     check_settings(root, &mut problems);
-    let totals = check_totals(root, lifetimes, &mut problems);
+    let totals = check_totals(root, lifetimes, restart, &mut problems);
     check_shapes(root, lifetimes, &totals, &mut problems);
     check_self_metrics(root, &mut problems);
     // Whether the counters were read under exclusion decides how strict the
@@ -167,6 +204,9 @@ struct Totals {
     max_bytes: u64,
     dropped_blocks: u64,
     rows_dropped: u64,
+    /// Present when the counts were restarted, which is what each relaxed rule
+    /// below asks before it relaxes.
+    restart: Option<Restart>,
 }
 
 /// Reads `object[field]` as an integer, reporting its absence.
@@ -199,10 +239,11 @@ fn object<'a>(root: &'a Value, path: &str, problems: &mut Vec<String>) -> Option
     Some(current)
 }
 
-/// Returns whether the run's mode has block lifetimes.
-fn check_run(root: &Value, problems: &mut Vec<String>) -> bool {
+/// Returns whether the run's mode has block lifetimes, and the restart it
+/// declares, if any.
+fn check_run(root: &Value, problems: &mut Vec<String>) -> (bool, Option<Restart>) {
     let Some(run) = object(root, "run", problems) else {
-        return false;
+        return (false, None);
     };
 
     let mode = run.get("mode").and_then(Value::as_str).unwrap_or_default();
@@ -213,7 +254,7 @@ fn check_run(root: &Value, problems: &mut Vec<String>) -> bool {
             problems.push(format!(
                 "`run.mode` is {other:?}, which is not one of heap, ad-hoc, copy"
             ));
-            return false;
+            return (false, None);
         }
     };
 
@@ -234,15 +275,80 @@ fn check_run(root: &Value, problems: &mut Vec<String>) -> bool {
     // The same rule the DHAT validator applies to `tg`: an event was never live,
     // so the instant at which live bytes were greatest is not a measurement that
     // exists, and a zero would claim it does.
-    if lifetimes {
-        integer(run, "run", "timeAtMax", problems);
-    } else if run.get("timeAtMax").is_some() {
-        problems.push(format!(
-            "`run.timeAtMax` is present in {mode} mode, which has no peak; it \
-             must be omitted, not zeroed"
+    let time_at_max = if lifetimes {
+        integer(run, "run", "timeAtMax", problems)
+    } else {
+        if run.get("timeAtMax").is_some() {
+            problems.push(format!(
+                "`run.timeAtMax` is present in {mode} mode, which has no peak; it \
+                 must be omitted, not zeroed"
+            ));
+        }
+        None
+    };
+
+    let restart = run
+        .get("reset")
+        .and_then(|_| check_reset(run, lifetimes, time_at_max, problems));
+    (lifetimes, restart)
+}
+
+/// `run.reset`, which is present only when the counts were restarted.
+fn check_reset(
+    run: &Value,
+    lifetimes: bool,
+    time_at_max: Option<u64>,
+    problems: &mut Vec<String>,
+) -> Option<Restart> {
+    let reset = object(run, "reset", problems)?;
+    let count = integer(reset, "run.reset", "count", problems);
+    let at = integer(reset, "run.reset", "at", problems);
+    let dropped_blocks = integer(reset, "run.reset", "notRecordedBlocks", problems).unwrap_or(0);
+    if count == Some(0) {
+        problems.push(String::from(
+            "`run.reset` is present and counts no restart; a run never restarted \
+             leaves it out",
         ));
     }
-    lifetimes
+    let end = run.get("timeAtEnd").and_then(Value::as_u64);
+    if let (Some(at), Some(end)) = (at, end) {
+        if at > end {
+            problems.push(format!(
+                "the counts were restarted at {at}, after the run ended at {end}"
+            ));
+        }
+    }
+    // The restart is the window's first peak, so the window's greatest one
+    // cannot be before it.
+    if let (Some(at), Some(peak)) = (at, time_at_max) {
+        if peak < at {
+            problems.push(format!(
+                "the peak was at {peak}, before the restart at {at} that began \
+                 the window it is the peak of"
+            ));
+        }
+    }
+    let (carried_bytes, carried_blocks) = if lifetimes {
+        (
+            integer(reset, "run.reset", "carriedBytes", problems).unwrap_or(0),
+            integer(reset, "run.reset", "carriedBlocks", problems).unwrap_or(0),
+        )
+    } else {
+        for field in ["carriedBytes", "carriedBlocks"] {
+            if reset.get(field).is_some() {
+                problems.push(format!(
+                    "`run.reset.{field}` is present in a mode with no live \
+                     blocks; it must be omitted, not zeroed"
+                ));
+            }
+        }
+        (0, 0)
+    };
+    Some(Restart {
+        carried_bytes,
+        carried_blocks,
+        dropped_blocks,
+    })
 }
 
 fn check_settings(root: &Value, problems: &mut Vec<String>) {
@@ -267,8 +373,21 @@ fn check_settings(root: &Value, problems: &mut Vec<String>) {
     }
 }
 
-fn check_totals(root: &Value, lifetimes: bool, problems: &mut Vec<String>) -> Totals {
-    let mut totals = Totals::default();
+fn check_totals(
+    root: &Value,
+    lifetimes: bool,
+    restart: Option<Restart>,
+    problems: &mut Vec<String>,
+) -> Totals {
+    let mut totals = Totals {
+        restart,
+        ..Totals::default()
+    };
+    // What the heap held without the window having allocated it. Every live
+    // byte was either allocated in the window or carried into it, so the live
+    // figures are bounded by the two together, which is the original rule
+    // wherever nothing was carried.
+    let carried = restart.map_or(0, |restart| restart.carried_bytes);
 
     if let Some(value) = object(root, "totals", problems) {
         totals.total_bytes = integer(value, "totals", "totalBytes", problems).unwrap_or(0);
@@ -291,15 +410,17 @@ fn check_totals(root: &Value, lifetimes: bool, problems: &mut Vec<String>) -> To
                 }
             }
         }
-        if totals.curr_bytes > totals.total_bytes {
+        if totals.curr_bytes > totals.total_bytes + carried {
             problems.push(format!(
-                "`totals.currBytes` is {} but only {} bytes were ever allocated",
+                "`totals.currBytes` is {} but only {} bytes were ever allocated \
+                 and {carried} carried across a restart",
                 totals.curr_bytes, totals.total_bytes
             ));
         }
-        if lifetimes && totals.max_bytes > totals.total_bytes {
+        if lifetimes && totals.max_bytes > totals.total_bytes + carried {
             problems.push(format!(
-                "`totals.maxBytes` is {} but only {} bytes were ever allocated",
+                "`totals.maxBytes` is {} but only {} bytes were ever allocated \
+                 and {carried} carried across a restart",
                 totals.max_bytes, totals.total_bytes
             ));
         }
@@ -311,6 +432,15 @@ fn check_totals(root: &Value, lifetimes: bool, problems: &mut Vec<String>) -> To
             integer(value, "notRecorded", "attributionRows", problems).unwrap_or(0);
         for field in ["programPoints", "unattributedBlocks", "refusedEvents"] {
             integer(value, "notRecorded", field, problems);
+        }
+    }
+    if let Some(restart) = restart {
+        if restart.dropped_blocks > totals.dropped_blocks {
+            problems.push(format!(
+                "{} blocks went unrecorded before the restart, more than the {} \
+                 the whole run did",
+                restart.dropped_blocks, totals.dropped_blocks
+            ));
         }
     }
 
@@ -454,13 +584,19 @@ fn check_shapes(
     // counts none is out by the drop count. A single-threaded or already-stopped
     // profile — every hand-built one, and every ordinary run — must be exact,
     // because a thousandth of a small number is zero.
-    let recorded = totals.total_blocks + totals.dropped_blocks;
+    //
+    // After a restart the histograms are the window's, and so are the totals,
+    // but `notRecorded.blocks` is the whole run's: the part of it from before
+    // the window is what `run.reset` records, so that it can be taken off here.
+    let before = totals.restart.map_or(0, |restart| restart.dropped_blocks);
+    let dropped = totals.dropped_blocks.saturating_sub(before);
+    let recorded = totals.total_blocks + dropped;
     if records_allocations && observed.abs_diff(recorded).saturating_mul(1_000) > recorded {
         problems.push(format!(
             "{observed} allocation requests were observed but the totals account \
-             for {recorded} ({} recorded plus {} dropped), which is further apart \
-             than threads in flight can explain",
-            totals.total_blocks, totals.dropped_blocks
+             for {recorded} ({} recorded plus {dropped} dropped in the window), \
+             which is further apart than threads in flight can explain",
+            totals.total_blocks
         ));
     }
     if !records_allocations && observed != 0 {
@@ -510,14 +646,25 @@ fn check_tally(
     // A row cannot hold more than it ever allocated, and cannot be holding more
     // now than the most it ever held. Both are arithmetic the row does for
     // itself, so a row that fails one has a counter moving without its pair.
+    //
+    // After a restart the first is true only up to what the row carried: it
+    // can peak on blocks it held at the restart and did not allocate in the
+    // window. The file does not say what each row carried, but no row carried
+    // more than the run did, so the run's figure is the bound, and without a
+    // restart it is zero and the rule is the original. The second holds
+    // unchanged, because the restart starts each peak from what the row held.
+    let (carried_bytes, carried_blocks) = totals.restart.map_or((0, 0), |restart| {
+        (restart.carried_bytes, restart.carried_blocks)
+    });
     if curr_bytes > max_bytes {
         problems.push(format!(
             "`{path}` holds {curr_bytes} bytes, more than its own peak of {max_bytes}"
         ));
     }
-    if max_bytes > total_bytes {
+    if max_bytes > total_bytes + carried_bytes {
         problems.push(format!(
-            "`{path}` peaked at {max_bytes} bytes having only ever allocated {total_bytes}"
+            "`{path}` peaked at {max_bytes} bytes having allocated {total_bytes} \
+             and the run carried {carried_bytes} across a restart"
         ));
     }
     if curr_blocks > max_blocks {
@@ -525,9 +672,10 @@ fn check_tally(
             "`{path}` holds {curr_blocks} blocks, more than its own peak of {max_blocks}"
         ));
     }
-    if max_blocks > total_blocks {
+    if max_blocks > total_blocks + carried_blocks {
         problems.push(format!(
-            "`{path}` peaked at {max_blocks} blocks having only ever allocated {total_blocks}"
+            "`{path}` peaked at {max_blocks} blocks having allocated {total_blocks} \
+             and the run carried {carried_blocks} across a restart"
         ));
     }
     // A row's live bytes are a subset of the run's at every instant, so its
@@ -1051,10 +1199,24 @@ fn check_points(
                 .and_then(Value::as_u64)
                 .unwrap_or(0);
 
+            // The same rule a row follows, bounded after a restart the same
+            // way: a point can peak on what it carried into the window, and no
+            // point carried more than the run did.
+            let (carried_bytes, carried_blocks) = totals.restart.map_or((0, 0), |restart| {
+                (restart.carried_bytes, restart.carried_blocks)
+            });
             let max = point.get("maxBytes").and_then(Value::as_u64).unwrap_or(0);
-            if max > bytes {
+            if max > bytes + carried_bytes {
                 problems.push(format!(
-                    "a point peaked at {max} bytes having only ever allocated {bytes}"
+                    "a point peaked at {max} bytes having allocated {bytes} and the \
+                     run carried {carried_bytes} across a restart"
+                ));
+            }
+            let max_blocks = point.get("maxBlocks").and_then(Value::as_u64).unwrap_or(0);
+            if max_blocks > blocks + carried_blocks {
+                problems.push(format!(
+                    "a point peaked at {max_blocks} blocks having allocated {blocks} \
+                     and the run carried {carried_blocks} across a restart"
                 ));
             }
         } else {

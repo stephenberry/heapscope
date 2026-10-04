@@ -14,7 +14,7 @@ The [README](../README.md) gets you a first profile. These pages are the detail 
 
 - [Performance](performance.md) — what profiling costs, measured, and how to pay less
 - [Stack capture](stack-capture.md) — which unwinder, why, and how much to trust the frames
-- [When the profile gets written](lifecycle.md) — exits, `fork`, signals
+- [When the profile gets written](lifecycle.md) — exits, `fork`, signals, leaving a warm-up out
 - [Platforms and requirements](platforms.md) — where this is verified, and the MSRV
 
 ## Why it is built this way

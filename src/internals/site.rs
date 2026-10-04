@@ -300,17 +300,21 @@ pub struct Tally {
 /// One row's counters, read out.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TallyStats {
-    /// Bytes ever allocated by this thread, or in this region.
+    /// Bytes allocated by this thread, or in this region, since the run
+    /// started or its counts were last restarted.
     pub total_bytes: u64,
-    /// Blocks ever allocated. In a non-heap run, events recorded.
+    /// Blocks allocated since the run started or its counts were last
+    /// restarted. In a non-heap run, events recorded.
     pub total_blocks: u64,
     /// Bytes still live.
     pub curr_bytes: u64,
     /// Blocks still live.
     pub curr_blocks: u64,
-    /// Greatest `curr_bytes` this row ever reached.
+    /// Greatest `curr_bytes` this row reached since the run started or its
+    /// counts were last restarted.
     pub max_bytes: u64,
-    /// Greatest `curr_blocks` this row ever reached.
+    /// Greatest `curr_blocks` this row reached since the run started or its
+    /// counts were last restarted.
     pub max_blocks: u64,
 }
 
@@ -352,6 +356,18 @@ pub struct OutsideRegions {
     pub curr_bytes: u64,
     /// Blocks allocated outside every region and still live.
     pub curr_blocks: u64,
+}
+
+impl TallyStats {
+    /// Whether this row has nothing to report.
+    ///
+    /// The same rule [`Counters::is_empty`](super::pp::Counters::is_empty)
+    /// states for a program point, for the same reason: after a restart of the
+    /// counts a row may hold carried blocks and have allocated nothing since,
+    /// and the thread rows sum to the live totals, so it has to be reported.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.total_blocks == 0 && self.max_blocks == 0
+    }
 }
 
 impl Tally {
@@ -439,6 +455,22 @@ impl Tally {
             }
             _ => {}
         }
+    }
+
+    /// Restarts the row's counts, keeping what it holds.
+    ///
+    /// Totals return to zero and the row's own peak to what it holds now, which
+    /// is the most it has held since. The caller must hold the peak gate
+    /// exclusively: every [`Tally::apply`] runs under it, so that is what makes
+    /// the four stores below one step rather than four that an allocation can
+    /// land between.
+    pub fn restart(&self) {
+        self.total_bytes.store(0, Ordering::Relaxed);
+        self.total_blocks.store(0, Ordering::Relaxed);
+        self.max_bytes
+            .store(self.curr_bytes.load(Ordering::Relaxed), Ordering::Relaxed);
+        self.max_blocks
+            .store(self.curr_blocks.load(Ordering::Relaxed), Ordering::Relaxed);
     }
 
     /// Reads the row.
@@ -789,7 +821,7 @@ impl Threads {
         }
 
         let counts = self.overflow.tally.snapshot();
-        if counts.total_blocks != 0 {
+        if !counts.is_empty() {
             f(ThreadView {
                 id: ThreadId::OVERFLOW,
                 name: Name::EMPTY,
@@ -797,6 +829,21 @@ impl Threads {
                 counts,
             });
         }
+    }
+
+    /// Restarts every row's counts. See [`Tally::restart`], whose requirement
+    /// on the peak gate applies here too.
+    ///
+    /// The rows themselves stay, with their names and the instant each thread
+    /// was first seen: those are facts about the threads, not counts, and the
+    /// time axis a restart leaves in place is the one they were read on.
+    pub fn restart(&self) {
+        for index in 0..self.len() {
+            if let Some(record) = self.record(index) {
+                record.tally.restart();
+            }
+        }
+        self.overflow.tally.restart();
     }
 
     /// The row at `index`, if one has been published there.
@@ -993,6 +1040,9 @@ impl Regions {
     /// the second as the first. Same rule as the overflow row: a row appears
     /// once it has something to say.
     ///
+    /// A restart of the counts changes none of this. A region holding blocks
+    /// from before one was entered before one, and `entries` is not restarted.
+    ///
     /// [`Engine::intern_region`]: crate::internals::engine::Engine::intern_region
     pub fn visit(&self, mut f: impl FnMut(RegionView)) {
         for index in 0..self.len() {
@@ -1008,6 +1058,24 @@ impl Regions {
         if self.overflow.entries.load(Ordering::Relaxed) != 0 {
             f(view(RegionId::OVERFLOW, &self.overflow));
         }
+    }
+
+    /// Restarts every row's counts. See [`Tally::restart`], whose requirement
+    /// on the peak gate applies here too.
+    ///
+    /// `entries` and `active` are left alone. They describe the phases, the way
+    /// a thread's name describes the thread, and a guard moves them outside the
+    /// peak gate: restarting `entries` from `active` would race a guard entering
+    /// between the two atomic operations and could leave a row open more times
+    /// than it was entered. Counted over the run, `active <= entries` holds by
+    /// construction.
+    pub fn restart(&self) {
+        for index in 0..self.len() {
+            if let Some(record) = self.record(index) {
+                record.tally.restart();
+            }
+        }
+        self.overflow.tally.restart();
     }
 
     /// Acquires the intern lock, for a `pthread_atfork` prepare handler.
@@ -1443,6 +1511,73 @@ mod tests {
         let mut overflowed = Vec::new();
         threads.visit(|row| overflowed.push(row.id));
         assert_eq!(overflowed, vec![ThreadId(0), ThreadId::OVERFLOW]);
+    }
+
+    /// A restart keeps what a row holds and starts its totals and its own peak
+    /// again from there, and a row holding nothing but carried blocks is still
+    /// reported: the thread rows sum to what is live.
+    #[test]
+    fn a_restarted_row_keeps_what_it_holds() {
+        let tally = Tally::new();
+        tally.apply(1_000, 2, 1_000, 2);
+        tally.apply(-600, -1, 0, 0);
+        tally.restart();
+
+        let stats = tally.snapshot();
+        assert_eq!(
+            stats,
+            TallyStats {
+                total_bytes: 0,
+                total_blocks: 0,
+                curr_bytes: 400,
+                curr_blocks: 1,
+                max_bytes: 400,
+                max_blocks: 1,
+            }
+        );
+        assert!(!stats.is_empty(), "a row holding a carried block is empty");
+
+        // Freeing the carried block brings the row to zero, not past it, and
+        // leaves the peak it had since the restart.
+        tally.apply(-400, -1, 0, 0);
+        let drained = tally.snapshot();
+        assert_eq!((drained.curr_bytes, drained.max_bytes), (0, 400));
+
+        let arena = arena();
+        let threads = Threads::new();
+        threads.claim(&arena, Name::of("worker"), 0);
+        let overflow = threads
+            .tally(ThreadId::OVERFLOW)
+            .expect("the overflow row always exists");
+        overflow.apply(16, 1, 16, 1);
+        threads.restart();
+        let mut rows = Vec::new();
+        threads.visit(|row| rows.push((row.id, row.counts)));
+        assert_eq!(
+            rows.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec![ThreadId(0), ThreadId::OVERFLOW],
+            "the shared row holds a carried block and was left out"
+        );
+        assert_eq!(rows[1].1.total_blocks, 0);
+        assert_eq!(rows[1].1.curr_bytes, 16);
+
+        // A region's entries are about the phase, not the window, and are not
+        // restarted: a region open across the restart must never read as open
+        // more times than it was entered.
+        let regions = Regions::new();
+        let id = regions.intern(&arena, "warm-up", 0);
+        regions.enter(id);
+        regions
+            .tally(id)
+            .expect("an interned row")
+            .apply(64, 1, 64, 1);
+        regions.restart();
+        let mut seen = Vec::new();
+        regions.visit(|row| seen.push((row.entries, row.active, row.counts)));
+        assert_eq!(seen.len(), 1);
+        let (entries, active, counts) = seen[0];
+        assert_eq!((entries, active), (1, 1));
+        assert_eq!((counts.total_bytes, counts.curr_bytes), (0, 64));
     }
 
     #[test]
