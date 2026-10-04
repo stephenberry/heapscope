@@ -547,6 +547,19 @@ impl Default for Settings {
     }
 }
 
+/// What [`Engine::visit_regions`] read beside the rows, all of it at the one
+/// instant the rows were.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RegionsReading {
+    /// The run's counters.
+    pub stats: GlobalStats,
+    /// The totals less everything the region rows account for.
+    pub outside: OutsideRegions,
+    /// Restarts of the counts that had completed, which says which window the
+    /// totals, the rows' and the remainder's, belong to.
+    pub resets: u64,
+}
+
 /// Snapshot of the engine's global state.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct GlobalStats {
@@ -2054,13 +2067,20 @@ impl Engine {
         &self,
         timeout: Duration,
         visit_region: impl FnMut(RegionView),
-    ) -> Option<(GlobalStats, OutsideRegions)> {
+    ) -> Option<RegionsReading> {
         let _order = super::order::enter(super::order::Level::PeakGate);
         let _guard = self.gate.write_for(timeout)?;
         let stats = self.stats();
         self.regions.visit(visit_region);
         let outside = self.outside_regions(&stats, true);
-        Some((stats, outside))
+        Some(RegionsReading {
+            stats,
+            outside,
+            // Exact, and of the same window as the rows: a restart holds the
+            // gate from its odd store to its even one, so with the gate held
+            // here no restart is under way and none can begin.
+            resets: self.resets(),
+        })
     }
 
     /// The totals in `stats` less everything the region table accounts for.
@@ -3052,7 +3072,11 @@ mod tests {
 
         // The cheaper reading agrees with the full one, and visits the same rows.
         let mut visited = 0;
-        let (cheap_stats, cheap) = engine
+        let RegionsReading {
+            stats: cheap_stats,
+            outside: cheap,
+            ..
+        } = engine
             .visit_regions(Engine::FLUSH_TIMEOUT, |_| visited += 1)
             .expect("nothing else holds the gate");
         assert_eq!(cheap, outside);
@@ -3090,9 +3114,10 @@ mod tests {
         engine.record_alloc_guarded(0x10, Shape::of(4_000), &[0xB0]);
         engine.record_alloc_guarded(0x20, Shape::of(96), &[0xB0]);
         engine.record_free(0x20, 96);
-        let (_, before) = engine
+        let before = engine
             .visit_regions(Engine::FLUSH_TIMEOUT, |_| {})
-            .expect("nothing else holds the gate");
+            .expect("nothing else holds the gate")
+            .outside;
         assert_eq!(before.total_bytes, 4_096);
         assert_eq!(before.curr_bytes, 4_000);
 
@@ -3133,10 +3158,15 @@ mod tests {
                 // Summed in the visitor, which may not allocate, so that the
                 // rows checked are the rows read in the window.
                 let (mut bytes, mut blocks) = (0u64, 0u64);
-                let Some((stats, now)) = engine.visit_regions(Engine::FLUSH_TIMEOUT, |row| {
+                let Some(RegionsReading {
+                    stats,
+                    outside: now,
+                    ..
+                }) = engine.visit_regions(Engine::FLUSH_TIMEOUT, |row| {
                     bytes += row.counts.total_bytes;
                     blocks += row.counts.total_blocks;
-                }) else {
+                })
+                else {
                     continue;
                 };
                 assert_eq!(
@@ -3267,9 +3297,10 @@ mod tests {
         drop(guard);
         close(&engine, retrying, previous);
 
-        let (_, outside) = engine
+        let outside = engine
             .visit_regions(Engine::FLUSH_TIMEOUT, |_| {})
-            .expect("nothing else holds the gate");
+            .expect("nothing else holds the gate")
+            .outside;
         assert_eq!(
             outside,
             OutsideRegions {
@@ -4522,9 +4553,14 @@ mod tests {
 
         reset(&engine);
 
-        let (_, outside) = engine
+        let first = engine
             .visit_regions(Engine::FLUSH_TIMEOUT, |_| {})
             .expect("a quiet engine can be read");
+        assert_eq!(
+            first.resets, 1,
+            "the reading does not say which window it is of"
+        );
+        let outside = first.outside;
         assert_eq!(
             outside,
             OutsideRegions {
@@ -4543,7 +4579,7 @@ mod tests {
         close(&engine, parsing, outer);
         engine.record_alloc_guarded(0x5000, Shape::of(7), &[0xA5]);
 
-        let (stats, outside) = engine
+        let RegionsReading { stats, outside, .. } = engine
             .visit_regions(Engine::FLUSH_TIMEOUT, |_| {})
             .expect("a quiet engine can be read");
         assert_eq!(

@@ -55,7 +55,7 @@ heapscope regions
 
 A region is scoped to the calling thread and nests to any depth. A process-wide "current phase" would be worse than either: it attributes whatever a background thread happens to be doing to whichever phase some other thread is in.
 
-Names are interned, so entering `"parsing"` a thousand times is one row that says it was entered a thousand times. Each row's peak is its own — the most that thread or region held at once since the run started or its counts were restarted, which may well have been at an instant when the whole heap was nowhere near its maximum. `region` costs two atomic loads and a branch when nothing is profiling, so instrumentation can be left in place.
+Names are interned, so entering `"parsing"` a thousand times is one row that says it was entered a thousand times. Each row's peak is its own — the most that thread or region held at once since the run started or its counts were last restarted, which may well have been at an instant when the whole heap was nowhere near its maximum. `region` costs two atomic loads and a branch when nothing is profiling, so instrumentation can be left in place.
 
 ### What no region covered
 

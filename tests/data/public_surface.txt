@@ -61,6 +61,7 @@ field heapscope::RegionBreakdown::mode
 field heapscope::RegionBreakdown::outside_regions
 field heapscope::RegionBreakdown::refused_events
 field heapscope::RegionBreakdown::regions
+field heapscope::RegionBreakdown::resets
 field heapscope::Regression::allowed
 field heapscope::Regression::baseline
 field heapscope::Regression::figure
@@ -220,6 +221,7 @@ field heapscope::stats::RegionBreakdown::mode
 field heapscope::stats::RegionBreakdown::outside_regions
 field heapscope::stats::RegionBreakdown::refused_events
 field heapscope::stats::RegionBreakdown::regions
+field heapscope::stats::RegionBreakdown::resets
 field heapscope::symbol::Resolved::file_address
 field heapscope::symbol::Resolved::module
 field heapscope::symbol::Resolved::symbol
