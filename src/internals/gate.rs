@@ -419,45 +419,59 @@ mod tests {
         drop(guard);
     }
 
-    #[test]
-    fn write_for_times_out_rather_than_hanging() {
-        let gate = Gate::new();
+    /// Holds the gate for reading on another thread while `writer` runs, and
+    /// returns what `writer` returned.
+    ///
+    /// The reader is known to hold the gate before `writer` starts, by a
+    /// handshake rather than a sleep. A sleep only made that likely: under
+    /// Miri, whose clock advances with the steps it interprets and whose
+    /// scheduler is seeded, 8 seeds in 40 ran the writer first, which then
+    /// took the gate. And `writer` returns its findings rather than asserting
+    /// them, so that the reader is released before anything can fail: a panic
+    /// with the reader still waiting to be released left the scope waiting
+    /// for it, and Miri reported a deadlock instead of the failed assertion.
+    fn while_a_reader_holds<T>(gate: &Gate, writer: impl FnOnce() -> T) -> T {
+        let held = std::sync::Barrier::new(2);
         let release = std::sync::Barrier::new(2);
-
         std::thread::scope(|s| {
             s.spawn(|| {
                 let _reader = gate.read();
-                release.wait(); // hold the read lock until the writer has given up
+                held.wait();
+                release.wait();
             });
-
-            // Give the reader a moment to acquire.
-            std::thread::sleep(Duration::from_millis(10));
-            let start = Instant::now();
-            assert!(
-                gate.write_for(Duration::from_millis(50)).is_none(),
-                "write_for should have timed out against a held read lock"
-            );
-            assert!(start.elapsed() >= Duration::from_millis(40));
+            held.wait();
+            let found = writer();
             release.wait();
+            found
+        })
+    }
+
+    #[test]
+    fn write_for_times_out_rather_than_hanging() {
+        let gate = Gate::new();
+        let (acquired, waited) = while_a_reader_holds(&gate, || {
+            let start = Instant::now();
+            let acquired = gate.write_for(Duration::from_millis(50)).is_some();
+            (acquired, start.elapsed())
         });
+        assert!(
+            !acquired,
+            "write_for should have timed out against a held read lock"
+        );
+        assert!(
+            waited >= Duration::from_millis(40),
+            "write_for gave up after {waited:?} of the 50ms it was given"
+        );
     }
 
     /// A writer that gives up must not leave the gate closed against readers.
     #[test]
     fn a_timed_out_writer_withdraws_its_intent() {
         let gate = Gate::new();
-        let release = std::sync::Barrier::new(2);
-
-        std::thread::scope(|s| {
-            s.spawn(|| {
-                let _reader = gate.read();
-                release.wait();
-            });
-
-            std::thread::sleep(Duration::from_millis(10));
-            assert!(gate.write_for(Duration::from_millis(30)).is_none());
-            release.wait();
+        let acquired = while_a_reader_holds(&gate, || {
+            gate.write_for(Duration::from_millis(30)).is_some()
         });
+        assert!(!acquired, "write_for took the gate from a reader");
 
         // With the reader gone, both modes must be available again.
         drop(gate.read());
