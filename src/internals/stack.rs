@@ -30,11 +30,15 @@ mod imp {
     use std::ffi::c_void;
     use std::ops::Range;
 
+    // `pthread_t` as `usize`, not the header's pointer: one declaration of
+    // `pthread_self` per program, and `guard::thread_handle` says why it is
+    // this one. The handle is only ever passed back to Darwin, which is
+    // indifferent to the spelling.
     extern "C" {
-        fn pthread_self() -> *mut c_void;
+        fn pthread_self() -> usize;
         /// Returns the *highest* address of the thread's stack.
-        fn pthread_get_stackaddr_np(thread: *mut c_void) -> *mut c_void;
-        fn pthread_get_stacksize_np(thread: *mut c_void) -> usize;
+        fn pthread_get_stackaddr_np(thread: usize) -> *mut c_void;
+        fn pthread_get_stacksize_np(thread: usize) -> usize;
     }
 
     pub(super) fn current_bounds() -> Option<Range<usize>> {
