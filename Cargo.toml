@@ -1,6 +1,6 @@
 [package]
 name = "heapscope"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.96"
 description = "Dynamic heap analysis for Rust: a heap profiler with no dependencies outside the standard library."
