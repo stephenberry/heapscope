@@ -202,19 +202,27 @@ static CLAIMED: AtomicUsize = AtomicUsize::new(0);
 pub(crate) fn thread_handle() -> usize {
     // `pthread_t` is not one type. Darwin defines it as
     // `struct _opaque_pthread_t *`, a genuine pointer; glibc defines it as
-    // `unsigned long int`. Declaring one as the other is an ABI mismatch, so
-    // each is spelled out. (Miri rejects exactly this class of mismatch, but
-    // only for the paths it executes — it runs the Darwin backend here, so the
-    // glibc declaration below is correct by inspection rather than by test.)
+    // `unsigned long int`. Each is declared as the integer it is passed as.
+    //
+    // On Darwin that is `usize` rather than the header's pointer, as the libc
+    // crate and Miri both model it (`pthread_t = uintptr_t`). Every Apple ABI
+    // returns a pointer and a `uintptr_t` the same way, and only the address is
+    // wanted here. Miri checks a declaration against its own and rejects a
+    // pointer where it returns `usize`, so the header's spelling would stop it
+    // from running on the host. The declarations in `stack` and `site` follow
+    // this one, because `clashing_extern_declarations` holds a program to a
+    // single signature per symbol. Miri checks only the paths it executes, so
+    // the glibc declaration below is correct by inspection rather than by test
+    // unless Miri is pointed at a Linux target.
     #[cfg(target_vendor = "apple")]
     let raw = {
         extern "C" {
-            fn pthread_self() -> *mut std::ffi::c_void;
+            fn pthread_self() -> usize;
         }
         // SAFETY: `pthread_self` takes no arguments, cannot fail, and is
         // async-signal-safe. It reads the thread's own control block, which
         // exists for the entire lifetime of any thread that can execute code.
-        unsafe { pthread_self() }.addr()
+        unsafe { pthread_self() }
     };
 
     #[cfg(all(unix, not(target_vendor = "apple")))]

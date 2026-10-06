@@ -1179,19 +1179,17 @@ mod platform {
     use super::MAX_NAME;
 
     /// `pthread_t` is a pointer on Darwin and an integer on glibc, so each is
-    /// spelled out rather than one being declared as the other. This mirrors
-    /// [`super::super::guard::thread_handle`], for the same ABI reason.
+    /// spelled out. On Darwin it is declared as `usize`, the integer it is
+    /// passed as, to match [`super::super::guard::thread_handle`]: a program
+    /// has one `pthread_self`, and that function says why it is spelled so.
     #[cfg(target_vendor = "apple")]
     mod sys {
-        use std::ffi::{c_char, c_int, c_void};
+        use std::ffi::{c_char, c_int};
 
         extern "C" {
-            pub(super) fn pthread_self() -> *mut c_void;
-            pub(super) fn pthread_getname_np(
-                thread: *mut c_void,
-                name: *mut c_char,
-                len: usize,
-            ) -> c_int;
+            pub(super) fn pthread_self() -> usize;
+            pub(super) fn pthread_getname_np(thread: usize, name: *mut c_char, len: usize)
+                -> c_int;
         }
 
         /// # Safety
