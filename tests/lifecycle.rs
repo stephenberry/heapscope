@@ -1486,86 +1486,98 @@ fn probe_binary() -> PathBuf {
 /// deliberately broken `fork` implementation pass this whole file, because the
 /// binary under test predated the breakage.
 ///
-/// The cheapest correct check is the one the build system itself uses. If any
+/// The cheapest correct check is the one the build system itself uses: if any
 /// source that goes into the probe is newer than the probe, the probe is stale.
+/// "The one the build system itself uses" is meant literally. The list of
+/// sources is read from the dep-info file Cargo writes beside the probe, which
+/// names every file whose modification time Cargo compares to decide whether to
+/// rebuild it: the probe's own source, the library's `.rs` files, and anything
+/// they `include_str!`, such as the HTML viewer.
 ///
-/// "The one the build system itself uses" is meant literally, and it is why the
-/// list below is `.rs` files and nothing else. Cargo decides a source file is
-/// stale by its modification time, so comparing modification times agrees with
-/// Cargo exactly. Cargo decides nothing that way about `Cargo.toml` or
-/// `Cargo.lock`: it fingerprints the build-relevant content of one and the
-/// resolution recorded in the other. Both used to be in this list, and both were
-/// wrong in the same way — an edit Cargo provably ignores (a comment, a
-/// `[[bin]]` section, a `cargo update` of a dependency this fixture does not
-/// link) moves the file's clock without moving anything Cargo will rebuild.
+/// A list kept here by hand has been wrong in both directions. It once held
+/// `Cargo.toml` and `Cargo.lock`, which Cargo fingerprints by content rather
+/// than by clock, so an edit Cargo provably ignores (a comment, a `cargo update`
+/// of a dependency this fixture does not link) failed the guard and nothing
+/// could turn it green again: Cargo answered the remedy below with `Finished`
+/// and left the probe's clock where it was. `touch Cargo.lock` followed by
+/// `cargo build --example lifecycle_probe` reproduced it in two commands. Later
+/// it held only `.rs` files, and an edit to the viewer passed unnoticed. Reading
+/// Cargo's own list cannot drift from Cargo in either direction.
 ///
-/// That is not merely a stricter check. It is an unsatisfiable one, which is
-/// worse than none: the guard fails, prints the remedy below, and Cargo answers
-/// the remedy with `Finished` and leaves the probe's clock exactly where it was,
-/// because nothing it tracks changed. There is no command that turns the suite
-/// green again. Measured, not reasoned: `touch Cargo.lock` followed by
-/// `cargo build --example lifecycle_probe` reproduces it in two commands.
-///
-/// What that gives up is a manifest or resolution change that really does alter
-/// the probe and touches no `.rs` file. For this fixture there is no such
-/// change: the probe links `heapscope`, `heapscope` has no dependencies, and a
-/// manifest edit that alters the build (a `[profile.dev]` key, an edition bump)
-/// makes Cargo rebuild the probe the next time anything builds examples — which
-/// is what the remedy below says to do, and what CI now does before it tests.
+/// A file the list names that no longer exists counts as stale, because Cargo
+/// counts it that way too: the next build rebuilds the probe and writes a new
+/// list without it.
 #[track_caller]
 fn assert_fresh(probe: &Path) {
     let built = modified(probe).expect("the probe has a modification time");
+    let dep_info = probe.with_extension("d");
+    let text = std::fs::read_to_string(&dep_info).unwrap_or_else(|error| {
+        panic!(
+            "cannot read {}, the list of sources Cargo wrote beside the probe: {error}",
+            dep_info.display(),
+        )
+    });
 
-    let mut newest_source = std::time::SystemTime::UNIX_EPOCH;
-    let mut newest_path = PathBuf::new();
+    let sources = dependencies(&text);
+    assert!(
+        !sources.is_empty(),
+        "{} names no sources, so freshness cannot be judged from it",
+        dep_info.display(),
+    );
+
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
-    // Not `src/bin`: those are other binaries, which the probe does not link,
-    // so an edit there is the same unsatisfiable case as the manifest's. Cargo
-    // answers the remedy with `Finished`, and the guard fails for good.
-    let binaries = manifest.join("src").join("bin");
-    for source in sources(&manifest.join("src"))
-        .into_iter()
-        .filter(|source| !source.starts_with(&binaries))
-        .chain([manifest.join("examples/lifecycle_probe.rs")])
-    {
-        if let Some(time) = modified(&source) {
-            if time > newest_source {
-                newest_source = time;
-                newest_path = source;
+    for source in sources {
+        // Relative only under `build.dep-info-basedir`, which this repository
+        // does not set; were it set, the manifest is the base it would name.
+        let source = manifest.join(source);
+        let fresh = modified(&source).is_some_and(|time| time <= built);
+        assert!(
+            fresh,
+            "the lifecycle probe at {} predates {}, which is newer or no longer \
+             exists, so these tests would report on the previous build of the \
+             library.\n\
+             Run `cargo build --example lifecycle_probe`, or plain `cargo test`, \
+             which builds examples -- `cargo test --all-targets` does not.",
+            probe.display(),
+            source.display(),
+        );
+    }
+}
+
+/// The prerequisites of a Makefile-style dep-info file, as Cargo writes one.
+///
+/// Cargo writes a single rule, `target: source source ...`, and escapes a space
+/// inside a path as `\ `. The target ends at the first `": "`, which a Windows
+/// drive letter cannot be mistaken for because its colon is followed by `\`.
+fn dependencies(text: &str) -> Vec<PathBuf> {
+    let Some((_, sources)) = text.lines().next().and_then(|rule| rule.split_once(": ")) else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    let mut current = String::new();
+    let mut characters = sources.chars().peekable();
+    while let Some(character) = characters.next() {
+        match character {
+            '\\' if characters.peek() == Some(&' ') => {
+                current.push(' ');
+                characters.next();
             }
+            ' ' => {
+                if !current.is_empty() {
+                    found.push(PathBuf::from(std::mem::take(&mut current)));
+                }
+            }
+            other => current.push(other),
         }
     }
-
-    assert!(
-        built >= newest_source,
-        "the lifecycle probe at {} is older than {}, so these tests would report \
-         on the previous build of the library.\n\
-         Run `cargo build --example lifecycle_probe`, or plain `cargo test`, \
-         which builds examples -- `cargo test --all-targets` does not.",
-        probe.display(),
-        newest_path.display(),
-    );
+    if !current.is_empty() {
+        found.push(PathBuf::from(current));
+    }
+    found
 }
 
 fn modified(path: &Path) -> Option<std::time::SystemTime> {
     std::fs::metadata(path).ok()?.modified().ok()
-}
-
-/// Every `.rs` file under `directory`, recursively.
-fn sources(directory: &Path) -> Vec<PathBuf> {
-    let mut found = Vec::new();
-    let Ok(entries) = std::fs::read_dir(directory) else {
-        return found;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            found.extend(sources(&path));
-        } else if path.extension().is_some_and(|kind| kind == "rs") {
-            found.push(path);
-        }
-    }
-    found
 }
 
 /// A fresh directory for one run of the probe.
