@@ -371,7 +371,12 @@ impl fmt::Debug for Guard {
 /// from the platform's thread-local bootstrap — or if no slot is available.
 /// In every one of those cases the correct action is to do nothing but forward
 /// to the inner allocator.
+///
+/// `#[must_use]` here as well as on [`Guard`], because the lint does not look
+/// through an `Option`: a bare `enter();` would otherwise compile silently and
+/// release the guard on the same line that took it.
 #[inline]
+#[must_use = "the guard is released immediately if it is not bound"]
 pub fn enter() -> Option<Guard> {
     let handle = thread_handle();
     let slot = find_slot(handle)?;
