@@ -752,31 +752,8 @@ mod tests {
         });
     }
 
-    #[test]
-    fn slots_are_reclaimed_when_threads_exit() {
-        #[cfg(miri)]
-        const ROUNDS: usize = 8;
-        #[cfg(not(miri))]
-        const ROUNDS: usize = 200;
-
-        let before = stats();
-        for _ in 0..ROUNDS {
-            std::thread::spawn(|| {
-                let _guard = enter().expect("fresh thread should get a slot");
-            })
-            .join()
-            .unwrap();
-        }
-        let after = stats();
-
-        // Without reclamation this would have consumed `ROUNDS` slots. Allow a
-        // small drift for threads the test harness itself may have started.
-        assert!(
-            after.claimed <= before.claimed + 8,
-            "slots leaked: {before:?} -> {after:?}"
-        );
-        assert_eq!(after.refused, before.refused, "no refusal was expected");
-    }
+    // `slots_are_reclaimed_when_threads_exit` is `tests/guard_reclaim.rs`:
+    // it reads a process-wide count that other tests here move.
 
     /// The property the whole design exists for: a recursive call that arrives
     /// while the thread is inside the guard must be refused, whatever the source.
