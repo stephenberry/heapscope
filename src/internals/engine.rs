@@ -164,6 +164,19 @@ impl Mode {
     pub const DEFAULT_UNITS: (&'static str, &'static str, &'static str) =
         ("byte", "bytes", "blocks");
 
+    /// The third of [`units`](Mode::units) in the singular, for a count of
+    /// one: "1 block", "1 event".
+    ///
+    /// Kept beside `units` rather than added to it, because that tuple is
+    /// public and the file formats name nothing in the singular. A test holds
+    /// the two to agreeing.
+    pub(crate) fn per_count_singular(self) -> &'static str {
+        match self {
+            Mode::Heap | Mode::Copy => "block",
+            Mode::AdHoc => "event",
+        }
+    }
+
     /// Whether an amount is a count of bytes, and so should be rendered in
     /// binary units.
     ///
@@ -2547,6 +2560,20 @@ fn apply_to_counters(counters: &mut Counters, delta: Delta) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The singular is the plural less its `s`, in every mode, so the summary
+    /// cannot say "1 event" for what the file calls "blocks".
+    #[test]
+    fn the_singular_count_noun_agrees_with_the_plural() {
+        for mode in [Mode::Heap, Mode::AdHoc, Mode::Copy] {
+            let (_, _, per_count) = mode.units();
+            assert_eq!(
+                format!("{}s", mode.per_count_singular()),
+                per_count,
+                "{mode:?}"
+            );
+        }
+    }
 
     fn engine() -> Engine {
         let engine = Engine::with_limits(1 << 12, 1 << 14);

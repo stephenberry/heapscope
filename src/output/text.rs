@@ -54,7 +54,8 @@ pub(super) fn write<W: Write>(
     // lines are omitted rather than printed as zeroes.
     let mode = snapshot.settings.mode;
     let lifetimes = mode.block_lifetimes();
-    let (_, many, per_count) = mode.units();
+    let (one, many, per_count) = mode.units();
+    let per_one = mode.per_count_singular();
     // The file's own `verb`, lowercased once, so the summary and the DHAT viewer
     // describe the same numbers with the same word and there is one place the
     // word comes from.
@@ -67,9 +68,12 @@ pub(super) fn write<W: Write>(
         if mode.counts_bytes() {
             bytes(value)
         } else {
-            format!("{} {many}", count(value))
+            counted(value, one, many)
         }
     };
+    // A count of what the mode counts, agreeing with it: "1 block", not
+    // "1 blocks", which reads as a line nobody looked at.
+    let blocks = |value: u64| counted(value, per_one, per_count);
 
     // This one goes to a terminal, so the screening described on
     // `push_display` is not a precaution here but the difference between
@@ -122,31 +126,31 @@ pub(super) fn write<W: Write>(
         if lifetimes {
             writeln!(
                 out,
-                "  carried    {} in {} {per_count} live at the restart, counted as live and not as {verb}",
+                "  carried    {} in {} live at the restart, counted as live and not as {verb}",
                 amount(reset.carried_bytes),
-                count(reset.carried_blocks)
+                blocks(reset.carried_blocks)
             )?;
         }
     }
     writeln!(out)?;
     writeln!(
         out,
-        "  {verb:<9}  {} in {} {per_count}",
+        "  {verb:<9}  {} in {}",
         amount(stats.total_bytes),
-        count(stats.total_blocks)
+        blocks(stats.total_blocks)
     )?;
     if lifetimes {
         writeln!(
             out,
-            "  at t-gmax  {} in {} {per_count}",
+            "  at t-gmax  {} in {}",
             amount(stats.max_bytes),
-            count(stats.max_blocks)
+            blocks(stats.max_blocks)
         )?;
         writeln!(
             out,
-            "  at t-end   {} in {} {per_count}",
+            "  at t-end   {} in {}",
             amount(stats.curr_bytes),
-            count(stats.curr_blocks)
+            blocks(stats.curr_blocks)
         )?;
     }
 
@@ -156,8 +160,8 @@ pub(super) fn write<W: Write>(
         writeln!(out, "  warning    {warning}")?;
     }
 
-    write_threads(&mut out, snapshot, &amount, per_count, top)?;
-    write_regions(&mut out, snapshot, &amount, per_count, top)?;
+    write_threads(&mut out, snapshot, &amount, &blocks, top)?;
+    write_regions(&mut out, snapshot, &amount, &blocks, top)?;
     write_overhead(&mut out, snapshot)?;
 
     if snapshot.points.is_empty() || top == 0 {
@@ -215,19 +219,14 @@ pub(super) fn write<W: Write>(
     if shown > 0 {
         writeln!(
             out,
-            "Top {shown} of {} program points, by {ranked_by} {verb}. Times are in {}.",
-            count(order.len() as u64),
+            "Top {shown} of {}, by {ranked_by} {verb}. Times are in {}.",
+            counted(order.len() as u64, "program point", "program points"),
             snapshot.time_source.unit_long()
         )?;
     }
     if unranked > 0 {
         // Worded like the header, "by blocks allocated", so that the two lines
         // name the same figure the same way.
-        let (point, is) = if unranked == 1 {
-            ("program point", "is")
-        } else {
-            ("program points", "are")
-        };
         let since = if snapshot.reset.is_some() {
             " since the restart"
         } else {
@@ -235,8 +234,9 @@ pub(super) fn write<W: Write>(
         };
         writeln!(
             out,
-            "{} {point} with no {per_count} {verb}{since} {is} not ranked.",
-            count(unranked as u64),
+            "{} with no {per_count} {verb}{since} {} not ranked.",
+            counted(unranked as u64, "program point", "program points"),
+            agreeing(unranked as u64, "is", "are"),
         )?;
     }
     if kept < captured {
@@ -247,10 +247,10 @@ pub(super) fn write<W: Write>(
         // renderer happened to be passed in.
         writeln!(
             out,
-            "{} of {} frames are not shown, because the frame renderer left \
-             them out.",
+            "{} of {} {} not shown, because the frame renderer left them out.",
             count((captured - kept) as u64),
-            count(captured as u64)
+            counted(captured as u64, "frame", "frames"),
+            agreeing((captured - kept) as u64, "is", "are")
         )?;
     }
 
@@ -260,10 +260,10 @@ pub(super) fn write<W: Write>(
         writeln!(out)?;
         writeln!(
             out,
-            "{:>3}. {} in {} {per_count} ({} of all {ranked_by} {verb})",
+            "{:>3}. {} in {} ({} of all {ranked_by} {verb})",
             rank + 1,
             amount(counters.total_bytes),
-            count(counters.total_blocks),
+            blocks(counters.total_blocks),
             percent(ranking.key(counters).0, ranked_total)
         )?;
         // The time unit is named once, in the header. Repeating it here would
@@ -365,7 +365,7 @@ fn write_threads<W: Write>(
     out: &mut W,
     snapshot: &Snapshot,
     amount: &dyn Fn(u64) -> String,
-    per_count: &str,
+    blocks: &dyn Fn(u64) -> String,
     top: usize,
 ) -> io::Result<()> {
     if snapshot.threads.len() < 2 || top == 0 {
@@ -382,7 +382,7 @@ fn write_threads<W: Write>(
     for row in order.iter().take(shown) {
         let label = thread_label(row);
         write!(out, "  {label:width$}  ")?;
-        write_row(out, snapshot, amount, per_count, &row.counts)?;
+        write_row(out, snapshot, amount, blocks, &row.counts)?;
     }
     write_remainder(out, order.len(), shown)
 }
@@ -398,7 +398,7 @@ fn write_regions<W: Write>(
     out: &mut W,
     snapshot: &Snapshot,
     amount: &dyn Fn(u64) -> String,
-    per_count: &str,
+    blocks: &dyn Fn(u64) -> String,
     top: usize,
 ) -> io::Result<()> {
     if snapshot.regions.is_empty() || top == 0 {
@@ -421,7 +421,7 @@ fn write_regions<W: Write>(
     for row in order.iter().take(shown) {
         let label = region_label(row);
         write!(out, "  {label:width$}  ")?;
-        write_row(out, snapshot, amount, per_count, &row.counts)?;
+        write_row(out, snapshot, amount, blocks, &row.counts)?;
         // Only worth a line when it is not the ordinary answer. A region still
         // open when the profile was written is not an error, but it does mean
         // its numbers are a reading taken mid-phase.
@@ -440,9 +440,9 @@ fn write_regions<W: Write>(
     write!(out, "  {OUTSIDE_REGIONS:width$}  ")?;
     write!(
         out,
-        "{} in {} {per_count} ({})",
+        "{} in {} ({})",
         amount(outside.total_bytes),
-        count(outside.total_blocks),
+        blocks(outside.total_blocks),
         percent(outside.total_bytes, snapshot.stats.total_bytes)
     )?;
     // Live, and no peak: this row is the totals less the regions, and a peak is
@@ -467,7 +467,7 @@ fn write_row<W: Write>(
     out: &mut W,
     snapshot: &Snapshot,
     amount: &dyn Fn(u64) -> String,
-    per_count: &str,
+    blocks: &dyn Fn(u64) -> String,
     counts: &super::TallyStats,
 ) -> io::Result<()> {
     // The mode's own noun for what it counts, so that an ad hoc profile says
@@ -475,9 +475,9 @@ fn write_row<W: Write>(
     // other.
     write!(
         out,
-        "{} in {} {per_count} ({})",
+        "{} in {} ({})",
         amount(counts.total_bytes),
-        count(counts.total_blocks),
+        blocks(counts.total_blocks),
         percent(counts.total_bytes, snapshot.stats.total_bytes)
     )?;
     // A row's peak is its own, not its share of the whole heap's. Omitted in a
@@ -643,9 +643,9 @@ fn warnings(snapshot: &Snapshot) -> Vec<String> {
     }
     if snapshot.points_dropped > 0 {
         warnings.push(format!(
-            "{} program points appeared while the snapshot was being taken and \
-             are missing from it",
-            count(snapshot.points_dropped)
+            "{} appeared while the snapshot was being taken and {} missing from it",
+            counted(snapshot.points_dropped, "program point", "program points"),
+            agreeing(snapshot.points_dropped, "is", "are")
         ));
     }
     if snapshot.stats.refused_events > 0 {
@@ -708,6 +708,26 @@ fn bytes(value: u64) -> String {
 /// not: this module renders those through [`bytes`] as `4.0 KiB` where a panic
 /// message renders `4,096`, which is a deliberate difference — a summary is
 /// scanned and a budget is compared against a number the reader wrote.
+/// `one` when `value` is exactly one, `many` otherwise.
+///
+/// For the nouns and verbs a sentence puts beside a number. A summary or a
+/// failure message is the whole of what a reader sees, and "1 blocks" reads as
+/// a line nobody looked at, which invites the reader to doubt the number beside
+/// it as well. Zero is plural in English, which is the case a `> 1` test gets
+/// wrong.
+pub(crate) fn agreeing<'a>(value: u64, one: &'a str, many: &'a str) -> &'a str {
+    if value == 1 {
+        one
+    } else {
+        many
+    }
+}
+
+/// `value` grouped, followed by `one` or `many` to agree with it.
+pub(crate) fn counted(value: u64, one: &str, many: &str) -> String {
+    format!("{} {}", count(value), agreeing(value, one, many))
+}
+
 pub(crate) fn count(value: u64) -> String {
     let digits = value.to_string();
     let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
@@ -863,7 +883,7 @@ mod tests {
         });
         for ranking in [Ranking::Bytes, Ranking::Blocks] {
             let text = render_ranked(&restarted, 10, ranking);
-            assert!(text.contains("Top 1 of 1 program points"), "{text}");
+            assert!(text.contains("Top 1 of 1 program point,"), "{text}");
             assert!(
                 text.contains(
                     "2 program points with no blocks allocated since the restart are not ranked."
@@ -889,6 +909,43 @@ mod tests {
         // A run that allocated at every point it has mentions none of this.
         let text = render(&snapshot(vec![point(&[0x10], 4_096)]), 10);
         assert!(!text.contains("not ranked"), "{text}");
+    }
+
+    /// A count of one is singular wherever the summary puts a noun beside it,
+    /// in every mode's own units.
+    #[test]
+    fn a_count_of_one_reads_as_one() {
+        let mut single = point(&[0x10], 4_096);
+        single.counters.total_blocks = 1;
+        let mut lone = snapshot(vec![single]);
+        lone.stats.total_blocks = 1;
+        lone.stats.curr_blocks = 1;
+        lone.stats.max_blocks = 1;
+        lone.reset = Some(crate::output::Reset {
+            count: 1,
+            carried_blocks: 1,
+            ..crate::output::Reset::default()
+        });
+        let text = render(&lone, 10);
+        for sentence in [
+            "Top 1 of 1 program point, by bytes allocated",
+            "4.0 KiB in 1 block (",
+            "  allocated  ",
+            "in 1 block live at the restart",
+        ] {
+            assert!(text.contains(sentence), "{sentence:?} in:\n{text}");
+        }
+        assert!(!text.contains(" 1 blocks"), "{text}");
+
+        let mut events = lone.clone();
+        events.settings.mode = crate::internals::engine::Mode::AdHoc;
+        events.stats.total_bytes = 1;
+        let text = render(&events, 10);
+        assert!(text.contains("1 unit in 1 event"), "{text}");
+        assert!(
+            !text.contains(" 1 events") && !text.contains(" 1 units"),
+            "{text}"
+        );
     }
 
     /// An event run has no peak and no lifetimes, so its restart line names

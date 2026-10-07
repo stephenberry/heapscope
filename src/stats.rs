@@ -162,7 +162,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::internals::engine::{Engine, Mode, State};
-use crate::output::{count, GlobalStats, OutsideRegions, Ranking, RegionStats, Snapshot};
+use crate::output::{
+    agreeing, count, counted, GlobalStats, OutsideRegions, Ranking, RegionStats, Snapshot,
+};
 
 /// What a heap run has recorded, as of now.
 ///
@@ -1126,25 +1128,6 @@ impl AssertionFailure for Complaint {
             | Complaint::Leaked { .. } => Ranking::Bytes,
         }
     }
-}
-
-/// `one` when `value` is exactly one, `many` otherwise.
-///
-/// For the nouns and verbs a complaint puts beside a number. A message is the
-/// whole of what a failing CI job shows, and "1 allocations were made" reads as
-/// a message nobody looked at, which invites the reader to doubt the number
-/// beside it as well.
-fn agreeing<'a>(value: u64, one: &'a str, many: &'a str) -> &'a str {
-    if value == 1 {
-        one
-    } else {
-        many
-    }
-}
-
-/// `value` grouped, followed by `one` or `many` to agree with it.
-fn counted(value: u64, one: &str, many: &str) -> String {
-    format!("{} {}", count(value), agreeing(value, one, many))
 }
 
 impl fmt::Display for Complaint {
