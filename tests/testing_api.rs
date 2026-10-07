@@ -307,7 +307,29 @@ fn the_testing_api_gates_a_real_program() {
     // `staged` is still live, so both fail.
     let staged_count = failure_message(|| heapscope::assert_alloc_count!(since: stage, <= 0));
     let staged_leak = failure_message(|| heapscope::assert_no_leaks!(since: stage));
+
+    // ---- unset, a dump goes under the build directory, not the source tree ----
+    // Derived here from this binary's own path rather than asked of the crate:
+    // `cargo test` runs it from `<target>/<profile>/deps`.
+    std::env::remove_var(heapscope::stats::DUMP_VARIABLE);
+    let defaulted = failure_message(|| heapscope::assert_alloc_count!(0));
     std::env::set_var(heapscope::stats::DUMP_VARIABLE, "off");
+    let executable = std::env::current_exe().expect("this test's executable");
+    let deps = executable
+        .parent()
+        .expect("the executable is in a directory");
+    assert_eq!(
+        deps.file_name().and_then(|name| name.to_str()),
+        Some("deps")
+    );
+    let build = deps
+        .parent()
+        .expect("deps is in a profile directory")
+        .join("heapscope");
+    let written = dumped_profile(&defaulted);
+    assert_eq!(written.parent(), Some(build.as_path()), "{defaulted}");
+    assert!(written.is_file(), "{defaulted}");
+    std::fs::remove_file(&written).expect("the default dump is removable");
     drop(staged);
 
     // ---- a failure since a mark says its profile covers the whole run ----

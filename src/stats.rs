@@ -153,8 +153,8 @@
 //! "The budget was 64 KiB and the peak was 400 KiB" says a test failed. It does
 //! not say *which call site* spent the difference, and that is the only thing
 //! anyone wants to know next. So a failing assertion prints the heaviest program
-//! points to stderr and writes a DHAT profile beside the test, and the panic
-//! message names the file. See [`DUMP_VARIABLE`] for where it goes.
+//! points to stderr and writes a DHAT profile under the build directory, and
+//! the panic message names the file. See [`DUMP_VARIABLE`] for where it goes.
 
 use std::fmt;
 use std::io;
@@ -1350,8 +1350,15 @@ fn same_window(stats: &HeapStats, mark: &HeapStats) -> Result<(), MarkError> {
 ///
 /// Set it to a path and every dump goes there. Set it to `0`, `off`, `no`, or
 /// `false` and nothing is written — the panic message still names the numbers.
-/// Unset, a dump goes to `heapscope-assert-<thread>.json` in the working
-/// directory, which for a `cargo test` binary names the test that failed.
+/// Unset, a dump is named `heapscope-assert-<thread>.json`, which for a
+/// `cargo test` binary names the test that failed, and goes in a `heapscope`
+/// directory beside Cargo's `deps`: `target/debug/heapscope/` for an ordinary
+/// `cargo test`, wherever `CARGO_TARGET_DIR` and `--target` put that. A
+/// program not run from `deps` writes it to the working directory instead.
+///
+/// The working directory was the default everywhere up to 0.2.0, and for a
+/// test that is the package's source tree: a failing budget left a profile
+/// beside `Cargo.toml` for someone to commit by accident.
 ///
 /// A second dump in the same process never overwrites the first: it takes the
 /// same path with `.2` inserted before the extension, then `.3`, and so on. That
@@ -1399,7 +1406,7 @@ static DUMPS: AtomicU64 = AtomicU64::new(0);
 fn dump(
     engine: &Engine,
     _entered: &crate::internals::guard::Guard,
-    path: &Path,
+    target: &DumpTarget,
     ranking: Ranking,
     summary: &mut dyn io::Write,
 ) -> String {
@@ -1409,25 +1416,50 @@ fn dump(
     let snapshot = Snapshot::of(engine);
     let _ = snapshot.write_text_summary_ranked(summary, TOP_ON_FAILURE, ranking);
 
+    let path = target.path.as_path();
     let named = screened(&path.display().to_string());
+    if let Some(directory) = &target.create {
+        if let Err(error) = std::fs::create_dir_all(directory) {
+            let directory = screened(&directory.display().to_string());
+            return format!("could not create {directory} to write a profile in: {error}");
+        }
+    }
     match snapshot.save_dhat_v2(path) {
         Ok(()) => format!("profile written to {named}"),
         Err(error) => format!("could not write a profile to {named}: {error}"),
     }
 }
 
+/// Where a failure's profile goes.
+struct DumpTarget {
+    path: PathBuf,
+    /// The directory to create first, if the default chose one. Never a
+    /// directory the reader named: a [`DUMP_VARIABLE`] path in a directory that
+    /// does not exist fails, and says so, rather than being made to succeed.
+    create: Option<PathBuf>,
+}
+
 /// Where this failure's profile goes, or `None` if it should not write one.
 ///
 /// The two reasons not to are separate and both need to be reachable by a test:
 /// there is no run to describe, or the reader turned dumping off. Composed from
-/// [`has_a_profile`] and [`dump_base`] rather than written out here, because a
-/// function that reads the environment and bumps a counter is one no test can
-/// drive twice with the same answer.
-fn dump_target(engine: &Engine) -> Option<PathBuf> {
+/// [`has_a_profile`], [`dump_base`] and [`default_dump_directory`] rather than
+/// written out here, because a function that reads the environment and bumps a
+/// counter is one no test can drive twice with the same answer.
+fn dump_target(engine: &Engine) -> Option<DumpTarget> {
     if !has_a_profile(engine) {
         return None;
     }
-    let base = dump_base(std::env::var_os(DUMP_VARIABLE).as_deref())?;
+    let setting = std::env::var_os(DUMP_VARIABLE);
+    // Only asked for when the default is in use: a path the reader set is
+    // theirs, wherever the executable happens to be.
+    let directory = match setting {
+        Some(_) => None,
+        None => std::env::current_exe()
+            .ok()
+            .and_then(|executable| default_dump_directory(&executable)),
+    };
+    let base = dump_base(setting.as_deref(), directory.as_deref())?;
     let ordinal = DUMPS.fetch_add(1, Ordering::Relaxed);
     // The other half of the same question, asked of the filesystem rather than
     // of the string, and asked here rather than inside `distinguish` because it
@@ -1435,25 +1467,53 @@ fn dump_target(engine: &Engine) -> Option<PathBuf> {
     // directory keeps its name: the write then fails with "Is a directory",
     // which is the true answer, where distinguishing it would quietly succeed
     // at writing a *sibling* of the directory the caller named.
-    if base.is_dir() {
-        return Some(base);
-    }
-    Some(distinguish(base, ordinal))
+    let path = if base.is_dir() {
+        base
+    } else {
+        distinguish(base, ordinal)
+    };
+    Some(DumpTarget {
+        path,
+        create: directory,
+    })
 }
 
-/// The name a dump takes before the ordinal is applied, given the setting.
+/// The name a dump takes before the ordinal is applied, given the setting and
+/// the directory a default dump goes in, if there is one.
 ///
-/// Pure, so the three cases can be checked without a test mutating the
-/// environment out from under every other test in the binary.
-fn dump_base(setting: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+/// Pure, so the cases can be checked without a test mutating the environment
+/// out from under every other test in the binary.
+fn dump_base(setting: Option<&std::ffi::OsStr>, directory: Option<&Path>) -> Option<PathBuf> {
     match setting {
         Some(setting) if is_off(setting) => None,
         Some(setting) => Some(PathBuf::from(setting)),
-        None => Some(PathBuf::from(format!(
-            "heapscope-assert{}.json",
-            thread_suffix()
-        ))),
+        None => {
+            let name = format!("heapscope-assert{}.json", thread_suffix());
+            Some(match directory {
+                Some(directory) => directory.join(name),
+                None => PathBuf::from(name),
+            })
+        }
     }
+}
+
+/// The directory a default dump goes in, given the running executable.
+///
+/// `heapscope` beside Cargo's `deps`, which is where `cargo test`, `cargo
+/// bench` and nextest run a test binary from: `target/debug/deps/name-hash`
+/// gives `target/debug/heapscope`. Read off the executable's own path rather
+/// than assumed to be `target/`, so that `CARGO_TARGET_DIR` and a `--target`
+/// triple, which both move it, are followed without being read.
+///
+/// `None` for anything not run from `deps`, which leaves a dump in the working
+/// directory: a program run some other way has no build directory this can
+/// find, and guessing one would scatter profiles somewhere nobody looks.
+fn default_dump_directory(executable: &Path) -> Option<PathBuf> {
+    let directory = executable.parent()?;
+    if directory.file_name()? != "deps" {
+        return None;
+    }
+    Some(directory.parent()?.join("heapscope"))
 }
 
 /// `-<thread name>`, or nothing for a thread the platform has no name for.
@@ -1615,12 +1675,12 @@ pub(crate) fn report<E: AssertionFailure>(
     // The assertion still fails and still says what it measured; what it cannot
     // do from there is write a profile. See [`dump`].
     let dumped = match (&quiet, dump_target(engine)) {
-        (Some(entered), Some(path)) => {
+        (Some(entered), Some(target)) => {
             let mut stderr = io::stderr().lock();
             Some(dump(
                 engine,
                 entered,
-                &path,
+                &target,
                 complaint.ranking(),
                 &mut stderr,
             ))
@@ -3416,21 +3476,59 @@ mod tests {
 
     #[test]
     fn the_dump_setting_chooses_a_path_or_refuses_one() {
-        let named = dump_base(Some(std::ffi::OsStr::new("/tmp/p.json")));
+        let build = Path::new("/work/target/debug/heapscope");
+        // A path the reader set is used as set, whatever the default would be.
+        let named = dump_base(Some(std::ffi::OsStr::new("/tmp/p.json")), Some(build));
         assert_eq!(named, Some(PathBuf::from("/tmp/p.json")));
 
         for off in ["0", "off", "OFF", "No", "FALSE"] {
             assert_eq!(
-                dump_base(Some(std::ffi::OsStr::new(off))),
+                dump_base(Some(std::ffi::OsStr::new(off)), Some(build)),
                 None,
                 "{off} did not read as off"
             );
         }
 
-        let default = dump_base(None).expect("an unset variable dumps by default");
+        let default = dump_base(None, Some(build)).expect("an unset variable dumps by default");
+        assert_eq!(default.parent(), Some(build));
         let name = default.file_name().unwrap().to_string_lossy().into_owned();
         assert!(name.starts_with("heapscope-assert"), "{name}");
         assert!(name.ends_with(".json"), "{name}");
+
+        let nowhere = dump_base(None, None).expect("an unset variable dumps by default");
+        assert_eq!(
+            nowhere.parent(),
+            Some(Path::new("")),
+            "with no build directory, a dump goes to the working directory"
+        );
+    }
+
+    /// The build directory is found from the executable's own path, so a
+    /// target directory moved by `CARGO_TARGET_DIR` or a `--target` triple is
+    /// followed, and anything not run from `deps` is left alone.
+    #[test]
+    fn a_default_dump_goes_beside_deps() {
+        let cases = [
+            (
+                "/work/target/debug/deps/budgets-0123abcd",
+                Some("/work/target/debug/heapscope"),
+            ),
+            (
+                "/elsewhere/build/aarch64-apple-darwin/release/deps/budgets-0123abcd",
+                Some("/elsewhere/build/aarch64-apple-darwin/release/heapscope"),
+            ),
+            ("/work/target/debug/examples/probe", None),
+            ("/usr/local/bin/program", None),
+            ("deps", None),
+            ("/", None),
+        ];
+        for (executable, expected) in cases {
+            assert_eq!(
+                default_dump_directory(Path::new(executable)),
+                expected.map(PathBuf::from),
+                "{executable}"
+            );
+        }
     }
 
     /// The failure report is the whole of what a reader gets, and until an
@@ -3446,7 +3544,7 @@ mod tests {
         let guard = crate::internals::guard::enter().expect("not inside the profiler");
 
         let mut summary = Vec::new();
-        let line = dump(&engine, &guard, &path, Ranking::Bytes, &mut summary);
+        let line = dump(&engine, &guard, &named(&path), Ranking::Bytes, &mut summary);
         drop(guard);
 
         let summary = String::from_utf8(summary).expect("the summary is text");
@@ -3478,11 +3576,68 @@ mod tests {
         let path = directory.path().join("no-such-directory").join("p.json");
         let guard = crate::internals::guard::enter().expect("not inside the profiler");
 
-        let line = dump(&engine, &guard, &path, Ranking::Bytes, &mut Vec::new());
+        let line = dump(
+            &engine,
+            &guard,
+            &named(&path),
+            Ranking::Bytes,
+            &mut Vec::new(),
+        );
         drop(guard);
 
         assert!(line.contains("could not write a profile"), "{line}");
         assert!(line.contains(&path.display().to_string()), "{line}");
+    }
+
+    /// A dump at a path the reader named, which creates nothing.
+    fn named(path: &Path) -> DumpTarget {
+        DumpTarget {
+            path: path.to_path_buf(),
+            create: None,
+        }
+    }
+
+    /// The default directory is made on the way to the first dump into it,
+    /// and a directory that cannot be made is reported as that rather than as
+    /// a file that could not be written.
+    #[test]
+    #[cfg_attr(miri, ignore = "writes a profile, and Miri has no filesystem")]
+    fn a_default_dump_makes_its_directory_or_says_why_not() {
+        let _serial = serialized();
+        let engine = distinct_figures();
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let made = directory.path().join("debug").join("heapscope");
+        let guard = crate::internals::guard::enter().expect("not inside the profiler");
+
+        let line = dump(
+            &engine,
+            &guard,
+            &DumpTarget {
+                path: made.join("p.json"),
+                create: Some(made.clone()),
+            },
+            Ranking::Bytes,
+            &mut Vec::new(),
+        );
+        assert!(line.starts_with("profile written to"), "{line}");
+        assert!(made.join("p.json").is_file(), "{line}");
+
+        // A file where the directory should be.
+        let blocked = directory.path().join("blocked");
+        std::fs::write(&blocked, b"").expect("a plain file");
+        let line = dump(
+            &engine,
+            &guard,
+            &DumpTarget {
+                path: blocked.join("heapscope").join("p.json"),
+                create: Some(blocked.join("heapscope")),
+            },
+            Ranking::Bytes,
+            &mut Vec::new(),
+        );
+        drop(guard);
+        assert!(line.starts_with("could not create"), "{line}");
+        assert!(line.contains("blocked"), "{line}");
     }
 
     /// The dump path comes from the caller, through an environment variable,
@@ -3496,7 +3651,13 @@ mod tests {
         let path = directory.path().join("run\u{1b}[2Kmasked.json");
         let guard = crate::internals::guard::enter().expect("not inside the profiler");
 
-        let line = dump(&engine, &guard, &path, Ranking::Bytes, &mut Vec::new());
+        let line = dump(
+            &engine,
+            &guard,
+            &named(&path),
+            Ranking::Bytes,
+            &mut Vec::new(),
+        );
         drop(guard);
 
         assert!(!line.contains('\u{1b}'), "{line}");
@@ -3956,7 +4117,7 @@ mod tests {
         dump(
             &engine,
             &guard,
-            &directory.path().join("blocks.json"),
+            &named(&directory.path().join("blocks.json")),
             Ranking::Blocks,
             &mut by_blocks,
         );
@@ -3964,7 +4125,7 @@ mod tests {
         dump(
             &engine,
             &guard,
-            &directory.path().join("bytes.json"),
+            &named(&directory.path().join("bytes.json")),
             Ranking::Bytes,
             &mut by_bytes,
         );
