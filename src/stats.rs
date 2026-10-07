@@ -1352,9 +1352,10 @@ fn same_window(stats: &HeapStats, mark: &HeapStats) -> Result<(), MarkError> {
 /// `false` and nothing is written — the panic message still names the numbers.
 /// Unset, a dump is named `heapscope-assert-<thread>.json`, which for a
 /// `cargo test` binary names the test that failed, and goes in a `heapscope`
-/// directory beside Cargo's `deps`: `target/debug/heapscope/` for an ordinary
-/// `cargo test`, wherever `CARGO_TARGET_DIR` and `--target` put that. A
-/// program not run from `deps` writes it to the working directory instead.
+/// directory in Cargo's target directory: `target/heapscope/` for an ordinary
+/// `cargo test`, `target/<triple>/heapscope/` with `--target`, and under
+/// `CARGO_TARGET_DIR` when that is set. A program that was not built into a
+/// target directory writes it to the working directory instead.
 ///
 /// The working directory was the default everywhere up to 0.2.0, and for a
 /// test that is the package's source tree: a failing budget left a profile
@@ -1457,7 +1458,7 @@ fn dump_target(engine: &Engine) -> Option<DumpTarget> {
         Some(_) => None,
         None => std::env::current_exe()
             .ok()
-            .and_then(|executable| default_dump_directory(&executable)),
+            .and_then(|executable| default_dump_directory(&executable, is_cache_directory)),
     };
     let base = dump_base(setting.as_deref(), directory.as_deref())?;
     let ordinal = DUMPS.fetch_add(1, Ordering::Relaxed);
@@ -1497,23 +1498,44 @@ fn dump_base(setting: Option<&std::ffi::OsStr>, directory: Option<&Path>) -> Opt
     }
 }
 
-/// The directory a default dump goes in, given the running executable.
+/// The directory a default dump goes in, given the running executable and a
+/// test for whether a directory is a cache directory.
 ///
-/// `heapscope` beside Cargo's `deps`, which is where `cargo test`, `cargo
-/// bench` and nextest run a test binary from: `target/debug/deps/name-hash`
-/// gives `target/debug/heapscope`. Read off the executable's own path rather
-/// than assumed to be `target/`, so that `CARGO_TARGET_DIR` and a `--target`
-/// triple, which both move it, are followed without being read.
+/// `heapscope` in the nearest directory above the executable that is tagged as
+/// a cache, which for anything Cargo built is the target directory: Cargo
+/// writes a `CACHEDIR.TAG` at its root, and another under `<triple>` with
+/// `--target`. Found by walking up rather than by matching the layout below
+/// it, because that layout is Cargo's to change, and has: a test binary was
+/// in `<profile>/deps`, and newer Cargo puts it in
+/// `<profile>/build/<package>/<hash>/out`. The tag is in both, and so is
+/// wherever `CARGO_TARGET_DIR` moves the directory.
 ///
-/// `None` for anything not run from `deps`, which leaves a dump in the working
-/// directory: a program run some other way has no build directory this can
-/// find, and guessing one would scatter profiles somewhere nobody looks.
-fn default_dump_directory(executable: &Path) -> Option<PathBuf> {
-    let directory = executable.parent()?;
-    if directory.file_name()? != "deps" {
-        return None;
-    }
-    Some(directory.parent()?.join("heapscope"))
+/// `None` when no directory above the executable is tagged, which leaves a
+/// dump in the working directory: a program built some other way has no build
+/// directory this can find, and guessing one would scatter profiles somewhere
+/// nobody looks.
+fn default_dump_directory(executable: &Path, is_cache: impl Fn(&Path) -> bool) -> Option<PathBuf> {
+    executable
+        .ancestors()
+        .skip(1)
+        .find(|directory| is_cache(directory))
+        .map(|directory| directory.join("heapscope"))
+}
+
+/// Whether `directory` holds a cache directory tag.
+///
+/// Checked by its signature, which the specification
+/// (<https://bford.info/cachedir/>) requires as the first bytes, rather than
+/// by the file's name alone, so a stray `CACHEDIR.TAG` that is not one does
+/// not decide where profiles go. Not checked for Cargo's own wording, which
+/// is prose and no promise.
+fn is_cache_directory(directory: &Path) -> bool {
+    use std::io::Read;
+    const SIGNATURE: &[u8] = b"Signature: 8a477f597d28d172789f06886806bc55";
+    let mut start = [0u8; SIGNATURE.len()];
+    std::fs::File::open(directory.join("CACHEDIR.TAG"))
+        .and_then(|mut tag| tag.read_exact(&mut start))
+        .is_ok_and(|()| start == SIGNATURE)
 }
 
 /// `-<thread name>`, or nothing for a thread the platform has no name for.
@@ -3476,7 +3498,7 @@ mod tests {
 
     #[test]
     fn the_dump_setting_chooses_a_path_or_refuses_one() {
-        let build = Path::new("/work/target/debug/heapscope");
+        let build = Path::new("/work/target/heapscope");
         // A path the reader set is used as set, whatever the default would be.
         let named = dump_base(Some(std::ffi::OsStr::new("/tmp/p.json")), Some(build));
         assert_eq!(named, Some(PathBuf::from("/tmp/p.json")));
@@ -3503,32 +3525,68 @@ mod tests {
         );
     }
 
-    /// The build directory is found from the executable's own path, so a
-    /// target directory moved by `CARGO_TARGET_DIR` or a `--target` triple is
-    /// followed, and anything not run from `deps` is left alone.
+    /// The target directory is found by walking up to its tag, so neither
+    /// Cargo's layout below it nor where `CARGO_TARGET_DIR` puts it matters,
+    /// and a program with no tagged directory above it is left alone.
     #[test]
-    fn a_default_dump_goes_beside_deps() {
+    fn a_default_dump_goes_in_the_nearest_tagged_directory() {
+        let tagged = ["/work/target", "/elsewhere/build/aarch64-apple-darwin"];
+        let is_cache = |directory: &Path| tagged.iter().any(|tag| directory == Path::new(tag));
         let cases = [
+            // Cargo's older layout, and its newer one.
             (
                 "/work/target/debug/deps/budgets-0123abcd",
-                Some("/work/target/debug/heapscope"),
+                Some("/work/target/heapscope"),
             ),
             (
-                "/elsewhere/build/aarch64-apple-darwin/release/deps/budgets-0123abcd",
-                Some("/elsewhere/build/aarch64-apple-darwin/release/heapscope"),
+                "/work/target/debug/build/app/0123abcd/out/budgets-0123abcd",
+                Some("/work/target/heapscope"),
             ),
-            ("/work/target/debug/examples/probe", None),
+            // A `--target` triple is tagged too, and is nearer.
+            (
+                "/elsewhere/build/aarch64-apple-darwin/release/deps/budgets-0123abcd",
+                Some("/elsewhere/build/aarch64-apple-darwin/heapscope"),
+            ),
             ("/usr/local/bin/program", None),
-            ("deps", None),
+            ("program", None),
             ("/", None),
         ];
         for (executable, expected) in cases {
             assert_eq!(
-                default_dump_directory(Path::new(executable)),
+                default_dump_directory(Path::new(executable), is_cache),
                 expected.map(PathBuf::from),
                 "{executable}"
             );
         }
+        // The executable itself is not a candidate, however it is named.
+        assert_eq!(
+            default_dump_directory(Path::new("/work/target"), is_cache),
+            None
+        );
+    }
+
+    /// A tag is a tag by its signature, not by its file name.
+    #[test]
+    #[cfg_attr(miri, ignore = "reads the filesystem, and Miri has none")]
+    fn a_cache_directory_is_recognised_by_its_signature() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        assert!(!is_cache_directory(directory.path()), "no tag at all");
+
+        let tag = directory.path().join("CACHEDIR.TAG");
+        std::fs::write(&tag, b"not a cache directory tag").expect("a file");
+        assert!(
+            !is_cache_directory(directory.path()),
+            "a tag without the signature"
+        );
+        std::fs::write(&tag, b"Signature").expect("a file");
+        assert!(!is_cache_directory(directory.path()), "a tag cut short");
+
+        std::fs::write(
+            &tag,
+            b"Signature: 8a477f597d28d172789f06886806bc55\n# created by cargo\n",
+        )
+        .expect("a file");
+        assert!(is_cache_directory(directory.path()));
     }
 
     /// The failure report is the whole of what a reader gets, and until an
