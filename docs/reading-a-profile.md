@@ -85,8 +85,11 @@ for region in &breakdown.regions {
     println!("{:?}: {} allocations", region.name, region.counts.total_blocks);
 }
 println!("(no region): {} allocations", breakdown.outside_regions.total_blocks);
+println!("all told: {} allocations", breakdown.totals.total_blocks);
 let lexing = breakdown.region("parsing/lexing");
 ```
+
+`totals` is the run's own counters from the same instant, so the rows plus `outside_regions` add up to it exactly, with no separate `HeapStats` reading taken a moment later.
 
 It refuses rather than returning zeros in the cases `HeapStats::get()` does: nothing recording, a poisoned profiler, a `fork` child, a sampled run (whose rows are estimates, like everything else in it). It answers in every mode, saying which, because a region row means the same thing in each, and it carries `dropped_blocks` and `refused_events` from the same reading: the rows still add up when the live-block table overflows, but they undercount, and those say by how much.
 

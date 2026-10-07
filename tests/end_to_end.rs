@@ -268,6 +268,15 @@ fn a_real_workload_is_recorded_end_to_end() {
         .write_native(&mut native_profile)
         .expect("writing a native profile to memory");
 
+    // Folded output builds its renderer's table of image labels before it
+    // writes anything, and that table allocated outside the guard until a
+    // change to the summary's renderer made this block notice.
+    let mut folded = Vec::new();
+    profiler
+        .snapshot()
+        .write_folded(&mut folded, heapscope::FoldedMetric::TotalBytes)
+        .expect("writing folded stacks to memory");
+
     let after_output = profiler.stats();
     assert_eq!(
         after_output.total_blocks,
@@ -363,7 +372,15 @@ fn a_real_workload_is_recorded_end_to_end() {
 
     assert!(summary.contains("heapscope profile"), "{summary}");
     assert!(summary.contains("at t-gmax"), "{summary}");
-    assert!(summary.contains("0x"), "the summary should name call sites");
+    // A frame line, indented under its point, rather than an address: the
+    // summary renders frames as function names, and only an unnamed one
+    // carries a number.
+    assert!(
+        summary
+            .lines()
+            .any(|line| line.starts_with("       ") && !line.trim().is_empty()),
+        "the summary should name call sites:\n{summary}"
+    );
 
     the_default_output_trims(&recorded, &parsed, &summary);
     the_default_folded_output_trims(&recorded);

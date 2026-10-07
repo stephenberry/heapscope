@@ -837,6 +837,10 @@ impl Snapshot {
     /// who needs to know whether a file is of a window reads
     /// [`Snapshot::reset`], or another output of the same run.
     pub fn write_folded<W: Write>(&self, out: W, metric: FoldedMetric) -> io::Result<()> {
+        // Before the renderer rather than inside `write_folded_with`, because
+        // building one allocates its table of image labels, and a profiler
+        // asked for a file mid-run would otherwise count it.
+        let _quiet = crate::internals::guard::enter();
         let names = FunctionNames::new(&self.modules);
         if self.settings.trim_frames {
             self.write_folded_with(out, &Trimmed::new(names), metric)
@@ -905,9 +909,14 @@ impl Snapshot {
 
     /// Writes a human-readable summary of the `top` heaviest program points.
     ///
-    /// Frames are rendered by [`Symbolized`] and [`Trimmed`]. This is the
+    /// Frames are rendered by [`FunctionNames`] and [`Trimmed`]. This is the
     /// output someone reads without opening anything, so it is where a name
-    /// earns the most and where a wall of `lang_start` costs the most.
+    /// earns the most, and where an address and an image path repeated on
+    /// every frame, or a wall of `lang_start`, cost the most. A frame with no
+    /// name is `[image+0xfileaddress]`, which is still resolvable; the profile
+    /// files carry every address. This rendered with [`Symbolized`] up to
+    /// 0.2.0, and [`write_text_summary_with`](Snapshot::write_text_summary_with)
+    /// takes `&Trimmed::new(Symbolized::new(&snapshot.modules))` for that.
     pub fn write_text_summary<W: Write>(&self, out: W, top: usize) -> io::Result<()> {
         self.write_text_summary_ranked(out, top, Ranking::Bytes)
     }
@@ -934,7 +943,9 @@ impl Snapshot {
         top: usize,
         ranking: Ranking,
     ) -> io::Result<()> {
-        let names = Symbolized::new(&self.modules);
+        // Before the renderer, for the reason `write_folded` gives.
+        let _quiet = crate::internals::guard::enter();
+        let names = FunctionNames::new(&self.modules);
         if self.settings.trim_frames {
             self.write_text_summary_ranked_with(out, &Trimmed::new(names), top, ranking)
         } else {

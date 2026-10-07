@@ -162,7 +162,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::internals::engine::{Engine, Mode, State};
-use crate::output::{count, OutsideRegions, Ranking, RegionStats, Snapshot};
+use crate::output::{count, GlobalStats, OutsideRegions, Ranking, RegionStats, Snapshot};
 
 /// What a heap run has recorded, as of now.
 ///
@@ -323,6 +323,7 @@ pub struct EventStats {
 ///     println!("{:?}: {} allocations", region.name, region.counts.total_blocks);
 /// }
 /// println!("(no region): {} allocations", breakdown.outside_regions.total_blocks);
+/// println!("all told: {} allocations", breakdown.totals.total_blocks);
 /// ```
 ///
 /// # What adds up
@@ -330,9 +331,10 @@ pub struct EventStats {
 /// For each of `total_bytes`, `total_blocks`, `curr_bytes` and `curr_blocks`,
 /// the rows in [`regions`](RegionBreakdown::regions) — the shared overflow row
 /// among them — plus [`outside_regions`](RegionBreakdown::outside_regions)
-/// equal the run's own total at the instant of the reading, exactly. The peaks
-/// do not add up and are not meant to: each region's is its own, reached at its
-/// own moment.
+/// equal [`totals`](RegionBreakdown::totals), the run's own, read at the same
+/// instant, exactly. The peaks do not add up and are not meant to: each
+/// region's is its own, reached at its own moment, and the run's is in
+/// `totals`.
 ///
 /// After a [`Profiler::reset`](crate::Profiler::reset), the totals here, the
 /// rows' and the remainder's alike, are the window's since that reset, and
@@ -388,6 +390,16 @@ pub struct RegionBreakdown {
     /// under the same name, as [`Snapshot::outside_regions`] and the native
     /// format's `outsideRegions`.
     pub outside_regions: OutsideRegions,
+    /// The run's own counters, read at the same instant as the rows.
+    ///
+    /// What [`regions`](RegionBreakdown::regions) and
+    /// [`outside_regions`](RegionBreakdown::outside_regions) add up to, so a
+    /// share or a grand total comes from this reading rather than from a sum,
+    /// or from a [`HeapStats`] read at another moment. The same figures as
+    /// [`Snapshot::stats`], with the run's peak among them, which no row's
+    /// peak adds up to. In an event mode the columns mean what the rows' do,
+    /// and the live and peak ones are zero.
+    pub totals: GlobalStats,
     /// Allocations the live-block table had no room to track, as of the
     /// reading.
     ///
@@ -488,6 +500,7 @@ impl RegionBreakdown {
             mode: engine.mode(),
             regions: rows.iter().map(RegionStats::of_view).collect(),
             outside_regions: reading.outside,
+            totals: reading.stats,
             dropped_blocks: reading.stats.dropped_blocks,
             refused_events: reading.stats.refused_events,
             resets: reading.resets,
@@ -715,7 +728,174 @@ impl HeapStats {
             resets,
         })
     }
+
+    /// Allocations made between `mark` and this reading.
+    ///
+    /// The figure [`assert_alloc_count!`](crate::assert_alloc_count)`(since:
+    /// mark, ..)` checks, for code that wants the number rather than a pass or a
+    /// fail: read a mark before the code under test, a reading after it, and
+    /// ask the later one.
+    ///
+    /// ```no_run
+    /// # fn work() {}
+    /// # let _profiler = heapscope::Profiler::builder().no_output().build().unwrap();
+    /// let mark = heapscope::HeapStats::get().unwrap();
+    /// work();
+    /// let made = heapscope::HeapStats::get().unwrap().allocations_since(&mark);
+    /// println!("work made {} allocations", made.unwrap());
+    /// ```
+    ///
+    /// A difference of [`total_blocks`](HeapStats::total_blocks) between two
+    /// of its own readings, which only grows within a window, so what lies
+    /// between them is exactly the allocations made in between. Counted as
+    /// `total_blocks` counts, a reallocation included.
+    ///
+    /// Taken as it stands: a reading with
+    /// [`dropped_blocks`](HeapStats::dropped_blocks) is missing that many from
+    /// both sides, and the difference carries the same caveat.
+    ///
+    /// # Errors
+    ///
+    /// When the difference would measure nothing, rather than a number that
+    /// looks like a count. See each [`MarkError`] variant: a mark from before a
+    /// [`Profiler::reset`](crate::Profiler::reset), and a mark ahead of this
+    /// reading, which one read before it and passed on unchanged cannot be.
+    pub fn allocations_since(&self, mark: &HeapStats) -> Result<u64, MarkError> {
+        // The window is compared before anything is subtracted. A reset sets
+        // the total back, so a mark read before one is ahead of the new total
+        // or behind it according to how many allocations each window happened
+        // to make. Ahead, it would be refused as `AllocationsAhead`, whose
+        // remedy, read the mark during this run, does not fit a mark that was.
+        // Behind, it would give a plausible difference that measures nothing,
+        // and pass. One diagnosis for both halves, naming the call that moved
+        // the counts, leaves `AllocationsAhead` for a mark changed after
+        // reading.
+        same_window(self, mark)?;
+        // Refused rather than saturated, and `check_no_leaks` saturates for a
+        // reason that does not transfer. There, a reading below the mark has an
+        // innocent cause, blocks live at the mark were freed, and its true
+        // answer, no leak, is the one saturating gives. Here there is none: a
+        // counter that only grows cannot read below an earlier reading of
+        // itself, so the count since such a mark is unknown. Zero would pass
+        // every ceiling and `since: mark, 0`, an answer invented in the
+        // direction of passing, which is the one this module exists to refuse.
+        //
+        // It is reachable. `#[non_exhaustive]` stops a caller *building* a
+        // `HeapStats` but not changing one, so a mark read properly and then
+        // adjusted (`mark.total_blocks += 1_000`) arrives here ahead of the run.
+        self.total_blocks
+            .checked_sub(mark.total_blocks)
+            .ok_or(MarkError::AllocationsAhead {
+                mark: mark.total_blocks,
+                now: self.total_blocks,
+            })
+    }
 }
+
+/// Why a mark cannot be compared with a later reading.
+///
+/// Returned by [`HeapStats::allocations_since`], and the reason
+/// [`assert_alloc_count!`](crate::assert_alloc_count)`(since: mark, ..)` fails
+/// with, so the two cannot come to disagree about which marks are usable.
+///
+/// Every variant is a mark whose difference from the reading would be a number
+/// with no meaning. A mark read with [`HeapStats::get`] during the run, after
+/// any reset, and passed on unchanged meets none of them.
+///
+/// `#[non_exhaustive]`, as [`StatsError`] is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum MarkError {
+    /// The mark was read before [`Profiler::reset`](crate::Profiler::reset)
+    /// restarted the counts, so its totals belong to another window.
+    ///
+    /// The remedy is almost always to swap two lines: read the mark after the
+    /// reset.
+    FromAnotherWindow {
+        /// [`HeapStats::resets`] in the mark.
+        mark_resets: u64,
+        /// [`HeapStats::resets`] in the reading.
+        resets: u64,
+    },
+    /// The mark records more restarts than the reading.
+    ///
+    /// [`HeapStats::resets`] only grows, so a mark read before the reading and
+    /// passed on unchanged cannot be ahead of it. One that is was read from
+    /// another run, edited, or passed in the wrong order, and which window it
+    /// belongs to is unknown.
+    ResetsAhead {
+        /// [`HeapStats::resets`] in the mark.
+        mark_resets: u64,
+        /// [`HeapStats::resets`] in the reading.
+        resets: u64,
+    },
+    /// The mark records more allocations than the reading, in the same window.
+    ///
+    /// [`HeapStats::total_blocks`] only grows within a window, so this is a
+    /// mark that was not read from this run before the reading and passed on
+    /// unchanged, and the count since it is unknown rather than zero.
+    AllocationsAhead {
+        /// [`HeapStats::total_blocks`] in the mark.
+        mark: u64,
+        /// [`HeapStats::total_blocks`] in the reading.
+        now: u64,
+    },
+}
+
+impl fmt::Display for MarkError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            // Names the call that moved the counts, because the mark is in the
+            // test and so, almost always, is the reset: the remedy is to swap
+            // two lines, and the message should say which two.
+            MarkError::FromAnotherWindow {
+                mark_resets,
+                resets,
+            } => write!(
+                f,
+                "the mark was read before Profiler::reset restarted the counts \
+                 (HeapStats::resets was {} when it was read, {} now), so its \
+                 totals describe another window and nothing can be counted since \
+                 it; read the mark after the reset",
+                count(*mark_resets),
+                count(*resets)
+            ),
+            // Worded as `AllocationsAhead` is, naming the field, because the
+            // remedy is the same: the mark was not passed on as it was read.
+            MarkError::ResetsAhead {
+                mark_resets,
+                resets,
+            } => write!(
+                f,
+                "the mark records {} of the counts (HeapStats::resets) but this \
+                 run has had {}, which a mark read from this run and passed on \
+                 unchanged cannot do, so which window it belongs to cannot be \
+                 known; read the mark with HeapStats::get() during the run being \
+                 measured, and pass it as read",
+                counted(*mark_resets, "restart", "restarts"),
+                count(*resets)
+            ),
+            // Names the remedy, and says what the numbers imply rather than
+            // only what they are. It does not say *where* the mark came from,
+            // because the numbers cannot tell: a mark read from another run and
+            // one whose fields were changed after reading look identical here,
+            // and a message that guessed would send half its readers to look
+            // for the wrong mistake.
+            MarkError::AllocationsAhead { mark, now } => write!(
+                f,
+                "the mark records {} but this run has made {}, which a mark \
+                 read from this run and passed on unchanged cannot do, so the \
+                 number made since it cannot be known; read the mark with \
+                 HeapStats::get() during the run being measured, and pass it \
+                 as read",
+                counted(*mark, "allocation", "allocations"),
+                count(*now)
+            ),
+        }
+    }
+}
+
+impl std::error::Error for MarkError {}
 
 impl EventStats {
     /// The counters of the ad hoc or copy run recording in this process.
@@ -891,23 +1071,9 @@ pub(crate) enum Complaint {
         ceiling: u64,
         scope: Scope,
     },
-    /// The mark records more allocations than the run it is compared against.
-    ///
-    /// [`total_blocks`](HeapStats::total_blocks) only grows, so a mark read from
-    /// these counters and passed on as read can never be ahead of a later
-    /// reading. One that is was read elsewhere or changed since, and either way
-    /// the count since it is not zero but unknown.
-    MarkAhead { mark: u64, now: u64 },
-    /// The mark was read before the counts were last restarted, so it belongs
-    /// to another window than the reading it would be compared with.
-    MarkFromAnotherWindow { mark_resets: u64, resets: u64 },
-    /// The mark records more restarts than the run has had.
-    ///
-    /// [`HeapStats::resets`] only grows, as `total_blocks` does, so a mark
-    /// passed on as read can never be ahead of a later reading's count either:
-    /// one that is was changed after it was read, and which window it belongs
-    /// to is unknown.
-    MarkResetsAhead { mark_resets: u64, resets: u64 },
+    /// The mark cannot be compared with the reading, so nothing can be counted
+    /// since it.
+    Mark(MarkError),
     /// Blocks were still live.
     ///
     /// The byte figures are absolute readings rather than a difference, and
@@ -939,9 +1105,7 @@ impl AssertionFailure for Complaint {
             Complaint::Unavailable(_)
             | Complaint::Incomplete { .. }
             | Complaint::OverBudget { .. }
-            | Complaint::MarkAhead { .. }
-            | Complaint::MarkFromAnotherWindow { .. }
-            | Complaint::MarkResetsAhead { .. }
+            | Complaint::Mark(_)
             | Complaint::Leaked {
                 mark_bytes: None, ..
             } => Scope::WholeRun,
@@ -958,9 +1122,7 @@ impl AssertionFailure for Complaint {
             Complaint::Unavailable(_)
             | Complaint::Incomplete { .. }
             | Complaint::OverBudget { .. }
-            | Complaint::MarkAhead { .. }
-            | Complaint::MarkFromAnotherWindow { .. }
-            | Complaint::MarkResetsAhead { .. }
+            | Complaint::Mark(_)
             | Complaint::Leaked { .. } => Ranking::Bytes,
         }
     }
@@ -1027,52 +1189,7 @@ impl fmt::Display for Complaint {
                 scope.phrase(),
                 count(*ceiling)
             ),
-            // Names the remedy for the reason `Incomplete` does, and says what
-            // the numbers imply rather than only what they are. It does not say
-            // *where* the mark came from, because the numbers cannot tell: a
-            // mark read from another run and one whose fields were changed after
-            // reading look identical here, and a message that guessed would send
-            // half its readers to look for the wrong mistake.
-            Complaint::MarkAhead { mark, now } => write!(
-                f,
-                "the mark records {} but this run has made {}, which a mark \
-                 read from this run and passed on unchanged cannot do, so the \
-                 number made since it cannot be known; read the mark with \
-                 HeapStats::get() during the run being asserted on, and pass it \
-                 as read",
-                counted(*mark, "allocation", "allocations"),
-                count(*now)
-            ),
-            // Names the call that moved the counts, because the mark is in the
-            // test and so, almost always, is the reset: the remedy is to swap
-            // two lines, and the message should say which two.
-            Complaint::MarkFromAnotherWindow {
-                mark_resets,
-                resets,
-            } => write!(
-                f,
-                "the mark was read before Profiler::reset restarted the counts \
-                 (HeapStats::resets was {} when it was read, {} now), so its \
-                 totals describe another window and nothing can be counted since \
-                 it; read the mark after the reset",
-                count(*mark_resets),
-                count(*resets)
-            ),
-            // Worded as `MarkAhead` is, naming the field, because the remedy is
-            // the same: the mark was not passed on as it was read.
-            Complaint::MarkResetsAhead {
-                mark_resets,
-                resets,
-            } => write!(
-                f,
-                "the mark records {} of the counts (HeapStats::resets) but this \
-                 run has had {}, which a mark read from this run and passed on \
-                 unchanged cannot do, so which window it belongs to cannot be \
-                 known; read the mark with HeapStats::get() during the run being \
-                 asserted on, and pass it as read",
-                counted(*mark_resets, "restart", "restarts"),
-                count(*resets)
-            ),
+            Complaint::Mark(error) => write!(f, "{error}"),
             // The remedy is named for the reason `Incomplete` names one: the
             // likeliest cause of this failing is not a leak but an assertion
             // written without a mark, on a program that legitimately holds
@@ -1161,51 +1278,14 @@ pub(crate) fn check_alloc_count(
 
 /// Allocations made since `since`, or over the whole run without one.
 ///
-/// A difference of one counter between two of its own readings, which is not
-/// the arithmetic [`HeapStats`] warns against: `total_blocks` only grows, so
-/// what lies between two readings of it is exactly the allocations made in
-/// between.
-///
-/// # A mark ahead of the reading is refused rather than saturated
-///
-/// `check_no_leaks` saturates its difference, and the reason does not transfer.
-/// There, a reading below the mark has an innocent cause — blocks live at the
-/// mark were freed — and its true answer, no leak, is the one saturating gives.
-/// Here there is no innocent cause: a counter that only grows cannot read below
-/// an earlier reading of itself, so a mark ahead of `stats` was not passed on as
-/// it was read from these counters, and the count since it is unknown.
-/// Saturating would report zero, which passes every ceiling and
-/// `since: mark, 0` — an answer invented in the direction of passing, which is
-/// the one this module exists to refuse.
-///
-/// It is reachable. [`HeapStats`] is `#[non_exhaustive]`, which stops a caller
-/// *building* one but not changing one: its fields are public, so a mark read
-/// properly and then adjusted (`mark.total_blocks += 1_000`) arrives here
-/// ahead of the run.
-///
-/// # A mark from before a reset is refused first, and for that
-///
-/// A [`Profiler::reset`](crate::Profiler::reset) sets the total back, so a mark
-/// read before one is ahead of the new total or behind it according to how
-/// many allocations each window happened to make. Ahead, it would be refused
-/// as `MarkAhead`, whose remedy, read the mark during this run, does not fit a
-/// mark that was. Behind, it would give a plausible difference that measures
-/// nothing, and pass. So the window is compared before anything is
-/// subtracted: one diagnosis for both halves, naming the call that moved the
-/// counts, and `MarkAhead` is left for the mark that was changed after
-/// reading.
+/// With a mark, [`HeapStats::allocations_since`], which says what it refuses
+/// and why; the assertion and the public figure are one computation, so they
+/// cannot disagree about which marks are usable.
 fn allocations_since(stats: &HeapStats, since: Option<HeapStats>) -> Result<u64, Complaint> {
-    let Some(mark) = since else {
-        return Ok(stats.total_blocks);
-    };
-    same_window(stats, &mark)?;
-    stats
-        .total_blocks
-        .checked_sub(mark.total_blocks)
-        .ok_or(Complaint::MarkAhead {
-            mark: mark.total_blocks,
-            now: stats.total_blocks,
-        })
+    match since {
+        None => Ok(stats.total_blocks),
+        Some(mark) => stats.allocations_since(&mark).map_err(Complaint::Mark),
+    }
 }
 
 pub(crate) fn check_no_leaks(engine: &Engine, since: Option<HeapStats>) -> Result<(), Complaint> {
@@ -1243,22 +1323,23 @@ pub(crate) fn check_no_leaks(engine: &Engine, since: Option<HeapStats>) -> Resul
 /// meaning, and whether it happens to come out negative is luck. A check of
 /// live figures, which carry across, does not ask.
 ///
-/// [`allocations_since`] asks, for `assert_alloc_count!(since: mark)`.
+/// [`HeapStats::allocations_since`] asks, and through it
+/// `assert_alloc_count!(since: mark)`.
 ///
 /// Only a mark *behind* the reading's count is from an earlier window. The
 /// count only grows, so a mark ahead of it was changed after it was read, and
 /// saying it was read before a reset would be a diagnosis the numbers
 /// contradict; it is refused as an edited mark instead, the way a mark ahead
 /// of the reading's `total_blocks` is.
-fn same_window(stats: &HeapStats, mark: &HeapStats) -> Result<(), Complaint> {
+fn same_window(stats: &HeapStats, mark: &HeapStats) -> Result<(), MarkError> {
     use std::cmp::Ordering;
     match mark.resets.cmp(&stats.resets) {
         Ordering::Equal => Ok(()),
-        Ordering::Less => Err(Complaint::MarkFromAnotherWindow {
+        Ordering::Less => Err(MarkError::FromAnotherWindow {
             mark_resets: mark.resets,
             resets: stats.resets,
         }),
-        Ordering::Greater => Err(Complaint::MarkResetsAhead {
+        Ordering::Greater => Err(MarkError::ResetsAhead {
             mark_resets: mark.resets,
             resets: stats.resets,
         }),
@@ -2555,10 +2636,62 @@ mod tests {
         ] {
             assert_eq!(
                 check_alloc_count(&later, Some(mark), expected),
-                Err(Complaint::MarkAhead { mark: 5, now: 2 }),
+                Err(Complaint::Mark(MarkError::AllocationsAhead {
+                    mark: 5,
+                    now: 2
+                })),
                 "{expected:?}"
             );
         }
+        assert_eq!(
+            HeapStats::of(&later).unwrap().allocations_since(&mark),
+            Err(MarkError::AllocationsAhead { mark: 5, now: 2 })
+        );
+    }
+
+    /// The public figure is the one `since: mark` checks: the allocations
+    /// between two readings of one window, with frees not subtracted, because
+    /// a count of what was made is not a count of what is live.
+    #[test]
+    fn allocations_since_a_mark_counts_what_was_made_in_between() {
+        let _serial = serialized();
+        let engine = engine(Mode::Heap);
+        record(&engine, 0x100, 16);
+        let mark = HeapStats::of(&engine).unwrap();
+        assert_eq!(mark.allocations_since(&mark), Ok(0));
+
+        record(&engine, 0x200, 16);
+        record(&engine, 0x300, 32);
+        engine.record_free(0x300, 32);
+        let now = HeapStats::of(&engine).unwrap();
+        assert_eq!(now.allocations_since(&mark), Ok(2));
+        assert_eq!(
+            check_alloc_count(&engine, Some(mark), Expected::Exactly(2)),
+            Ok(()),
+            "the assertion and the figure disagree"
+        );
+
+        // A reading taken before a reset is beside the new window, and the
+        // later reading says so whichever way the totals happen to fall.
+        engine
+            .reset_guarded()
+            .expect("a running engine restarts its counts");
+        let after = HeapStats::of(&engine).unwrap();
+        assert_eq!(
+            after.allocations_since(&mark),
+            Err(MarkError::FromAnotherWindow {
+                mark_resets: 0,
+                resets: 1,
+            })
+        );
+        // Asked the wrong way round, the mark is ahead of the reading.
+        assert_eq!(
+            mark.allocations_since(&after),
+            Err(MarkError::ResetsAhead {
+                mark_resets: 1,
+                resets: 0,
+            })
+        );
     }
 
     #[test]
@@ -2736,7 +2869,7 @@ mod tests {
         // before the reset is beside the reading, not behind it.
         assert_eq!(
             same_window(&after, &mark),
-            Err(Complaint::MarkFromAnotherWindow {
+            Err(MarkError::FromAnotherWindow {
                 mark_resets: 0,
                 resets: 1,
             }),
@@ -2749,7 +2882,7 @@ mod tests {
         edited.resets += 1;
         assert_eq!(
             same_window(&after, &edited),
-            Err(Complaint::MarkResetsAhead {
+            Err(MarkError::ResetsAhead {
                 mark_resets: 2,
                 resets: 1,
             }),
@@ -2757,19 +2890,19 @@ mod tests {
         );
         assert_eq!(
             check_alloc_count(&engine, Some(edited), Expected::AtMost(u64::MAX)),
-            Err(Complaint::MarkResetsAhead {
+            Err(Complaint::Mark(MarkError::ResetsAhead {
                 mark_resets: 2,
                 resets: 1,
-            })
+            }))
         );
         // And through the assertion that subtracts them. The mark's three
         // allocations are ahead of the new window's none, which is the half
-        // `MarkAhead` would otherwise have claimed: the window diagnosis wins,
+        // `AllocationsAhead` would otherwise have claimed: the window diagnosis wins,
         // because it names the cause.
-        let another_window = Err(Complaint::MarkFromAnotherWindow {
+        let another_window = Err(Complaint::Mark(MarkError::FromAnotherWindow {
             mark_resets: 0,
             resets: 1,
-        });
+        }));
         assert_eq!(
             check_alloc_count(&engine, Some(mark), Expected::AtMost(u64::MAX)),
             another_window,
@@ -2985,14 +3118,45 @@ mod tests {
         assert_eq!(breakdown.outside_regions.curr_bytes, 80);
         assert_eq!(breakdown.outside_regions.curr_blocks, 2);
 
-        let stats = HeapStats::of(&engine).expect("heap stats");
+        // The breakdown's own totals, which the rows and the remainder add up
+        // to, are the run's: the same six figures a `HeapStats` reads.
+        let totals = breakdown.totals;
         assert_eq!(
             parsing.counts.total_bytes + breakdown.outside_regions.total_bytes,
-            stats.total_bytes
+            totals.total_bytes
+        );
+        assert_eq!(
+            parsing.counts.total_blocks + breakdown.outside_regions.total_blocks,
+            totals.total_blocks
+        );
+        assert_eq!(
+            parsing.counts.curr_bytes + breakdown.outside_regions.curr_bytes,
+            totals.curr_bytes
         );
         assert_eq!(
             parsing.counts.curr_blocks + breakdown.outside_regions.curr_blocks,
-            stats.curr_blocks
+            totals.curr_blocks
+        );
+        let stats = HeapStats::of(&engine).expect("heap stats");
+        assert_eq!(
+            (
+                totals.curr_bytes,
+                totals.curr_blocks,
+                totals.max_bytes,
+                totals.max_blocks,
+                totals.total_bytes,
+                totals.total_blocks,
+                totals.dropped_blocks,
+            ),
+            (
+                stats.curr_bytes,
+                stats.curr_blocks,
+                stats.max_bytes,
+                stats.max_blocks,
+                stats.total_bytes,
+                stats.total_blocks,
+                stats.dropped_blocks,
+            )
         );
     }
 
@@ -3025,6 +3189,11 @@ mod tests {
             ),
             (0, 80)
         );
+        assert_eq!(
+            (after.totals.total_bytes, after.totals.curr_bytes),
+            (0, 1_080),
+            "the totals are not the window's"
+        );
     }
 
     /// The same rows a snapshot carries, not a parallel reading of them: a field
@@ -3041,6 +3210,7 @@ mod tests {
         let snapshot = Snapshot::of(&engine);
         assert_eq!(breakdown.regions, snapshot.regions);
         assert_eq!(breakdown.outside_regions, snapshot.outside_regions);
+        assert_eq!(breakdown.totals, snapshot.stats);
     }
 
     /// A name is found the way the program entered it, however long it was:
@@ -3101,6 +3271,10 @@ mod tests {
         assert_eq!(breakdown.mode, Mode::AdHoc);
         assert_eq!(breakdown.outside_regions.total_bytes, 700);
         assert_eq!(breakdown.outside_regions.total_blocks, 1);
+        assert_eq!(
+            (breakdown.totals.total_bytes, breakdown.totals.total_blocks),
+            (730, 2)
+        );
         assert_eq!(
             breakdown
                 .region("retrying")
@@ -3553,10 +3727,10 @@ mod tests {
             "{staged_ceiling}"
         );
 
-        let ahead = Complaint::MarkAhead {
+        let ahead = Complaint::Mark(MarkError::AllocationsAhead {
             mark: 1_000,
             now: 900,
-        }
+        })
         .to_string();
         assert!(ahead.contains("records 1,000 allocations"), "{ahead}");
         assert!(ahead.contains("this run has made 900"), "{ahead}");
@@ -3606,10 +3780,10 @@ mod tests {
 
         // The mark and the reset are both in the test, so the remedy is to
         // swap two lines, and the message has to name both of them.
-        let elsewhere = Complaint::MarkFromAnotherWindow {
+        let elsewhere = Complaint::Mark(MarkError::FromAnotherWindow {
             mark_resets: 1,
             resets: 3,
-        }
+        })
         .to_string();
         assert!(elsewhere.contains("Profiler::reset"), "{elsewhere}");
         assert!(
@@ -3651,7 +3825,7 @@ mod tests {
                 "1 allocation was made, above the ceiling of 0",
             ),
             (
-                Complaint::MarkAhead { mark: 1, now: 0 },
+                Complaint::Mark(MarkError::AllocationsAhead { mark: 1, now: 0 }),
                 "the mark records 1 allocation but this run has made 0",
             ),
             (
@@ -3690,7 +3864,7 @@ mod tests {
     /// The note that a profile covers the whole run belongs to a measurement
     /// made since a mark, and to nothing else: not to a whole-run failure,
     /// where it would teach readers to skip it, and not to a refusal, which
-    /// measured nothing. `MarkAhead` is the case that matters, because it
+    /// measured nothing. `AllocationsAhead` is the case that matters, because it
     /// comes only from a `since:` assertion and is about the mark rather than
     /// about anything after it.
     #[test]
@@ -3717,7 +3891,7 @@ mod tests {
         }
 
         let whole_run = [
-            Complaint::MarkAhead { mark: 5, now: 2 },
+            Complaint::Mark(MarkError::AllocationsAhead { mark: 5, now: 2 }),
             Complaint::Unavailable(StatsError::Sampled),
             Complaint::Incomplete { dropped_blocks: 1 },
             Complaint::OverBudget { peak: 2, limit: 1 },
@@ -3757,7 +3931,7 @@ mod tests {
         }
         for complaint in [
             Complaint::OverBudget { peak: 2, limit: 1 },
-            Complaint::MarkAhead { mark: 5, now: 2 },
+            Complaint::Mark(MarkError::AllocationsAhead { mark: 5, now: 2 }),
             Complaint::Leaked {
                 blocks: 1,
                 live_bytes: 8,
