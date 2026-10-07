@@ -35,7 +35,7 @@ The outputs written afterwards say so:
 
 Folded stacks cannot. The format is a stack and a number per line, with nowhere to put anything else, so a flame graph of a reset run is a flame graph of the window with nothing on it to say so. Ask for another output beside it where that matters.
 
-A reading taken before a reset is from another window, and `HeapStats::resets` is how code subtracting its totals can tell. Its live figures carry across, so a [leak check](testing.md) from it still answers.
+A reading taken before a reset is from another window, and `HeapStats::resets` is how code subtracting its totals can tell; `HeapStats::allocations_since` checks it for you. Its live figures carry across, so a [leak check](testing.md) from it still answers.
 
 A reset is refused, and changes nothing, on a run that is not recording, in a `fork` child, on a poisoned profiler, from inside the profiler's own bookkeeping, and when other threads keep it from reaching a quiet point for as long as a shutdown waits. `Profiler` is neither `Send` nor `Sync`, so the reset is called from the thread that owns it, and it is safe while other threads allocate: it waits for a moment at which no counter is midway through moving and applies itself there in one step. An allocation in flight at that moment can still land on either side of it: for its lifetime, and for whether its size and alignment are in the window's histograms. A reset where the program is quiet gives an exact profile.
 

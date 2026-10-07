@@ -86,7 +86,7 @@ musl / Alpine is not supported and never will be. All four targets run the suite
 
 ## Project status
 
-Pre-1.0, and the version number is the promise: the public API may still change. The engine, the three emitters, the bundled viewer, sampling, and the test-time budgets are built and tested.
+Pre-1.0, and the version number is the promise: the public API may still change. What changed in each release is in the [changelog](CHANGELOG.md). The engine, the three emitters, the bundled viewer, sampling, and the test-time budgets are built and tested.
 
 What stands between this and 1.0 is evidence rather than features, and most of it has now been gathered. The four-platform matrix runs on every push and passes: macOS aarch64, Linux x86_64, Linux aarch64, and Windows — the last natively rather than under Wine, which also settles in-process symbolization there. ThreadSanitizer and AddressSanitizer both run the suite, each behind a positive control that fails the job if the sanitizer cannot see a planted defect through this crate's `#[global_allocator]`, and Miri runs it under the race detector.
 

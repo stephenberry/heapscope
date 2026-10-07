@@ -164,12 +164,22 @@ pub(super) fn write<W: Write>(
         return Ok(());
     }
 
+    // Only the points that allocated in the window are ranked. After a restart
+    // of the counts, a point can be in the profile for nothing but what it
+    // carried into the window, and in a ranking by what was allocated it is a
+    // row of zeroes taking the place of a site that did something. It is still
+    // in every file, where the live columns need it to add up; here it is only
+    // counted, so the list never looks shorter than the run without saying why.
+    //
     // Ties break on position in `Snapshot::points`, which is canonical, so two
     // runs of one program list equal-weight points in the same order. Written
     // out rather than left to the sort's stability: what is at stake is whether
     // the summary diffs cleanly, and a stable sort is not the kind of promise a
     // reader of this line would think to check.
-    let mut order: Vec<usize> = (0..snapshot.points.len()).collect();
+    let mut order: Vec<usize> = (0..snapshot.points.len())
+        .filter(|&at| snapshot.points[at].counters.total_blocks > 0)
+        .collect();
+    let unranked = snapshot.points.len() - order.len();
     order.sort_unstable_by(|&a, &b| {
         let (left, right) = (&snapshot.points[a], &snapshot.points[b]);
         ranking
@@ -202,12 +212,33 @@ pub(super) fn write<W: Write>(
     let kept: usize = stacks.iter().map(Vec::len).sum();
 
     writeln!(out)?;
-    writeln!(
-        out,
-        "Top {shown} of {} program points, by {ranked_by} {verb}. Times are in {}.",
-        count(snapshot.points.len() as u64),
-        snapshot.time_source.unit_long()
-    )?;
+    if shown > 0 {
+        writeln!(
+            out,
+            "Top {shown} of {} program points, by {ranked_by} {verb}. Times are in {}.",
+            count(order.len() as u64),
+            snapshot.time_source.unit_long()
+        )?;
+    }
+    if unranked > 0 {
+        // Worded like the header, "by blocks allocated", so that the two lines
+        // name the same figure the same way.
+        let (point, is) = if unranked == 1 {
+            ("program point", "is")
+        } else {
+            ("program points", "are")
+        };
+        let since = if snapshot.reset.is_some() {
+            " since the restart"
+        } else {
+            ""
+        };
+        writeln!(
+            out,
+            "{} {point} with no {per_count} {verb}{since} {is} not ranked.",
+            count(unranked as u64),
+        )?;
+    }
     if kept < captured {
         // Deliberately does not say *which* frames, or why. The renderer
         // decided, and this emitter has no more idea what an address means than
@@ -245,14 +276,9 @@ pub(super) fn write<W: Write>(
                 amount(counters.at_gmax_bytes),
                 amount(counters.curr_bytes),
                 amount(counters.max_bytes),
-                // A point that allocated nothing in the window, and is here for
-                // what it carried into it, has no blocks to average over, and
-                // an average of zero would read as blocks that died at once.
-                if counters.total_blocks == 0 {
-                    String::from("—")
-                } else {
-                    count(average(point.total_lifetime(), counters.total_blocks))
-                },
+                // Never over zero blocks: a point that allocated nothing in the
+                // window is not ranked.
+                count(average(point.total_lifetime(), counters.total_blocks)),
             )?;
         }
         for frame in stack {
@@ -813,22 +839,56 @@ mod tests {
         assert!(!text.contains("carried"), "{text}");
     }
 
-    /// A point that allocated nothing since a restart is still listed for what
-    /// it holds, and has no blocks to average a lifetime over, so it says so
-    /// rather than reporting blocks that died at once.
+    /// A point that allocated nothing since a restart is in the profile for
+    /// what it carried into the window, and is not ranked by what it
+    /// allocated: a row of zeroes there takes the place of a site that did
+    /// something. It is counted instead, so the list never looks shorter than
+    /// the run without saying why.
     #[test]
-    fn a_point_holding_only_what_it_carried_has_no_average_lifetime() {
-        let mut carried_only = point(&[0x20], 0);
-        carried_only.counters.total_blocks = 0;
-        carried_only.counters.total_lifetime = 0;
-        let mut restarted = snapshot(vec![point(&[0x10], 4_096), carried_only]);
+    fn a_point_holding_only_what_it_carried_is_counted_and_not_ranked() {
+        let carried_only = |address| {
+            let mut point = point(&[address], 0);
+            point.counters.total_blocks = 0;
+            point.counters.total_lifetime = 0;
+            point
+        };
+        let mut restarted = snapshot(vec![
+            carried_only(0x20),
+            point(&[0x10], 4_096),
+            carried_only(0x30),
+        ]);
         restarted.reset = Some(crate::output::Reset {
             count: 1,
             ..crate::output::Reset::default()
         });
-        let text = render(&restarted, 10);
-        assert!(text.contains("avg lifetime —"), "{text}");
-        assert!(text.contains("avg lifetime 100"), "{text}");
+        for ranking in [Ranking::Bytes, Ranking::Blocks] {
+            let text = render_ranked(&restarted, 10, ranking);
+            assert!(text.contains("Top 1 of 1 program points"), "{text}");
+            assert!(
+                text.contains(
+                    "2 program points with no blocks allocated since the restart are not ranked."
+                ),
+                "{text}"
+            );
+            assert!(!text.contains("  2. "), "{text}");
+            assert!(text.contains("avg lifetime 100"), "{text}");
+        }
+
+        // Only carried points: nothing to rank, and the count still says so.
+        let mut carried = snapshot(vec![carried_only(0x20)]);
+        carried.reset = restarted.reset;
+        let text = render(&carried, 10);
+        assert!(!text.contains("Top "), "{text}");
+        assert!(
+            text.contains(
+                "1 program point with no blocks allocated since the restart is not ranked."
+            ),
+            "{text}"
+        );
+
+        // A run that allocated at every point it has mentions none of this.
+        let text = render(&snapshot(vec![point(&[0x10], 4_096)]), 10);
+        assert!(!text.contains("not ranked"), "{text}");
     }
 
     /// An event run has no peak and no lifetimes, so its restart line names

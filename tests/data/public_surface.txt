@@ -3,6 +3,7 @@
 attr heapscope::Baseline #[non_exhaustive]
 attr heapscope::EventStats #[non_exhaustive]
 attr heapscope::HeapStats #[non_exhaustive]
+attr heapscope::MarkError #[non_exhaustive]
 attr heapscope::RegionBreakdown #[non_exhaustive]
 attr heapscope::Regression #[non_exhaustive]
 attr heapscope::ResetError #[non_exhaustive]
@@ -18,6 +19,7 @@ attr heapscope::output::Settings #[non_exhaustive]
 attr heapscope::output::Snapshot #[non_exhaustive]
 attr heapscope::stats::EventStats #[non_exhaustive]
 attr heapscope::stats::HeapStats #[non_exhaustive]
+attr heapscope::stats::MarkError #[non_exhaustive]
 attr heapscope::stats::RegionBreakdown #[non_exhaustive]
 attr heapscope::stats::StatsError #[non_exhaustive]
 const heapscope::CAPTURE_DEPTH
@@ -27,6 +29,7 @@ const heapscope::baseline::UPDATE_VARIABLE
 const heapscope::output::ROW_SLACK
 const heapscope::stats::DUMP_VARIABLE
 const heapscope::symbol::dynamic::DISABLE_VARIABLE
+enum heapscope::MarkError
 enum heapscope::Mode
 enum heapscope::ResetError
 enum heapscope::StartError
@@ -35,6 +38,7 @@ enum heapscope::TimeSource
 enum heapscope::output::FoldedMetric
 enum heapscope::output::PointKind
 enum heapscope::output::Shutdown
+enum heapscope::stats::MarkError
 enum heapscope::stats::StatsError
 field heapscope::Baseline::curr_blocks
 field heapscope::Baseline::curr_bytes
@@ -62,6 +66,7 @@ field heapscope::RegionBreakdown::outside_regions
 field heapscope::RegionBreakdown::refused_events
 field heapscope::RegionBreakdown::regions
 field heapscope::RegionBreakdown::resets
+field heapscope::RegionBreakdown::totals
 field heapscope::Regression::allowed
 field heapscope::Regression::baseline
 field heapscope::Regression::figure
@@ -222,6 +227,7 @@ field heapscope::stats::RegionBreakdown::outside_regions
 field heapscope::stats::RegionBreakdown::refused_events
 field heapscope::stats::RegionBreakdown::regions
 field heapscope::stats::RegionBreakdown::resets
+field heapscope::stats::RegionBreakdown::totals
 field heapscope::symbol::Resolved::file_address
 field heapscope::symbol::Resolved::module
 field heapscope::symbol::Resolved::symbol
@@ -243,6 +249,7 @@ fn heapscope::Baseline::read
 fn heapscope::Baseline::save
 fn heapscope::Baseline::write
 fn heapscope::EventStats::get
+fn heapscope::HeapStats::allocations_since
 fn heapscope::HeapStats::get
 fn heapscope::Mode::DEFAULT_UNITS
 fn heapscope::Mode::as_str
@@ -341,6 +348,7 @@ fn heapscope::output::Snapshot::write_text_summary
 fn heapscope::output::Snapshot::write_text_summary_with
 fn heapscope::region
 fn heapscope::stats::EventStats::get
+fn heapscope::stats::HeapStats::allocations_since
 fn heapscope::stats::HeapStats::get
 fn heapscope::stats::RegionBreakdown::get
 fn heapscope::stats::RegionBreakdown::region
@@ -377,6 +385,13 @@ impl heapscope::HeapStats: Copy (derived)
 impl heapscope::HeapStats: Debug (derived)
 impl heapscope::HeapStats: Eq (derived)
 impl heapscope::HeapStats: PartialEq (derived)
+impl heapscope::MarkError: Clone (derived)
+impl heapscope::MarkError: Copy (derived)
+impl heapscope::MarkError: Debug (derived)
+impl heapscope::MarkError: Eq (derived)
+impl heapscope::MarkError: PartialEq (derived)
+impl heapscope::MarkError: fmt::Display
+impl heapscope::MarkError: std::error::Error
 impl heapscope::Mode: Clone (derived)
 impl heapscope::Mode: Copy (derived)
 impl heapscope::Mode: Debug (derived)
@@ -576,6 +591,13 @@ impl heapscope::stats::HeapStats: Copy (derived)
 impl heapscope::stats::HeapStats: Debug (derived)
 impl heapscope::stats::HeapStats: Eq (derived)
 impl heapscope::stats::HeapStats: PartialEq (derived)
+impl heapscope::stats::MarkError: Clone (derived)
+impl heapscope::stats::MarkError: Copy (derived)
+impl heapscope::stats::MarkError: Debug (derived)
+impl heapscope::stats::MarkError: Eq (derived)
+impl heapscope::stats::MarkError: PartialEq (derived)
+impl heapscope::stats::MarkError: fmt::Display
+impl heapscope::stats::MarkError: std::error::Error
 impl heapscope::stats::RegionBreakdown: Clone (derived)
 impl heapscope::stats::RegionBreakdown: Debug (derived)
 impl heapscope::stats::RegionBreakdown: Eq (derived)
@@ -680,6 +702,7 @@ use heapscope::DEFAULT_OUTPUT_PATH = profiler::DEFAULT_OUTPUT_PATH
 use heapscope::EventStats = stats::EventStats
 use heapscope::FoldedMetric = output::FoldedMetric
 use heapscope::HeapStats = stats::HeapStats
+use heapscope::MarkError = stats::MarkError
 use heapscope::Mode = internals::engine::Mode
 use heapscope::Output = profiler::Output
 use heapscope::Profiler = profiler::Profiler
@@ -714,6 +737,9 @@ use heapscope::region = region::region
 use heapscope::symbol::Trimmed = trim::Trimmed
 use heapscope::symbol::capture_modules = modules::capture
 use heapscope::symbol::demangle = demangle::demangle
+variant heapscope::MarkError::AllocationsAhead
+variant heapscope::MarkError::FromAnotherWindow
+variant heapscope::MarkError::ResetsAhead
 variant heapscope::Mode::AdHoc
 variant heapscope::Mode::Copy
 variant heapscope::Mode::Heap
@@ -748,6 +774,9 @@ variant heapscope::output::Shutdown::Dropped
 variant heapscope::output::Shutdown::Explicit
 variant heapscope::output::Shutdown::ForkedChild
 variant heapscope::output::Shutdown::Running
+variant heapscope::stats::MarkError::AllocationsAhead
+variant heapscope::stats::MarkError::FromAnotherWindow
+variant heapscope::stats::MarkError::ResetsAhead
 variant heapscope::stats::StatsError::ForkedChild
 variant heapscope::stats::StatsError::InsideTheProfiler
 variant heapscope::stats::StatsError::NoQuietPoint

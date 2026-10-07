@@ -407,7 +407,10 @@ impl std::fmt::Debug for Symbolized<'_> {
 /// ```
 ///
 /// This is what [`Snapshot::write_folded`](crate::Snapshot::write_folded)
-/// renders with, and the reason is how a flame graph is built. Its tools merge
+/// and [`Snapshot::write_text_summary`](crate::Snapshot::write_text_summary)
+/// render with. A summary is read rather than kept, and the profile files
+/// beside it are the record. For folded output, the reason is how a flame
+/// graph is built. Its tools merge
 /// frames by their **text**, so whatever a renderer puts in a frame beyond the
 /// function decides what the picture keeps apart. [`Symbolized`] puts in the
 /// runtime address and the offset from the symbol, which is right for a record

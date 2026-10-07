@@ -120,6 +120,32 @@ fn the_regions_and_what_no_region_covered_add_up_to_the_run() {
     // ---- the cheap reading ----
     let breakdown = RegionBreakdown::get().expect("a running heap run has regions");
     assert_eq!(breakdown.mode, heapscope::Mode::Heap);
+    // Against the totals of the same reading, which is the comparison a
+    // caller can make: a `HeapStats` read beside it is another instant.
+    let mut sum = breakdown.outside_regions;
+    for row in &breakdown.regions {
+        sum.total_bytes += row.counts.total_bytes;
+        sum.total_blocks += row.counts.total_blocks;
+        sum.curr_bytes += row.counts.curr_bytes;
+        sum.curr_blocks += row.counts.curr_blocks;
+    }
+    let totals = breakdown.totals;
+    assert_eq!(
+        (
+            sum.total_bytes,
+            sum.total_blocks,
+            sum.curr_bytes,
+            sum.curr_blocks
+        ),
+        (
+            totals.total_bytes,
+            totals.total_blocks,
+            totals.curr_bytes,
+            totals.curr_blocks
+        ),
+        "the rows of a breakdown do not add up to its own totals"
+    );
+    assert!(totals.max_bytes >= totals.curr_bytes);
     let names: Vec<_> = breakdown
         .regions
         .iter()
