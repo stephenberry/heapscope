@@ -14,7 +14,7 @@ A heap profiler that tracks every allocation, attributes it to the call site tha
 
 ```toml
 [dependencies]
-heapscope = "0.2"
+heapscope = "0.3"
 ```
 
 Two requirements, both checked at startup rather than left to produce a confusing profile:
