@@ -13,6 +13,10 @@
 - Text summaries leave out of the ranking any program point that allocated nothing since a `Profiler::reset`, and say how many were left out.
 - A failing assertion's profile goes in `target/heapscope/` under `cargo test`, not the working directory.
 
+### Fixed
+
+- Text summaries say "1 block", "1 event" and "1 program point" rather than the plural.
+
 ## 0.2.0 (2026-10-06)
 
 ### Added

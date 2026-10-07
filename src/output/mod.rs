@@ -57,7 +57,7 @@ pub use dhat_v2::{FrameFormat, RawAddresses};
 pub use folded::FoldedMetric;
 
 pub(crate) use dhat_v2::{name_after_address, push_hex};
-pub(crate) use text::{count, Ranking};
+pub(crate) use text::{agreeing, count, counted, Ranking};
 
 /// How much of one of the profiler's tables is in use.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
